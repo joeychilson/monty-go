@@ -1,0 +1,144 @@
+name: Release Artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            goos: linux
+            goarch: amd64
+            asset: monty-go-linux-amd64
+            library: libmonty_ffi.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            goos: linux
+            goarch: arm64
+            asset: monty-go-linux-arm64
+            library: libmonty_ffi.so
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            goos: darwin
+            goarch: amd64
+            asset: monty-go-darwin-amd64
+            library: libmonty_ffi.dylib
+          - os: macos-15
+            target: aarch64-apple-darwin
+            goos: darwin
+            goarch: arm64
+            asset: monty-go-darwin-arm64
+            library: libmonty_ffi.dylib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build dylib
+        run: cargo build --release -p monty-ffi --target ${{ matrix.target }}
+
+      - name: Install embedded asset
+        run: scripts/install-ffi-library.sh "target/${{ matrix.target }}/release/${{ matrix.library }}" "${{ matrix.goos }}" "${{ matrix.goarch }}"
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" "dist/${{ matrix.asset }}/"
+          cp README.md LICENSE "dist/${{ matrix.asset }}/"
+          tar -czf "dist/${{ matrix.asset }}.tar.gz" -C dist "${{ matrix.asset }}"
+          shasum -a 256 "dist/${{ matrix.asset }}.tar.gz" > "dist/${{ matrix.asset }}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}.tar.gz
+            dist/${{ matrix.asset }}.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Upload embedded asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: internal/ffi/lib/${{ matrix.goos }}_${{ matrix.goarch }}/${{ matrix.library }}.gz
+          if-no-files-found: error
+
+  verify-embedded-assets:
+    name: Verify embedded assets are committed
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download generated embedded assets
+        uses: actions/download-artifact@v4
+        with:
+          path: generated
+          pattern: embedded-*
+
+      - name: Verify generated assets match the repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact_dir in generated/embedded-*; do
+            name="$(basename "${artifact_dir}")"
+            platform="${name#embedded-}"
+            goos="${platform%-*}"
+            goarch="${platform##*-}"
+            src="$(find "${artifact_dir}" -type f -name 'libmonty_ffi.*.gz' -print -quit)"
+            if [[ -z "${src}" ]]; then
+              echo "No embedded FFI asset found in ${artifact_dir}" >&2
+              exit 1
+            fi
+            dest_dir="internal/ffi/lib/${goos}_${goarch}"
+            mkdir -p "${dest_dir}"
+            cp "${src}" "${dest_dir}/$(basename "${src}")"
+          done
+          if [[ -n "$(git status --short internal/ffi/lib)" ]]; then
+            git status --short internal/ffi/lib
+            echo "Embedded FFI assets are stale. Run the refresh workflow or scripts/install-ffi-library.sh for each platform and commit the results." >&2
+            exit 1
+          fi
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - build
+      - verify-embedded-assets
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: monty-go-*
+          merge-multiple: true
+
+      - name: Publish assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --generate-notes
+          gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber

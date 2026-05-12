@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: |
+          test -z "$(gofmt -l $(git ls-files '*.go'))"
+          cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy -p monty-ffi --all-targets --all-features -- -D warnings
+
+      - name: Build Rust FFI
+        run: cargo build --release -p monty-ffi
+
+      - name: Install embedded FFI asset
+        run: scripts/install-ffi-library.sh
+
+      - name: Test Go
+        env:
+          MONTY_GO_TEST_REQUIRE_EMBEDDED: "1"
+        run: go test ./...
+
+      - name: Vet Go
+        run: go vet ./...
+
+      - name: Vet benchmarks compile
+        run: go test -run '^$' -bench BenchmarkRunArithmetic -benchmem ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.0

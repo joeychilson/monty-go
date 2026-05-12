@@ -1,0 +1,101 @@
+name: Refresh Embedded FFI Libraries
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            goos: linux
+            goarch: amd64
+            library: libmonty_ffi.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            goos: linux
+            goarch: arm64
+            library: libmonty_ffi.so
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            goos: darwin
+            goarch: amd64
+            library: libmonty_ffi.dylib
+          - os: macos-15
+            target: aarch64-apple-darwin
+            goos: darwin
+            goarch: arm64
+            library: libmonty_ffi.dylib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build dylib
+        run: cargo build --release -p monty-ffi --target ${{ matrix.target }}
+
+      - name: Install embedded asset
+        run: scripts/install-ffi-library.sh "target/${{ matrix.target }}/release/${{ matrix.library }}" "${{ matrix.goos }}" "${{ matrix.goarch }}"
+
+      - name: Upload embedded asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: internal/ffi/lib/${{ matrix.goos }}_${{ matrix.goarch }}/${{ matrix.library }}.gz
+          if-no-files-found: error
+
+  commit:
+    name: Commit refreshed assets
+    needs: build
+    if: github.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Download embedded assets
+        uses: actions/download-artifact@v4
+        with:
+          path: generated
+          pattern: embedded-*
+
+      - name: Commit changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact_dir in generated/embedded-*; do
+            name="$(basename "${artifact_dir}")"
+            platform="${name#embedded-}"
+            goos="${platform%-*}"
+            goarch="${platform##*-}"
+            src="$(find "${artifact_dir}" -type f -name 'libmonty_ffi.*.gz' -print -quit)"
+            if [[ -z "${src}" ]]; then
+              echo "No embedded FFI asset found in ${artifact_dir}" >&2
+              exit 1
+            fi
+            dest_dir="internal/ffi/lib/${goos}_${goarch}"
+            mkdir -p "${dest_dir}"
+            cp "${src}" "${dest_dir}/$(basename "${src}")"
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add internal/ffi/lib
+          if git diff --cached --quiet; then
+            echo "Embedded FFI assets are already current."
+            exit 0
+          fi
+          git commit -m "Update embedded FFI libraries"
+          git push

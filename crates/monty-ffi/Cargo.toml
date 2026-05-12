@@ -1,0 +1,33 @@
+[package]
+name = "monty-ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[lib]
+name = "monty_ffi"
+crate-type = ["cdylib"]
+
+[dependencies]
+monty = { git = "https://github.com/pydantic/monty", rev = "1346bad22d31f7e4720a381ade04e6361142aae9", package = "monty" }
+monty_type_checking = { git = "https://github.com/pydantic/monty", rev = "1346bad22d31f7e4720a381ade04e6361142aae9", package = "monty_type_checking" }
+num-bigint = "0.4"
+postcard = { version = "1.1", features = ["alloc"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+undocumented_unsafe_blocks = "warn"
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cast_precision_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+too_many_arguments = "allow"
