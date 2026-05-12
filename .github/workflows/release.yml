@@ -84,42 +84,28 @@ jobs:
           if-no-files-found: error
 
   verify-embedded-assets:
-    name: Verify embedded assets are committed
-    needs: build
+    name: Verify embedded assets are present
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download generated embedded assets
-        uses: actions/download-artifact@v4
-        with:
-          path: generated
-          pattern: embedded-*
-
-      - name: Verify generated assets match the repository
+      - name: Verify committed embedded assets
         shell: bash
         run: |
           set -euo pipefail
-          for artifact_dir in generated/embedded-*; do
-            name="$(basename "${artifact_dir}")"
-            platform="${name#embedded-}"
-            goos="${platform%-*}"
-            goarch="${platform##*-}"
-            src="$(find "${artifact_dir}" -type f -name 'libmonty_ffi.*.gz' -print -quit)"
-            if [[ -z "${src}" ]]; then
-              echo "No embedded FFI asset found in ${artifact_dir}" >&2
+          for asset in \
+            internal/ffi/lib/darwin_amd64/libmonty_ffi.dylib.gz \
+            internal/ffi/lib/darwin_arm64/libmonty_ffi.dylib.gz \
+            internal/ffi/lib/linux_amd64/libmonty_ffi.so.gz \
+            internal/ffi/lib/linux_arm64/libmonty_ffi.so.gz
+          do
+            if [[ ! -s "${asset}" ]]; then
+              echo "Missing embedded FFI asset: ${asset}" >&2
+              echo "Run the Refresh Embedded FFI Libraries workflow before tagging a release." >&2
               exit 1
             fi
-            dest_dir="internal/ffi/lib/${goos}_${goarch}"
-            mkdir -p "${dest_dir}"
-            cp "${src}" "${dest_dir}/$(basename "${src}")"
           done
-          if [[ -n "$(git status --short internal/ffi/lib)" ]]; then
-            git status --short internal/ffi/lib
-            echo "Embedded FFI assets are stale. Run the refresh workflow or scripts/install-ffi-library.sh for each platform and commit the results." >&2
-            exit 1
-          fi
 
   release:
     name: Publish GitHub release
