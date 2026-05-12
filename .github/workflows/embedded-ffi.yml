@@ -39,8 +39,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Build dylib
         run: cargo build --release -p monty-ffi --target ${{ matrix.target }}
