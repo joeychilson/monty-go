@@ -2,6 +2,7 @@ package monty
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
@@ -171,7 +172,7 @@ func CompileAndRun(ctx context.Context, code string, inputs any, opts ...RunOpti
 	if err != nil {
 		ffi.RawValueFree(&output.Value)
 		freeFastOutputBytes(output)
-		return Value{}, joinErrors(normalizeError(err), writeErr)
+		return Value{}, errors.Join(normalizeError(err), writeErr)
 	}
 	if writeErr != nil {
 		ffi.RawValueFree(&output.Value)
@@ -268,8 +269,7 @@ func (p *Program) Start(ctx context.Context, inputs any, opts ...RunOption) (Pro
 }
 
 func (p *Program) start(ctx context.Context, inputs any, config runConfig) (Progress, error) {
-	var err error
-	config, err = p.prepareRun(ctx, config)
+	config, err := p.prepareRun(ctx, config)
 	if err != nil {
 		return nil, err
 	}
@@ -277,27 +277,15 @@ func (p *Program) start(ctx context.Context, inputs any, config runConfig) (Prog
 	if err != nil {
 		return nil, err
 	}
-
-	var ffiLimits *ffi.Limits
-	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
-	}
 	var progressHandle uintptr
-	var printed string
-	p.mu.RLock()
-	if p.handle == 0 {
-		p.mu.RUnlock()
-		p.releaseRawInputs(rawInputs, keepAlive)
-		runtime.KeepAlive(keepAlive)
-		return nil, fmt.Errorf("monty: program is closed")
-	}
-	progressHandle, printed, err = ffi.ProgramStartRaw(p.handle, rawInputs, ffiLimits)
-	p.mu.RUnlock()
-	p.releaseRawInputs(rawInputs, keepAlive)
-	runtime.KeepAlive(keepAlive)
+	printed, err := p.callLocked(rawInputs, keepAlive, func(handle uintptr) (string, error) {
+		var printed string
+		progressHandle, printed, err = ffi.ProgramStartRaw(handle, rawInputs, config.ffiLimits())
+		return printed, err
+	})
 	writeErr := writePrinted(config.stdout, printed)
 	if err != nil {
-		return nil, joinErrors(normalizeError(err), writeErr)
+		return nil, errors.Join(normalizeError(err), writeErr)
 	}
 	if writeErr != nil {
 		ffi.ProgressFree(progressHandle)
@@ -311,33 +299,18 @@ func (p *Program) runDirectValue(inputs any, config runConfig) (Value, error) {
 	if err != nil {
 		return Value{}, err
 	}
-	var ffiLimits *ffi.Limits
-	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
-	}
 	output := runFastOutputPool.Get().(*ffi.RunFastOutput) //nolint:errcheck // pool only stores *ffi.RunFastOutput
 	defer runFastOutputPool.Put(output)
-	var printed string
-	p.mu.RLock()
-	if p.handle == 0 {
-		p.mu.RUnlock()
-		p.releaseRawInputs(rawInputs, keepAlive)
-		runtime.KeepAlive(keepAlive)
-		return Value{}, fmt.Errorf("monty: program is closed")
-	}
-	printed, err = ffi.ProgramRunFastRaw(p.handle, rawInputs, ffiLimits, output)
-	p.mu.RUnlock()
-	p.releaseRawInputs(rawInputs, keepAlive)
-	runtime.KeepAlive(keepAlive)
+	printed, err := p.callLocked(rawInputs, keepAlive, func(handle uintptr) (string, error) {
+		return ffi.ProgramRunFastRaw(handle, rawInputs, config.ffiLimits(), output)
+	})
 	writeErr := writePrinted(config.stdout, printed)
-	if err != nil {
+	if err != nil || writeErr != nil {
 		ffi.RawValueFree(&output.Value)
 		freeFastOutputBytes(output)
-		return Value{}, joinErrors(normalizeError(err), writeErr)
-	}
-	if writeErr != nil {
-		ffi.RawValueFree(&output.Value)
-		freeFastOutputBytes(output)
+		if err != nil {
+			return Value{}, errors.Join(normalizeError(err), writeErr)
+		}
 		return Value{}, writeErr
 	}
 	return decodeFastOutput(output)
@@ -348,26 +321,15 @@ func (p *Program) runDirectRaw(inputs any, config runConfig) (ffi.RawValue, erro
 	if err != nil {
 		return ffi.RawValue{}, err
 	}
-	var ffiLimits *ffi.Limits
-	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
-	}
 	var rawResult ffi.RawValue
-	var printed string
-	p.mu.RLock()
-	if p.handle == 0 {
-		p.mu.RUnlock()
-		p.releaseRawInputs(rawInputs, keepAlive)
-		runtime.KeepAlive(keepAlive)
-		return ffi.RawValue{}, fmt.Errorf("monty: program is closed")
-	}
-	rawResult, printed, err = ffi.ProgramRunRaw(p.handle, rawInputs, ffiLimits)
-	p.mu.RUnlock()
-	p.releaseRawInputs(rawInputs, keepAlive)
-	runtime.KeepAlive(keepAlive)
+	printed, err := p.callLocked(rawInputs, keepAlive, func(handle uintptr) (string, error) {
+		var printed string
+		rawResult, printed, err = ffi.ProgramRunRaw(handle, rawInputs, config.ffiLimits())
+		return printed, err
+	})
 	writeErr := writePrinted(config.stdout, printed)
 	if err != nil {
-		return ffi.RawValue{}, joinErrors(normalizeError(err), writeErr)
+		return ffi.RawValue{}, errors.Join(normalizeError(err), writeErr)
 	}
 	if writeErr != nil {
 		ffi.RawValueFree(&rawResult)
@@ -500,11 +462,10 @@ func (p *Program) runFunctionCallback(ctx context.Context, inputs any, config ru
 }
 
 func (p *Program) runFunctionCallbackRaw(ctx context.Context, inputs any, config runConfig) (ffi.RawValue, error) {
-	var err error
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	config, err = p.prepareRun(ctx, config)
+	config, err := p.prepareRun(ctx, config)
 	if err != nil {
 		return ffi.RawValue{}, err
 	}
@@ -512,39 +473,22 @@ func (p *Program) runFunctionCallbackRaw(ctx context.Context, inputs any, config
 	if err != nil {
 		return ffi.RawValue{}, err
 	}
-	var ffiLimits *ffi.Limits
-	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
-	}
 	names := config.functionNames
 	if names == nil && len(config.functions) != 0 {
 		names = hostFunctionNameRefs(config.functions)
 	}
-	callback := hostCallbackPtr
 	state := &hostCallbackState{ctx: ctx, functions: config.functions}
-	p.mu.RLock()
-	if p.handle == 0 {
-		p.mu.RUnlock()
-		p.releaseRawInputs(rawInputs, keepAlive)
-		runtime.KeepAlive(keepAlive)
-		return ffi.RawValue{}, fmt.Errorf("monty: program is closed")
-	}
-	rawResult, printed, err := ffi.ProgramRunHostRaw(
-		p.handle,
-		rawInputs,
-		ffiLimits,
-		names,
-		callback,
-		uintptr(unsafe.Pointer(state)),
-	)
-	p.mu.RUnlock()
-	p.releaseRawInputs(rawInputs, keepAlive)
-	runtime.KeepAlive(keepAlive)
+	var rawResult ffi.RawValue
+	printed, err := p.callLocked(rawInputs, keepAlive, func(handle uintptr) (string, error) {
+		var printed string
+		rawResult, printed, err = ffi.ProgramRunHostRaw(handle, rawInputs, config.ffiLimits(), names, hostCallbackPtr, uintptr(unsafe.Pointer(state)))
+		return printed, err
+	})
 	runtime.KeepAlive(names)
 	runtime.KeepAlive(state)
 	writeErr := writePrinted(config.stdout, printed)
 	if err != nil {
-		return ffi.RawValue{}, joinErrors(normalizeError(err), writeErr)
+		return ffi.RawValue{}, errors.Join(normalizeError(err), writeErr)
 	}
 	if writeErr != nil {
 		ffi.RawValueFree(&rawResult)
@@ -601,18 +545,14 @@ func hostFunctionCallback(userData unsafe.Pointer, namePtr unsafe.Pointer, nameL
 }
 
 func (s *hostCallbackState) writeException(out *ffi.HostFunctionOutput, excType, message string) int32 {
-	s.setException(excType, message)
-	out.ExcType = ffi.StringRef(s.excType)
-	out.Message = ffi.StringRef(s.message)
-	return ffi.HostCallbackException
-}
-
-func (s *hostCallbackState) setException(excType, message string) {
 	if excType == "" {
 		excType = "RuntimeError"
 	}
 	s.excType = excType
 	s.message = message
+	out.ExcType = ffi.StringRef(s.excType)
+	out.Message = ffi.StringRef(s.message)
+	return ffi.HostCallbackException
 }
 
 // RunAs executes program and converts the final Python value into T.
@@ -725,40 +665,61 @@ type rawInputKeepAlive struct {
 	arena       rawArena
 }
 
+func (k rawInputKeepAlive) release(raw []ffi.RawValue) {
+	if k.arena.ownsHandles {
+		freeOwnedRawValues(raw)
+	}
+}
+
 func (p *Program) rawInputs(inputs any) ([]ffi.RawValue, rawInputKeepAlive, error) {
 	inputValues, err := normalizeInputs(inputs)
 	if err != nil {
 		return nil, rawInputKeepAlive{}, err
 	}
-	var arena rawArena
-	var rawInputs []ffi.RawValue
-	if len(p.inputs) != 0 {
-		rawInputs = make([]ffi.RawValue, len(p.inputs))
+	if len(p.inputs) == 0 {
+		return nil, rawInputKeepAlive{inputValues: inputValues}, nil
 	}
+	var arena rawArena
+	rawInputs := make([]ffi.RawValue, len(p.inputs))
 	for i, name := range p.inputs {
 		value, ok := inputValues[name]
 		if !ok {
-			if arena.ownsHandles {
-				freeOwnedRawValues(rawInputs)
-			}
-			return nil, rawInputKeepAlive{}, fmt.Errorf("monty: missing input %q", name)
+			err = fmt.Errorf("monty: missing input %q", name)
+		} else {
+			rawInputs[i], err = valueToRaw(value, &arena)
 		}
-		rawInput, err := valueToRaw(value, &arena)
 		if err != nil {
 			if arena.ownsHandles {
 				freeOwnedRawValues(rawInputs)
 			}
 			return nil, rawInputKeepAlive{}, err
 		}
-		rawInputs[i] = rawInput
 	}
 	return rawInputs, rawInputKeepAlive{inputValues: inputValues, arena: arena}, nil
 }
 
-func (p *Program) releaseRawInputs(raw []ffi.RawValue, keepAlive rawInputKeepAlive) {
-	if keepAlive.arena.ownsHandles {
-		freeOwnedRawValues(raw)
+// callLocked runs fn under the program read lock with the program handle.
+// It releases input keep-alive state after fn returns and forwards fn's
+// printed output and error. A zero handle short-circuits with a closed error.
+func (p *Program) callLocked(rawInputs []ffi.RawValue, keepAlive rawInputKeepAlive, fn func(handle uintptr) (string, error)) (string, error) {
+	p.mu.RLock()
+	if p.handle == 0 {
+		p.mu.RUnlock()
+		keepAlive.release(rawInputs)
+		return "", fmt.Errorf("monty: program is closed")
 	}
+	printed, err := fn(p.handle)
+	p.mu.RUnlock()
+	keepAlive.release(rawInputs)
+	runtime.KeepAlive(keepAlive)
+	return printed, err
+}
+
+func (c runConfig) ffiLimits() *ffi.Limits {
+	if c.limits == nil {
+		return nil
+	}
+	return c.limits.ffi()
 }
 
 func joinStubs(prefix string, functions map[string]*Function) string {

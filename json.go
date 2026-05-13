@@ -2,8 +2,8 @@ package monty
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"runtime"
 
 	"github.com/joeychilson/monty/internal/ffi"
 )
@@ -84,26 +84,15 @@ func (p *Program) runJSONDirect(ctx context.Context, inputs any, config runConfi
 	if err != nil {
 		return nil, err
 	}
-	var ffiLimits *ffi.Limits
-	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
-	}
 	var json []byte
-	var printed string
-	p.mu.RLock()
-	if p.handle == 0 {
-		p.mu.RUnlock()
-		p.releaseRawInputs(rawInputs, keepAlive)
-		runtime.KeepAlive(keepAlive)
-		return nil, fmt.Errorf("monty: program is closed")
-	}
-	json, printed, err = ffi.ProgramRunJSONRaw(p.handle, rawInputs, ffiLimits)
-	p.mu.RUnlock()
-	p.releaseRawInputs(rawInputs, keepAlive)
-	runtime.KeepAlive(keepAlive)
+	printed, err := p.callLocked(rawInputs, keepAlive, func(handle uintptr) (string, error) {
+		var printed string
+		json, printed, err = ffi.ProgramRunJSONRaw(handle, rawInputs, config.ffiLimits())
+		return printed, err
+	})
 	writeErr := writePrinted(config.stdout, printed)
 	if err != nil {
-		return nil, joinErrors(normalizeError(err), writeErr)
+		return nil, errors.Join(normalizeError(err), writeErr)
 	}
 	if writeErr != nil {
 		return nil, writeErr

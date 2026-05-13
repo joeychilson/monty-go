@@ -590,8 +590,7 @@ func (v Value) String() string {
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
 	case DataclassKind:
-		extra := v.extraPtr()
-		return formatDataclass(extra.typeName, extra.fieldNames, v.pairs)
+		return formatDataclass(v.extraPtr().typeName, v.pairs)
 	case DateKind:
 		date := v.extraPtr().date
 		return fmt.Sprintf("%04d-%02d-%02d", date.Year, date.Month, date.Day)
@@ -632,34 +631,14 @@ func formatNamedTuple(typeName string, fieldNames []string, values []Value) stri
 	return typeName + "(" + strings.Join(parts, ", ") + ")"
 }
 
-func formatDataclass(name string, fieldNames []string, attrs []Pair) string {
-	attrByName := make(map[string]Value, len(attrs))
-	for i := range attrs {
-		pair := attrs[i]
-		if pair.Key.kind == StringKind {
-			attrByName[pair.Key.text] = pair.Value
+func formatDataclass(name string, attrs []Pair) string {
+	parts := make([]string, len(attrs))
+	for i, pair := range attrs {
+		key := pair.Key.text
+		if pair.Key.kind != StringKind {
+			key = pair.Key.String()
 		}
-	}
-	parts := make([]string, 0, len(attrs))
-	seen := make(map[string]struct{}, len(fieldNames))
-	for _, fieldName := range fieldNames {
-		value, ok := attrByName[fieldName]
-		if !ok {
-			continue
-		}
-		parts = append(parts, fieldName+"="+value.String())
-		seen[fieldName] = struct{}{}
-	}
-	for i := range attrs {
-		pair := attrs[i]
-		if pair.Key.kind == StringKind {
-			if _, ok := seen[pair.Key.text]; ok {
-				continue
-			}
-			parts = append(parts, pair.Key.text+"="+pair.Value.String())
-			continue
-		}
-		parts = append(parts, pair.Key.String()+"="+pair.Value.String())
+		parts[i] = key + "=" + pair.Value.String()
 	}
 	if name == "" {
 		name = "dataclass"
@@ -844,11 +823,8 @@ func fieldName(field reflect.StructField) (string, bool) {
 	if tag == "-" {
 		return "", false
 	}
-	if tag != "" {
-		name := strings.Split(tag, ",")[0]
-		if name != "" {
-			return name, true
-		}
+	if name, _, _ := strings.Cut(tag, ","); name != "" {
+		return name, true
 	}
 	return snakeCase(field.Name), true
 }
@@ -1789,12 +1765,12 @@ func (r *flatValueReader) readBytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	//nolint:gosec // r.offset is always <= len(r.data) by invariant maintained in this reader
-	if uint64(len(r.data)-r.offset) < uint64(length) {
+	end := r.offset + int(length)
+	if end > len(r.data) {
 		return nil, fmt.Errorf("monty: truncated flat value")
 	}
-	value := r.data[r.offset : r.offset+int(length)]
-	r.offset += int(length)
+	value := r.data[r.offset:end]
+	r.offset = end
 	return value, nil
 }
 

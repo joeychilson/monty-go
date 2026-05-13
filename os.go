@@ -319,7 +319,7 @@ func valuesToHandles(values []Value) ([]uintptr, error) {
 	for i, value := range values {
 		handle, err := valueToHandle(value)
 		if err != nil {
-			freeHandles(handles)
+			freeHandles(handles[:i])
 			return nil, err
 		}
 		handles[i] = handle
@@ -328,25 +328,21 @@ func valuesToHandles(values []Value) ([]uintptr, error) {
 }
 
 func pairsToHandles(pairs []Pair) ([]uintptr, []uintptr, error) {
-	keyHandles := make([]uintptr, len(pairs))
-	valueHandles := make([]uintptr, len(pairs))
+	keys := make([]uintptr, len(pairs))
+	values := make([]uintptr, len(pairs))
 	for i := range pairs {
 		key, err := valueToHandle(pairs[i].Key)
+		if err == nil {
+			keys[i] = key
+			values[i], err = valueToHandle(pairs[i].Value)
+		}
 		if err != nil {
-			freeHandles(keyHandles)
-			freeHandles(valueHandles)
+			freeHandles(keys[:i+1])
+			freeHandles(values[:i])
 			return nil, nil, err
 		}
-		keyHandles[i] = key
-		value, err := valueToHandle(pairs[i].Value)
-		if err != nil {
-			freeHandles(keyHandles)
-			freeHandles(valueHandles)
-			return nil, nil, err
-		}
-		valueHandles[i] = value
 	}
-	return keyHandles, valueHandles, nil
+	return keys, values, nil
 }
 
 func isPathFunction(function string) bool {

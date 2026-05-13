@@ -18,56 +18,34 @@ type Error struct {
 
 // Error returns the formatted Monty exception text.
 func (e *Error) Error() string {
-	if e == nil {
-		return ""
-	}
-	if e.Display != "" {
+	switch {
+	case e.Display != "":
 		return e.Display
-	}
-	if e.Message == "" {
+	case e.Message == "":
 		return e.Type
+	default:
+		return e.Type + ": " + e.Message
 	}
-	return e.Type + ": " + e.Message
 }
 
 func normalizeError(err error) error {
-	if err == nil {
-		return nil
-	}
 	if ffiErr, ok := errors.AsType[*ffi.Error](err); ok {
-		return &Error{
-			Type:    ffiErr.Type,
-			Message: ffiErr.Message,
-			Display: ffiErr.Display,
-		}
+		return &Error{Type: ffiErr.Type, Message: ffiErr.Message, Display: ffiErr.Display}
 	}
 	return err
 }
 
-func joinErrors(primary, secondary error) error {
-	if primary == nil {
-		return secondary
-	}
-	if secondary == nil {
-		return primary
-	}
-	return errors.Join(primary, secondary)
-}
-
 func exceptionFromError(err error) (string, string) {
-	const fallbackType = "RuntimeError"
+	const fallback = "RuntimeError"
 	if err == nil {
-		return fallbackType, ""
+		return fallback, ""
 	}
-	if montyErr, ok := errors.AsType[*Error](err); ok && montyErr.Type != "" {
-		message := montyErr.Message
+	if me, ok := errors.AsType[*Error](err); ok && me.Type != "" {
+		message := me.Message
 		if message == "" {
-			message = montyErr.Display
+			message = me.Display
 		}
-		if message == "" {
-			message = montyErr.Error()
-		}
-		return montyErr.Type, message
+		return me.Type, message
 	}
-	return fallbackType, err.Error()
+	return fallback, err.Error()
 }

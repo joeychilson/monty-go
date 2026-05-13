@@ -2,6 +2,7 @@ package monty
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
@@ -298,7 +299,7 @@ func resumeWithException(ctx context.Context, base *progressBase, excType, messa
 func decodeResumeResult(stdout io.Writer, nextHandle uintptr, printed string, err error) (Progress, error) {
 	writeErr := writePrinted(stdout, printed)
 	if err != nil {
-		return nil, joinErrors(normalizeError(err), writeErr)
+		return nil, errors.Join(normalizeError(err), writeErr)
 	}
 	if writeErr != nil {
 		ffi.ProgressFree(nextHandle)
@@ -371,14 +372,22 @@ func progressFromHandle(handle uintptr, stdout io.Writer) (Progress, error) {
 	}
 }
 
-func functionCallFromSnapshot(handle uintptr, snapshot ffi.ProgressSnapshot, stdout io.Writer) (*FunctionCall, error) {
+func callFromSnapshot(snapshot ffi.ProgressSnapshot) (string, []Value, []Pair, error) {
 	name := ffi.TakeString(snapshot.Name)
 	args, err := valuesFromRawList(snapshot.Args)
 	if err != nil {
 		ffi.RawValueFree(&snapshot.Kwargs)
-		return nil, err
+		return "", nil, nil, err
 	}
 	kwargs, err := pairsFromRawDict(snapshot.Kwargs)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return name, args, kwargs, nil
+}
+
+func functionCallFromSnapshot(handle uintptr, snapshot ffi.ProgressSnapshot, stdout io.Writer) (*FunctionCall, error) {
+	name, args, kwargs, err := callFromSnapshot(snapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -393,13 +402,7 @@ func functionCallFromSnapshot(handle uintptr, snapshot ffi.ProgressSnapshot, std
 }
 
 func osCallFromSnapshot(handle uintptr, snapshot ffi.ProgressSnapshot, stdout io.Writer) (*OSCall, error) {
-	function := ffi.TakeString(snapshot.Name)
-	args, err := valuesFromRawList(snapshot.Args)
-	if err != nil {
-		ffi.RawValueFree(&snapshot.Kwargs)
-		return nil, err
-	}
-	kwargs, err := pairsFromRawDict(snapshot.Kwargs)
+	function, args, kwargs, err := callFromSnapshot(snapshot)
 	if err != nil {
 		return nil, err
 	}

@@ -271,12 +271,12 @@ func isSignedIntType(typ reflect.Type) bool {
 
 func bindInput(target reflect.Type, args []Value, kwargs []Pair, fields []taggedField, nameToField map[string]taggedField) (reflect.Value, error) {
 	if target.Kind() == reflect.Pointer {
-		value, err := bindInput(target.Elem(), args, kwargs, fields, nameToField)
+		elem, err := bindInput(target.Elem(), args, kwargs, fields, nameToField)
 		if err != nil {
 			return reflect.Value{}, err
 		}
 		ptr := reflect.New(target.Elem())
-		ptr.Elem().Set(value)
+		ptr.Elem().Set(elem)
 		return ptr, nil
 	}
 	if target.Kind() != reflect.Struct {
@@ -286,37 +286,30 @@ func bindInput(target reflect.Type, args []Value, kwargs []Pair, fields []tagged
 		return valueAsReflect(args[0], target)
 	}
 	result := reflect.New(target).Elem()
-	if fields == nil && nameToField == nil {
-		info := taggedFieldsFor(target)
-		fields = info.fields
-		nameToField = info.nameToField
-	}
 	for i, arg := range args {
 		if i >= len(fields) {
 			return reflect.Value{}, fmt.Errorf("monty: too many positional args for %s", target)
 		}
-		field := result.FieldByIndex(fields[i].index)
 		value, err := valueAsReflect(arg, fields[i].fieldType)
 		if err != nil {
 			return reflect.Value{}, err
 		}
-		field.Set(value)
+		result.FieldByIndex(fields[i].index).Set(value)
 	}
-	for pairIndex := range kwargs {
-		pair := &kwargs[pairIndex]
+	for i := range kwargs {
+		pair := &kwargs[i]
 		if pair.Key.kind != StringKind {
 			return reflect.Value{}, fmt.Errorf("monty: keyword arg key must be string")
 		}
-		fieldInfo, ok := nameToField[pair.Key.text]
+		field, ok := nameToField[pair.Key.text]
 		if !ok {
 			return reflect.Value{}, fmt.Errorf("monty: unexpected keyword arg %q", pair.Key.text)
 		}
-		field := result.FieldByIndex(fieldInfo.index)
-		value, err := valueAsReflect(pair.Value, fieldInfo.fieldType)
+		value, err := valueAsReflect(pair.Value, field.fieldType)
 		if err != nil {
 			return reflect.Value{}, err
 		}
-		field.Set(value)
+		result.FieldByIndex(field.index).Set(value)
 	}
 	return result, nil
 }

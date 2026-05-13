@@ -2,6 +2,7 @@ package monty
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -17,9 +18,8 @@ import (
 // safe to call from multiple goroutines; calls are serialized because each
 // snippet mutates the session.
 type Repl struct {
-	mu         sync.Mutex
-	handle     uintptr
-	scriptName string
+	mu     sync.Mutex
+	handle uintptr
 }
 
 // ReplOption configures NewRepl.
@@ -54,7 +54,7 @@ func NewRepl(opts ...ReplOption) (*Repl, error) {
 	if err != nil {
 		return nil, normalizeError(err)
 	}
-	return &Repl{handle: handle, scriptName: config.scriptName}, nil
+	return &Repl{handle: handle}, nil
 }
 
 // LoadRepl restores a REPL session created by Repl.Dump.
@@ -63,7 +63,7 @@ func LoadRepl(snapshot []byte) (*Repl, error) {
 	if err != nil {
 		return nil, normalizeError(err)
 	}
-	return &Repl{handle: handle, scriptName: "<repl>"}, nil
+	return &Repl{handle: handle}, nil
 }
 
 // Close releases the Rust-side REPL handle.
@@ -160,7 +160,7 @@ func (r *Repl) CallFunction(ctx context.Context, name string, args []Value, opts
 func decodeReplResult(valueHandle uintptr, printed string, callErr error, stdout io.Writer) (Value, error) {
 	writeErr := writePrinted(stdout, printed)
 	if callErr != nil {
-		return Value{}, joinErrors(normalizeError(callErr), writeErr)
+		return Value{}, errors.Join(normalizeError(callErr), writeErr)
 	}
 	if writeErr != nil {
 		ffi.ValueFree(valueHandle)
