@@ -633,7 +633,8 @@ func formatNamedTuple(typeName string, fieldNames []string, values []Value) stri
 
 func formatDataclass(name string, attrs []Pair) string {
 	parts := make([]string, len(attrs))
-	for i, pair := range attrs {
+	for i := range attrs {
+		pair := &attrs[i]
 		key := pair.Key.text
 		if pair.Key.kind != StringKind {
 			key = pair.Key.String()
