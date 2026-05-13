@@ -14,7 +14,7 @@ import (
 // values serialize directly, while Python-only values use tagged objects such
 // as {"$tuple": [...]} or {"$bytes": [...]}.
 func (v Value) MarshalJSON() ([]byte, error) {
-	handle, err := valueHandle(v)
+	handle, err := valueToHandle(v)
 	if err != nil {
 		return nil, err
 	}
@@ -59,25 +59,12 @@ func (complete *Complete) JSONString() (string, error) {
 	return string(json), nil
 }
 
-// RunJSON executes program and returns the final value in Monty's natural JSON form.
-func RunJSON(ctx context.Context, program *Program, inputs any, opts ...RunOption) ([]byte, error) {
-	if program == nil {
-		return nil, fmt.Errorf("monty: program is closed")
-	}
-	return program.RunJSON(ctx, inputs, opts...)
-}
-
 // RunJSON executes p and returns the final value in Monty's natural JSON form.
 func (p *Program) RunJSON(ctx context.Context, inputs any, opts ...RunOption) ([]byte, error) {
 	if p == nil {
 		return nil, fmt.Errorf("monty: program is closed")
 	}
-	var config runConfig
-	if len(opts) == 0 {
-		config.functions = p.functions
-	} else {
-		config = p.runConfig(opts...)
-	}
+	config := p.runConfig(opts...)
 	if !config.needsDispatchLoop() {
 		return p.runJSONDirect(ctx, inputs, config)
 	}

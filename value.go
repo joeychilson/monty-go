@@ -295,7 +295,7 @@ func FrozenSet(v ...Value) Value { return sequenceValue(FrozenSetKind, slices.Cl
 
 func sequenceValue(kind Kind, items []Value) Value {
 	value := Value{kind: kind, items: items}
-	if raw, ok := borrowedRawValues(items); ok && len(raw) != 0 {
+	if raw, ok := tryBorrowRawValues(items); ok && len(raw) != 0 {
 		value.valueExtra = &valueExtra{rawValues: raw}
 	}
 	return value
@@ -303,7 +303,7 @@ func sequenceValue(kind Kind, items []Value) Value {
 
 func dictValue(pairs []Pair) Value {
 	value := Value{kind: DictKind, pairs: pairs}
-	if raw, ok := borrowedRawPairs(pairs); ok && len(raw) != 0 {
+	if raw, ok := tryBorrowRawPairs(pairs); ok && len(raw) != 0 {
 		value.valueExtra = &valueExtra{rawPairs: raw}
 	}
 	return value
@@ -576,9 +576,9 @@ func (v Value) String() string {
 	case BytesKind:
 		return fmt.Sprintf("%q", v.bytes)
 	case ListKind, SetKind, FrozenSetKind:
-		return "[" + strings.Join(valueStrings(v.items), ", ") + "]"
+		return "[" + strings.Join(valuesToStrings(v.items), ", ") + "]"
 	case TupleKind:
-		return "(" + strings.Join(valueStrings(v.items), ", ") + ")"
+		return "(" + strings.Join(valuesToStrings(v.items), ", ") + ")"
 	case NamedTupleKind:
 		extra := v.extraPtr()
 		return formatNamedTuple(extra.typeName, extra.fieldNames, v.items)
@@ -667,7 +667,7 @@ func formatDataclass(name string, fieldNames []string, attrs []Pair) string {
 	return name + "(" + strings.Join(parts, ", ") + ")"
 }
 
-func valueStrings(values []Value) []string {
+func valuesToStrings(values []Value) []string {
 	formatted := make([]string, len(values))
 	for i := range values {
 		formatted[i] = values[i].String()
@@ -870,7 +870,7 @@ type rawArena struct {
 	ownsHandles    bool
 }
 
-func valueHandle(v Value) (uintptr, error) {
+func valueToHandle(v Value) (uintptr, error) {
 	if err := ffi.EnsureLoaded(); err != nil {
 		return 0, err
 	}
@@ -908,13 +908,13 @@ func valueHandle(v Value) (uintptr, error) {
 	case DictKind:
 		return dictHandle(v.pairs)
 	case DateKind:
-		return ffi.ValueDate(ffiDate(v.Date()))
+		return ffi.ValueDate(toFFIDate(v.Date()))
 	case DateTimeKind:
-		return ffi.ValueDateTime(ffiDateTime(v.DateTime()))
+		return ffi.ValueDateTime(toFFIDateTime(v.DateTime()))
 	case TimeDeltaKind:
-		return ffi.ValueTimeDelta(ffiTimeDelta(v.TimeDelta()))
+		return ffi.ValueTimeDelta(toFFITimeDelta(v.TimeDelta()))
 	case TimeZoneKind:
-		return ffi.ValueTimeZone(ffiTimeZone(v.TimeZone()))
+		return ffi.ValueTimeZone(toFFITimeZone(v.TimeZone()))
 	case DataclassKind:
 		return dataclassHandle(v)
 	case FunctionKind:
@@ -930,8 +930,8 @@ func valueHandle(v Value) (uintptr, error) {
 	}
 }
 
-func rawValue(v Value, arena *rawArena) (ffi.RawValue, error) {
-	if raw, ok := borrowedRawValue(v); ok {
+func valueToRaw(v Value, arena *rawArena) (ffi.RawValue, error) {
+	if raw, ok := tryBorrowRawValue(v); ok {
 		return raw, nil
 	}
 	raw := ffi.RawValue{Kind: uint32(v.kind)}
@@ -956,7 +956,7 @@ func rawValue(v Value, arena *rawArena) (ffi.RawValue, error) {
 		return raw, nil
 	case FunctionKind:
 		if v.extraPtr().doc != "" {
-			handle, err := valueHandle(v)
+			handle, err := valueToHandle(v)
 			if err != nil {
 				return ffi.RawValue{}, err
 			}
@@ -980,7 +980,7 @@ func rawValue(v Value, arena *rawArena) (ffi.RawValue, error) {
 		}
 		return raw, nil
 	case ListKind, TupleKind, SetKind, FrozenSetKind:
-		values, err := rawValues(v.items, arena)
+		values, err := valuesToRaw(v.items, arena)
 		if err != nil {
 			return ffi.RawValue{}, err
 		}
@@ -990,7 +990,7 @@ func rawValue(v Value, arena *rawArena) (ffi.RawValue, error) {
 		}
 		return raw, nil
 	case DictKind:
-		pairs, err := rawPairs(v.pairs, arena)
+		pairs, err := pairsToRaw(v.pairs, arena)
 		if err != nil {
 			return ffi.RawValue{}, err
 		}
@@ -1000,7 +1000,7 @@ func rawValue(v Value, arena *rawArena) (ffi.RawValue, error) {
 		}
 		return raw, nil
 	default:
-		handle, err := valueHandle(v)
+		handle, err := valueToHandle(v)
 		if err != nil {
 			return ffi.RawValue{}, err
 		}
@@ -1015,7 +1015,7 @@ func ownedRawHandle(handle uintptr) ffi.RawValue {
 	return ffi.RawValue{Kind: ffi.KindOwnedHandle, Handle: handle}
 }
 
-func borrowedRawValue(v Value) (ffi.RawValue, bool) {
+func tryBorrowRawValue(v Value) (ffi.RawValue, bool) {
 	raw := ffi.RawValue{Kind: uint32(v.kind)}
 	switch v.kind {
 	case EllipsisKind, NoneKind:
@@ -1079,10 +1079,10 @@ func borrowedRawValue(v Value) (ffi.RawValue, bool) {
 	}
 }
 
-func borrowedRawValues(items []Value) ([]ffi.RawValue, bool) {
+func tryBorrowRawValues(items []Value) ([]ffi.RawValue, bool) {
 	rawItems := make([]ffi.RawValue, len(items))
 	for i, item := range items {
-		raw, ok := borrowedRawValue(item)
+		raw, ok := tryBorrowRawValue(item)
 		if !ok {
 			return nil, false
 		}
@@ -1091,14 +1091,14 @@ func borrowedRawValues(items []Value) ([]ffi.RawValue, bool) {
 	return rawItems, true
 }
 
-func borrowedRawPairs(pairs []Pair) ([]ffi.RawPair, bool) {
+func tryBorrowRawPairs(pairs []Pair) ([]ffi.RawPair, bool) {
 	rawPairItems := make([]ffi.RawPair, len(pairs))
 	for i := range pairs {
-		key, ok := borrowedRawValue(pairs[i].Key)
+		key, ok := tryBorrowRawValue(pairs[i].Key)
 		if !ok {
 			return nil, false
 		}
-		value, ok := borrowedRawValue(pairs[i].Value)
+		value, ok := tryBorrowRawValue(pairs[i].Value)
 		if !ok {
 			return nil, false
 		}
@@ -1109,7 +1109,7 @@ func borrowedRawPairs(pairs []Pair) ([]ffi.RawPair, bool) {
 
 func sequenceHandle(items []Value, asTuple bool) (uintptr, error) {
 	arena := &rawArena{}
-	values, err := rawValues(items, arena)
+	values, err := valuesToRaw(items, arena)
 	if err != nil {
 		return 0, err
 	}
@@ -1131,7 +1131,7 @@ func namedTupleHandle(v Value) (uintptr, error) {
 		return 0, fmt.Errorf("monty: named tuple has %d field names for %d values", len(extra.fieldNames), len(v.items))
 	}
 	arena := &rawArena{}
-	values, err := rawValues(v.items, arena)
+	values, err := valuesToRaw(v.items, arena)
 	if err != nil {
 		return 0, err
 	}
@@ -1144,7 +1144,7 @@ func namedTupleHandle(v Value) (uintptr, error) {
 
 func setHandle(items []Value, asFrozenSet bool) (uintptr, error) {
 	arena := &rawArena{}
-	values, err := rawValues(items, arena)
+	values, err := valuesToRaw(items, arena)
 	if err != nil {
 		return 0, err
 	}
@@ -1162,7 +1162,7 @@ func setHandle(items []Value, asFrozenSet bool) (uintptr, error) {
 
 func dictHandle(pairs []Pair) (uintptr, error) {
 	arena := &rawArena{}
-	rawPairs, err := rawPairs(pairs, arena)
+	rawPairs, err := pairsToRaw(pairs, arena)
 	if err != nil {
 		return 0, err
 	}
@@ -1176,7 +1176,7 @@ func dictHandle(pairs []Pair) (uintptr, error) {
 func dataclassHandle(v Value) (uintptr, error) {
 	extra := v.extraPtr()
 	arena := &rawArena{}
-	rawPairs, err := rawPairs(v.pairs, arena)
+	rawPairs, err := pairsToRaw(v.pairs, arena)
 	if err != nil {
 		return 0, err
 	}
@@ -1187,12 +1187,12 @@ func dataclassHandle(v Value) (uintptr, error) {
 	return handle, err
 }
 
-func ffiDate(date MontyDate) ffi.Date {
+func toFFIDate(date MontyDate) ffi.Date {
 	//nolint:gosec // Python date fields are bounded: year fits int32, month/day fit uint8
 	return ffi.Date{Year: int32(date.Year), Month: uint8(date.Month), Day: uint8(date.Day)}
 }
 
-func ffiDateTime(value MontyDateTime) ffi.DateTime {
+func toFFIDateTime(value MontyDateTime) ffi.DateTime {
 	//nolint:gosec // Python datetime fields are bounded by their calendar/clock ranges
 	raw := ffi.DateTime{
 		Year:          int32(value.Year),
@@ -1214,7 +1214,7 @@ func ffiDateTime(value MontyDateTime) ffi.DateTime {
 	return raw
 }
 
-func ffiTimeDelta(value MontyTimeDelta) ffi.TimeDelta {
+func toFFITimeDelta(value MontyTimeDelta) ffi.TimeDelta {
 	//nolint:gosec // Python timedelta fields fit int32 (days bounded to ~±1e9 by Python)
 	return ffi.TimeDelta{
 		Days:         int32(value.Days),
@@ -1223,7 +1223,7 @@ func ffiTimeDelta(value MontyTimeDelta) ffi.TimeDelta {
 	}
 }
 
-func ffiTimeZone(value MontyTimeZone) ffi.TimeZone {
+func toFFITimeZone(value MontyTimeZone) ffi.TimeZone {
 	//nolint:gosec // timezone offset bounded to ±14h in seconds; fits int32
 	raw := ffi.TimeZone{OffsetSeconds: int32(value.OffsetSeconds)}
 	if value.HasName {
@@ -1233,11 +1233,11 @@ func ffiTimeZone(value MontyTimeZone) ffi.TimeZone {
 	return raw
 }
 
-func goDate(date ffi.Date) MontyDate {
+func fromFFIDate(date ffi.Date) MontyDate {
 	return MontyDate{Year: int(date.Year), Month: time.Month(date.Month), Day: int(date.Day)}
 }
 
-func goDateTime(value ffi.DateTime) MontyDateTime {
+func fromFFIDateTime(value ffi.DateTime) MontyDateTime {
 	return MontyDateTime{
 		Year:            int(value.Year),
 		Month:           time.Month(value.Month),
@@ -1253,7 +1253,7 @@ func goDateTime(value ffi.DateTime) MontyDateTime {
 	}
 }
 
-func goTimeDelta(value ffi.TimeDelta) MontyTimeDelta {
+func fromFFITimeDelta(value ffi.TimeDelta) MontyTimeDelta {
 	return MontyTimeDelta{
 		Days:         int(value.Days),
 		Seconds:      int(value.Seconds),
@@ -1261,7 +1261,7 @@ func goTimeDelta(value ffi.TimeDelta) MontyTimeDelta {
 	}
 }
 
-func goTimeZone(value ffi.TimeZone) MontyTimeZone {
+func fromFFITimeZone(value ffi.TimeZone) MontyTimeZone {
 	return MontyTimeZone{
 		OffsetSeconds: int(value.OffsetSeconds),
 		Name:          ffi.TakeString(value.Name),
@@ -1275,13 +1275,13 @@ func freeHandles(handles []uintptr) {
 	}
 }
 
-func rawValues(items []Value, arena *rawArena) ([]ffi.RawValue, error) {
+func valuesToRaw(items []Value, arena *rawArena) ([]ffi.RawValue, error) {
 	rawItems := make([]ffi.RawValue, len(items))
 	if arena != nil && len(rawItems) != 0 {
 		arena.rawValueSlices = append(arena.rawValueSlices, rawItems)
 	}
 	for i, item := range items {
-		raw, err := rawValue(item, arena)
+		raw, err := valueToRaw(item, arena)
 		if err != nil {
 			freeOwnedRawValues(rawItems)
 			return nil, err
@@ -1291,19 +1291,19 @@ func rawValues(items []Value, arena *rawArena) ([]ffi.RawValue, error) {
 	return rawItems, nil
 }
 
-func rawPairs(pairs []Pair, arena *rawArena) ([]ffi.RawPair, error) {
+func pairsToRaw(pairs []Pair, arena *rawArena) ([]ffi.RawPair, error) {
 	rawPairItems := make([]ffi.RawPair, len(pairs))
 	if arena != nil && len(rawPairItems) != 0 {
 		arena.rawPairSlices = append(arena.rawPairSlices, rawPairItems)
 	}
 	for i := range pairs {
-		key, err := rawValue(pairs[i].Key, arena)
+		key, err := valueToRaw(pairs[i].Key, arena)
 		if err != nil {
 			freeOwnedRawPairs(rawPairItems)
 			return nil, err
 		}
 		rawPairItems[i].Key = key
-		value, err := rawValue(pairs[i].Value, arena)
+		value, err := valueToRaw(pairs[i].Value, arena)
 		if err != nil {
 			freeOwnedRawPairs(rawPairItems)
 			return nil, err
@@ -1393,16 +1393,16 @@ func decodeValue(handle uintptr) (Value, error) {
 		return decodeDict(handle, kind)
 	case DateKind:
 		date, err := ffi.ValueDateGet(handle)
-		return DateValue(goDate(date)), err
+		return DateValue(fromFFIDate(date)), err
 	case DateTimeKind:
 		datetime, err := ffi.ValueDateTimeGet(handle)
-		return DateTime(goDateTime(datetime)), err
+		return DateTime(fromFFIDateTime(datetime)), err
 	case TimeDeltaKind:
 		delta, err := ffi.ValueTimeDeltaGet(handle)
-		return TimeDeltaValue(goTimeDelta(delta)), err
+		return TimeDeltaValue(fromFFITimeDelta(delta)), err
 	case TimeZoneKind:
 		tz, err := ffi.ValueTimeZoneGet(handle)
-		return TimeZoneValue(goTimeZone(tz)), err
+		return TimeZoneValue(fromFFITimeZone(tz)), err
 	case DataclassKind:
 		return decodeDataclass(handle)
 	default:
@@ -1466,13 +1466,13 @@ func decodeDict(handle uintptr, kind Kind) (Value, error) {
 		if err != nil {
 			ffi.RawValueFree(&rawPairs[i].Key)
 			ffi.RawValueFree(&rawPairs[i].Value)
-			freeRawPairs(rawPairs[i+1:])
+			freeAllRawPairs(rawPairs[i+1:])
 			return Value{}, err
 		}
 		value, err := decodeRawValue(rawPairs[i].Value)
 		if err != nil {
 			ffi.RawValueFree(&rawPairs[i].Value)
-			freeRawPairs(rawPairs[i+1:])
+			freeAllRawPairs(rawPairs[i+1:])
 			return Value{}, err
 		}
 		pairs[i] = Pair{Key: key, Value: value}
@@ -1508,10 +1508,10 @@ func decodeOwnedValue(handle uintptr) (Value, error) {
 }
 
 func decodeRawValue(raw ffi.RawValue) (Value, error) {
-	return decodeRawValueCached(raw, nil)
+	return decodeRawValueIntern(raw, nil)
 }
 
-func decodeRawValueCached(raw ffi.RawValue, stringCache map[string]string) (Value, error) {
+func decodeRawValueIntern(raw ffi.RawValue, stringCache map[string]string) (Value, error) {
 	kind := Kind(raw.Kind)
 	switch kind {
 	case InvalidKind:
@@ -1573,7 +1573,7 @@ func decodeRawSequence(raw ffi.RawValue, kind Kind, stringCache map[string]strin
 	rawItems := unsafe.Slice((*ffi.RawValue)(raw.Ptr), itemCount)
 	items := make([]Value, itemCount)
 	for i := range rawItems {
-		item, err := decodeRawValueCached(rawItems[i], stringCache)
+		item, err := decodeRawValueIntern(rawItems[i], stringCache)
 		if err != nil {
 			ffi.RawValueFree(&raw)
 			return Value{}, err
@@ -1604,14 +1604,14 @@ func decodeRawDict(raw ffi.RawValue, kind Kind, stringCache map[string]string) (
 		if Kind(rawPairs[i].Key.Kind) == StringKind {
 			key = Value{kind: StringKind, text: takeInternedRawString(&rawPairs[i].Key, stringCache)}
 		} else {
-			key, err = decodeRawValueCached(rawPairs[i].Key, stringCache)
+			key, err = decodeRawValueIntern(rawPairs[i].Key, stringCache)
 			if err != nil {
 				ffi.RawValueFree(&raw)
 				return Value{}, err
 			}
 		}
 		rawPairs[i].Key = ffi.RawValue{}
-		value, err := decodeRawValueCached(rawPairs[i].Value, stringCache)
+		value, err := decodeRawValueIntern(rawPairs[i].Value, stringCache)
 		if err != nil {
 			ffi.RawValueFree(&raw)
 			return Value{}, err
@@ -1814,7 +1814,7 @@ func (r *flatValueReader) readString() (string, error) {
 	return unsafe.String(unsafe.SliceData(bytes), len(bytes)), nil
 }
 
-func freeRawPairs(pairs []ffi.RawPair) {
+func freeAllRawPairs(pairs []ffi.RawPair) {
 	for i := range pairs {
 		ffi.RawValueFree(&pairs[i].Key)
 		ffi.RawValueFree(&pairs[i].Value)

@@ -18,14 +18,13 @@ type Function struct {
 	doc              string
 	handler          reflect.Value
 	handlerType      reflect.Type
-	fastCall         func(context.Context, []Value, []Pair) (Value, error)
 	fastRawCall      func(context.Context, ffi.RawValue, ffi.RawValue) (ffi.RawValue, error)
 	inputType        reflect.Type
 	outputType       reflect.Type
 	takesContext     bool
-	inputFields      []montyField
-	inputNameToField map[string]montyField
-	outputFields     []montyField
+	inputFields      []taggedField
+	inputNameToField map[string]taggedField
+	outputFields     []taggedField
 }
 
 // FunctionOption configures a Function.
@@ -46,11 +45,8 @@ func NewFunction(name string, handler any, opts ...FunctionOption) *Function {
 	for _, opt := range opts {
 		opt(f)
 	}
-	f.fastCall, f.fastRawCall = fastFunctionCall(handler)
 	f.inspect()
-	if f.fastRawCall == nil {
-		f.fastRawCall = f.fastReflectRawCall()
-	}
+	f.fastRawCall = f.fastReflectRawCall()
 	return f
 }
 
@@ -109,19 +105,16 @@ func (f *Function) inspect() {
 		f.outputType = functionType.Out(0)
 	}
 	if f.inputType != nil {
-		inputInfo := montyFieldInfoFor(f.inputType)
+		inputInfo := taggedFieldsFor(f.inputType)
 		f.inputFields = inputInfo.fields
 		f.inputNameToField = inputInfo.nameToField
 	}
 	if f.outputType != nil {
-		f.outputFields = montyFieldInfoFor(f.outputType).fields
+		f.outputFields = taggedFieldsFor(f.outputType).fields
 	}
 }
 
 func (f *Function) call(ctx context.Context, args []Value, kwargs []Pair) (Value, error) {
-	if f.fastCall != nil {
-		return f.fastCall(ctx, args, kwargs)
-	}
 	if !f.handler.IsValid() || f.handler.Kind() != reflect.Func {
 		return Value{}, fmt.Errorf("monty: function %q is not callable", f.name)
 	}
@@ -151,141 +144,6 @@ func (f *Function) call(ctx context.Context, args []Value, kwargs []Pair) (Value
 		return Value{}, err
 	}
 	return From(callResults[0].Interface())
-}
-
-func fastFunctionCall(handler any) (
-	func(context.Context, []Value, []Pair) (Value, error),
-	func(context.Context, ffi.RawValue, ffi.RawValue) (ffi.RawValue, error),
-) {
-	switch fn := handler.(type) {
-	case func(int) (int, error):
-		fastCall := func(_ context.Context, args []Value, kwargs []Pair) (Value, error) {
-			value, err := bindFastIntArg(args, kwargs)
-			if err != nil {
-				return Value{}, err
-			}
-			result, err := fn(value)
-			if err != nil {
-				return Value{}, err
-			}
-			return Int(result), nil
-		}
-		fastRawCall := func(_ context.Context, args ffi.RawValue, kwargs ffi.RawValue) (ffi.RawValue, error) {
-			value, err := bindFastRawIntArg(args, kwargs)
-			if err != nil {
-				return ffi.RawValue{}, err
-			}
-			result, err := fn(value)
-			if err != nil {
-				return ffi.RawValue{}, err
-			}
-			return ffi.RawValue{Kind: ffi.KindInt, Int: int64(result)}, nil
-		}
-		return fastCall, fastRawCall
-	case func(context.Context, int) (int, error):
-		fastCall := func(ctx context.Context, args []Value, kwargs []Pair) (Value, error) {
-			value, err := bindFastIntArg(args, kwargs)
-			if err != nil {
-				return Value{}, err
-			}
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			result, err := fn(ctx, value)
-			if err != nil {
-				return Value{}, err
-			}
-			return Int(result), nil
-		}
-		fastRawCall := func(ctx context.Context, args ffi.RawValue, kwargs ffi.RawValue) (ffi.RawValue, error) {
-			value, err := bindFastRawIntArg(args, kwargs)
-			if err != nil {
-				return ffi.RawValue{}, err
-			}
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			result, err := fn(ctx, value)
-			if err != nil {
-				return ffi.RawValue{}, err
-			}
-			return ffi.RawValue{Kind: ffi.KindInt, Int: int64(result)}, nil
-		}
-		return fastCall, fastRawCall
-	case func(int) int:
-		fastCall := func(_ context.Context, args []Value, kwargs []Pair) (Value, error) {
-			value, err := bindFastIntArg(args, kwargs)
-			if err != nil {
-				return Value{}, err
-			}
-			return Int(fn(value)), nil
-		}
-		fastRawCall := func(_ context.Context, args ffi.RawValue, kwargs ffi.RawValue) (ffi.RawValue, error) {
-			value, err := bindFastRawIntArg(args, kwargs)
-			if err != nil {
-				return ffi.RawValue{}, err
-			}
-			return ffi.RawValue{Kind: ffi.KindInt, Int: int64(fn(value))}, nil
-		}
-		return fastCall, fastRawCall
-	case func(context.Context, int) int:
-		fastCall := func(ctx context.Context, args []Value, kwargs []Pair) (Value, error) {
-			value, err := bindFastIntArg(args, kwargs)
-			if err != nil {
-				return Value{}, err
-			}
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			return Int(fn(ctx, value)), nil
-		}
-		fastRawCall := func(ctx context.Context, args ffi.RawValue, kwargs ffi.RawValue) (ffi.RawValue, error) {
-			value, err := bindFastRawIntArg(args, kwargs)
-			if err != nil {
-				return ffi.RawValue{}, err
-			}
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			return ffi.RawValue{Kind: ffi.KindInt, Int: int64(fn(ctx, value))}, nil
-		}
-		return fastCall, fastRawCall
-	default:
-		return nil, nil
-	}
-}
-
-func bindFastIntArg(args []Value, kwargs []Pair) (int, error) {
-	if len(kwargs) != 0 {
-		return 0, fmt.Errorf("monty: int fast path does not accept keyword args")
-	}
-	if len(args) != 1 {
-		return 0, fmt.Errorf("monty: expected 1 positional arg, got %d", len(args))
-	}
-	if args[0].kind != IntKind {
-		return 0, fmt.Errorf("monty: cannot assign %s to int", args[0].kind)
-	}
-	return args[0].Int(), nil
-}
-
-func bindFastRawIntArg(args ffi.RawValue, kwargs ffi.RawValue) (int, error) {
-	if Kind(kwargs.Kind) == DictKind && kwargs.Len != 0 {
-		return 0, fmt.Errorf("monty: int fast path does not accept keyword args")
-	}
-	if Kind(args.Kind) != ListKind {
-		return 0, fmt.Errorf("monty: expected positional args list, got %s", Kind(args.Kind))
-	}
-	if args.Len != 1 {
-		return 0, fmt.Errorf("monty: expected 1 positional arg, got %d", args.Len)
-	}
-	if args.Ptr == nil {
-		return 0, fmt.Errorf("monty: raw args pointer is null")
-	}
-	values := unsafe.Slice((*ffi.RawValue)(args.Ptr), args.Len)
-	if Kind(values[0].Kind) != IntKind {
-		return 0, fmt.Errorf("monty: cannot assign %s to int", Kind(values[0].Kind))
-	}
-	return int(values[0].Int), nil
 }
 
 func (f *Function) fastReflectRawCall() func(context.Context, ffi.RawValue, ffi.RawValue) (ffi.RawValue, error) {
@@ -340,7 +198,7 @@ func (f *Function) fastReflectRawCall() func(context.Context, ffi.RawValue, ffi.
 	}
 }
 
-func bindRawStructInput(target reflect.Value, args ffi.RawValue, kwargs ffi.RawValue, fields []montyField, nameToField map[string]montyField) error {
+func bindRawStructInput(target reflect.Value, args ffi.RawValue, kwargs ffi.RawValue, fields []taggedField, nameToField map[string]taggedField) error {
 	if Kind(args.Kind) != ListKind {
 		return fmt.Errorf("monty: expected positional args list, got %s", Kind(args.Kind))
 	}
@@ -411,7 +269,7 @@ func isSignedIntType(typ reflect.Type) bool {
 	}
 }
 
-func bindInput(target reflect.Type, args []Value, kwargs []Pair, fields []montyField, nameToField map[string]montyField) (reflect.Value, error) {
+func bindInput(target reflect.Type, args []Value, kwargs []Pair, fields []taggedField, nameToField map[string]taggedField) (reflect.Value, error) {
 	if target.Kind() == reflect.Pointer {
 		value, err := bindInput(target.Elem(), args, kwargs, fields, nameToField)
 		if err != nil {
@@ -429,7 +287,7 @@ func bindInput(target reflect.Type, args []Value, kwargs []Pair, fields []montyF
 	}
 	result := reflect.New(target).Elem()
 	if fields == nil && nameToField == nil {
-		info := montyFieldInfoFor(target)
+		info := taggedFieldsFor(target)
 		fields = info.fields
 		nameToField = info.nameToField
 	}
@@ -643,7 +501,7 @@ func valueAsReflect(value Value, target reflect.Type) (reflect.Value, error) {
 		if value.kind != DictKind && value.kind != DataclassKind {
 			return reflect.Value{}, fmt.Errorf("monty: cannot assign %s to struct", value.kind)
 		}
-		info := montyFieldInfoFor(target)
+		info := taggedFieldsFor(target)
 		for pairIndex := range value.pairs {
 			pair := &value.pairs[pairIndex]
 			if pair.Key.kind != StringKind {
@@ -674,43 +532,43 @@ func sequenceItems(value Value) ([]Value, bool) {
 	}
 }
 
-type montyField struct {
+type taggedField struct {
 	name      string
 	index     []int
 	fieldType reflect.Type
 }
 
-type montyFieldInfo struct {
-	fields      []montyField
-	nameToField map[string]montyField
+type taggedFieldInfo struct {
+	fields      []taggedField
+	nameToField map[string]taggedField
 }
 
-var montyFieldCache sync.Map
+var taggedFieldCache sync.Map
 
-func montyFieldInfoFor(t reflect.Type) montyFieldInfo {
+func taggedFieldsFor(t reflect.Type) taggedFieldInfo {
 	if t == nil {
-		return montyFieldInfo{}
+		return taggedFieldInfo{}
 	}
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
-		return montyFieldInfo{}
+		return taggedFieldInfo{}
 	}
-	if cached, ok := montyFieldCache.Load(t); ok {
-		return cached.(montyFieldInfo) //nolint:errcheck // montyFieldCache only stores montyFieldInfo
+	if cached, ok := taggedFieldCache.Load(t); ok {
+		return cached.(taggedFieldInfo) //nolint:errcheck // taggedFieldCache only stores taggedFieldInfo
 	}
-	fields := buildMontyFields(t)
-	nameToField := make(map[string]montyField, len(fields))
+	fields := buildTaggedFields(t)
+	nameToField := make(map[string]taggedField, len(fields))
 	for _, field := range fields {
 		nameToField[field.name] = field
 	}
-	info := montyFieldInfo{fields: fields, nameToField: nameToField}
-	actual, _ := montyFieldCache.LoadOrStore(t, info)
-	return actual.(montyFieldInfo) //nolint:errcheck // montyFieldCache only stores montyFieldInfo
+	info := taggedFieldInfo{fields: fields, nameToField: nameToField}
+	actual, _ := taggedFieldCache.LoadOrStore(t, info)
+	return actual.(taggedFieldInfo) //nolint:errcheck // taggedFieldCache only stores taggedFieldInfo
 }
 
-func buildMontyFields(t reflect.Type) []montyField {
+func buildTaggedFields(t reflect.Type) []taggedField {
 	if t == nil {
 		return nil
 	}
@@ -720,14 +578,14 @@ func buildMontyFields(t reflect.Type) []montyField {
 	if t.Kind() != reflect.Struct {
 		return nil
 	}
-	fields := make([]montyField, 0, t.NumField())
+	fields := make([]taggedField, 0, t.NumField())
 	for field := range t.Fields() {
 		if field.PkgPath != "" {
 			continue
 		}
 		name, ok := fieldName(field)
 		if ok {
-			fields = append(fields, montyField{
+			fields = append(fields, taggedField{
 				name:      name,
 				index:     append([]int(nil), field.Index...),
 				fieldType: field.Type,

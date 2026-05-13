@@ -27,27 +27,11 @@ type Program struct {
 	funcNames  []ffi.Str
 }
 
-const (
-	minPooledInputCount = 1
-	maxPooledInputCount = 16
-)
-
-var rawInputPools [maxPooledInputCount + 1]chan []ffi.RawValue
-
 var runFastOutputPool = sync.Pool{
 	New: func() any { return new(ffi.RunFastOutput) },
 }
 
-var (
-	hostCallbackOnce sync.Once
-	hostCallbackPtr  uintptr
-)
-
-func init() {
-	for i := minPooledInputCount; i <= maxPooledInputCount; i++ {
-		rawInputPools[i] = make(chan []ffi.RawValue, 64)
-	}
-}
+var hostCallbackPtr = ffi.NewCallback(hostFunctionCallback)
 
 // Compile compiles Python code into a reusable Program.
 func Compile(code string, opts ...CompileOption) (*Program, error) {
@@ -114,28 +98,6 @@ func LoadProgram(snapshot []byte) (*Program, error) {
 	return program, nil
 }
 
-// compileRunScratch bundles the per-call buffers needed by CompileAndRun.
-// Pooling them keeps the fused fast path allocation-free for typical input
-// counts. The embedded config keeps RunOption-applied state on the pooled
-// allocation instead of forcing a fresh heap alloc per call.
-type compileRunScratch struct {
-	config   runConfig
-	args     ffi.CompileRunFastRawArgs
-	output   ffi.RunFastOutput
-	nameRefs []ffi.Str
-	raw      []ffi.RawValue
-	arena    rawArena
-}
-
-var compileRunScratchPool = sync.Pool{
-	New: func() any {
-		return &compileRunScratch{
-			nameRefs: make([]ffi.Str, 0, 8),
-			raw:      make([]ffi.RawValue, 0, 8),
-		}
-	},
-}
-
 // CompileAndRun compiles code, runs it once with inputs, and frees the
 // underlying Rust program — all in a single FFI hop. It is materially faster
 // than Compile + Run + Close for one-shot evaluations because it pays the
@@ -153,25 +115,14 @@ func CompileAndRun(ctx context.Context, code string, inputs any, opts ...RunOpti
 	if err != nil {
 		return Value{}, err
 	}
-	scratch := compileRunScratchPool.Get().(*compileRunScratch) //nolint:errcheck // pool only stores *compileRunScratch
-	defer func() {
-		clear(scratch.nameRefs)
-		clear(scratch.raw)
-		scratch.nameRefs = scratch.nameRefs[:0]
-		scratch.raw = scratch.raw[:0]
-		scratch.arena = rawArena{}
-		scratch.args = ffi.CompileRunFastRawArgs{}
-		scratch.output = ffi.RunFastOutput{}
-		scratch.config = runConfig{}
-		compileRunScratchPool.Put(scratch)
-	}()
+	var config runConfig
 	for _, opt := range opts {
-		opt(&scratch.config)
+		opt(&config)
 	}
 	if deadline, ok := ctx.Deadline(); ok {
-		scratch.config.limits = limitsWithContextDeadline(scratch.config.limits, deadline)
+		config.limits = limitsWithContextDeadline(config.limits, deadline)
 	}
-	if scratch.config.needsDispatchLoop() {
+	if config.needsDispatchLoop() {
 		inputNames := make([]string, 0, len(values))
 		for name := range values {
 			inputNames = append(inputNames, name)
@@ -183,46 +134,51 @@ func CompileAndRun(ctx context.Context, code string, inputs any, opts ...RunOpti
 		defer program.Close()
 		return program.Run(ctx, values, opts...)
 	}
+	var arena rawArena
+	nameRefs := make([]ffi.Str, 0, len(values))
+	raw := make([]ffi.RawValue, 0, len(values))
 	for name, value := range values {
-		rawInput, err := rawValue(value, &scratch.arena)
+		rawInput, err := valueToRaw(value, &arena)
 		if err != nil {
 			return Value{}, err
 		}
-		scratch.nameRefs = append(scratch.nameRefs, ffi.StringRef(name))
-		scratch.raw = append(scratch.raw, rawInput)
+		nameRefs = append(nameRefs, ffi.StringRef(name))
+		raw = append(raw, rawInput)
 	}
 	var nameRefsPtr, rawPtr unsafe.Pointer
-	if len(scratch.nameRefs) > 0 {
-		nameRefsPtr = unsafe.Pointer(unsafe.SliceData(scratch.nameRefs))
-		rawPtr = unsafe.Pointer(unsafe.SliceData(scratch.raw))
+	if len(nameRefs) > 0 {
+		nameRefsPtr = unsafe.Pointer(unsafe.SliceData(nameRefs))
+		rawPtr = unsafe.Pointer(unsafe.SliceData(raw))
 	}
 	var ffiLimits *ffi.Limits
-	if scratch.config.limits != nil {
-		ffiLimits = scratch.config.limits.ffi()
+	if config.limits != nil {
+		ffiLimits = config.limits.ffi()
 	}
-	scratch.args = ffi.CompileRunFastRawArgs{
+	args := ffi.CompileRunFastRawArgs{
 		Code:            ffi.StringRef(code),
 		ScriptName:      ffi.StringRef("main.py"),
 		InputNames:      nameRefsPtr,
-		InputCount:      uintptr(len(scratch.nameRefs)),
+		InputCount:      uintptr(len(nameRefs)),
 		InputValues:     rawPtr,
-		InputValueCount: uintptr(len(scratch.raw)),
+		InputValueCount: uintptr(len(raw)),
 		Limits:          ffiLimits,
 	}
-	printed, err := ffi.ProgramCompileRunFastRaw(&scratch.args, &scratch.output)
+	output := runFastOutputPool.Get().(*ffi.RunFastOutput) //nolint:errcheck // pool only stores *ffi.RunFastOutput
+	defer runFastOutputPool.Put(output)
+	printed, err := ffi.ProgramCompileRunFastRaw(&args, output)
 	runtime.KeepAlive(values)
-	writeErr := writePrinted(scratch.config.stdout, printed)
+	writeErr := writePrinted(config.stdout, printed)
 	if err != nil {
-		ffi.RawValueFree(&scratch.output.Value)
-		freeFastOutputBytes(&scratch.output)
+		ffi.RawValueFree(&output.Value)
+		freeFastOutputBytes(output)
 		return Value{}, joinErrors(normalizeError(err), writeErr)
 	}
 	if writeErr != nil {
-		ffi.RawValueFree(&scratch.output.Value)
-		freeFastOutputBytes(&scratch.output)
+		ffi.RawValueFree(&output.Value)
+		freeFastOutputBytes(output)
 		return Value{}, writeErr
 	}
-	return decodeFastOutput(&scratch.output)
+	return decodeFastOutput(output)
 }
 
 // freeFastOutputBytes releases the Rust-owned flat buffer when one was emitted.
@@ -278,12 +234,15 @@ func (p *Program) Close() {
 
 // Dump serializes a compiled Program so it can be loaded in another process.
 func (p *Program) Dump() ([]byte, error) {
-	var snapshot []byte
-	err := p.withHandle(func(handle uintptr) error {
-		var dumpErr error
-		snapshot, dumpErr = ffi.ProgramDump(handle)
-		return dumpErr
-	})
+	if p == nil {
+		return nil, fmt.Errorf("monty: program is closed")
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.handle == 0 {
+		return nil, fmt.Errorf("monty: program is closed")
+	}
+	snapshot, err := ffi.ProgramDump(p.handle)
 	return snapshot, normalizeError(err)
 }
 
@@ -305,11 +264,7 @@ func (p *Program) Start(ctx context.Context, inputs any, opts ...RunOption) (Pro
 	if p == nil {
 		return nil, fmt.Errorf("monty: program is closed")
 	}
-	var config runConfig
-	if len(opts) != 0 {
-		config = p.runConfig(opts...)
-	}
-	return p.start(ctx, inputs, config)
+	return p.start(ctx, inputs, p.runConfig(opts...))
 }
 
 func (p *Program) start(ctx context.Context, inputs any, config runConfig) (Progress, error) {
@@ -329,11 +284,15 @@ func (p *Program) start(ctx context.Context, inputs any, config runConfig) (Prog
 	}
 	var progressHandle uintptr
 	var printed string
-	err = p.withHandle(func(handle uintptr) error {
-		var startErr error
-		progressHandle, printed, startErr = ffi.ProgramStartRaw(handle, rawInputs, ffiLimits)
-		return startErr
-	})
+	p.mu.RLock()
+	if p.handle == 0 {
+		p.mu.RUnlock()
+		p.releaseRawInputs(rawInputs, keepAlive)
+		runtime.KeepAlive(keepAlive)
+		return nil, fmt.Errorf("monty: program is closed")
+	}
+	progressHandle, printed, err = ffi.ProgramStartRaw(p.handle, rawInputs, ffiLimits)
+	p.mu.RUnlock()
 	p.releaseRawInputs(rawInputs, keepAlive)
 	runtime.KeepAlive(keepAlive)
 	writeErr := writePrinted(config.stdout, printed)
@@ -347,7 +306,7 @@ func (p *Program) start(ctx context.Context, inputs any, config runConfig) (Prog
 	return progressFromHandle(progressHandle, config.stdout)
 }
 
-func (p *Program) runDirectFast(inputs any, config runConfig) (Value, error) {
+func (p *Program) runDirectValue(inputs any, config runConfig) (Value, error) {
 	rawInputs, keepAlive, err := p.rawInputs(inputs)
 	if err != nil {
 		return Value{}, err
@@ -417,72 +376,6 @@ func (p *Program) runDirectRaw(inputs any, config runConfig) (ffi.RawValue, erro
 	return rawResult, nil
 }
 
-func (p *Program) runDirectRawInt(inputs any, config runConfig) (int64, Kind, error) {
-	rawInputs, keepAlive, err := p.rawInputs(inputs)
-	if err != nil {
-		return 0, InvalidKind, err
-	}
-	var ffiLimits *ffi.Limits
-	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
-	}
-	var value int64
-	var kind uint32
-	var printed string
-	p.mu.RLock()
-	if p.handle == 0 {
-		p.mu.RUnlock()
-		p.releaseRawInputs(rawInputs, keepAlive)
-		runtime.KeepAlive(keepAlive)
-		return 0, InvalidKind, fmt.Errorf("monty: program is closed")
-	}
-	value, kind, printed, err = ffi.ProgramRunRawInt(p.handle, rawInputs, ffiLimits)
-	p.mu.RUnlock()
-	p.releaseRawInputs(rawInputs, keepAlive)
-	runtime.KeepAlive(keepAlive)
-	writeErr := writePrinted(config.stdout, printed)
-	if err != nil {
-		return 0, InvalidKind, joinErrors(normalizeError(err), writeErr)
-	}
-	if writeErr != nil {
-		return 0, InvalidKind, writeErr
-	}
-	return value, Kind(kind), nil
-}
-
-func (p *Program) runDirectRawText(inputs any, config runConfig) (string, Kind, error) {
-	rawInputs, keepAlive, err := p.rawInputs(inputs)
-	if err != nil {
-		return "", InvalidKind, err
-	}
-	var ffiLimits *ffi.Limits
-	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
-	}
-	var value string
-	var kind uint32
-	var printed string
-	p.mu.RLock()
-	if p.handle == 0 {
-		p.mu.RUnlock()
-		p.releaseRawInputs(rawInputs, keepAlive)
-		runtime.KeepAlive(keepAlive)
-		return "", InvalidKind, fmt.Errorf("monty: program is closed")
-	}
-	value, kind, printed, err = ffi.ProgramRunRawText(p.handle, rawInputs, ffiLimits)
-	p.mu.RUnlock()
-	p.releaseRawInputs(rawInputs, keepAlive)
-	runtime.KeepAlive(keepAlive)
-	writeErr := writePrinted(config.stdout, printed)
-	if err != nil {
-		return "", InvalidKind, joinErrors(normalizeError(err), writeErr)
-	}
-	if writeErr != nil {
-		return "", InvalidKind, writeErr
-	}
-	return value, Kind(kind), nil
-}
-
 // Run executes the Program until it completes and returns the final Python value.
 //
 // Registered Go functions are resolved automatically. Runs without registered
@@ -494,25 +387,16 @@ func (p *Program) Run(ctx context.Context, inputs any, opts ...RunOption) (Value
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var config runConfig
-	if len(opts) == 0 {
-		config.functions = p.functions
-		config.functionNames = p.funcNames
-	} else {
-		config = p.runConfig(opts...)
-	}
+	config := p.runConfig(opts...)
 	if !config.needsDispatchLoop() {
 		preparedConfig, err := p.prepareRun(ctx, config)
 		if err != nil {
 			return Value{}, err
 		}
-		return p.runDirectFast(inputs, preparedConfig)
+		return p.runDirectValue(inputs, preparedConfig)
 	}
 	if config.canUseFunctionCallbackFast() {
 		return p.runFunctionCallback(ctx, inputs, config)
-	}
-	if config.canUseFunctionDispatchFast() {
-		return p.runFunctionDispatchFast(ctx, inputs, config)
 	}
 	if err := config.openMounts(); err != nil {
 		return Value{}, err
@@ -636,9 +520,6 @@ func (p *Program) runFunctionCallbackRaw(ctx context.Context, inputs any, config
 	if names == nil && len(config.functions) != 0 {
 		names = hostFunctionNameRefs(config.functions)
 	}
-	hostCallbackOnce.Do(func() {
-		hostCallbackPtr = ffi.NewCallback(hostFunctionCallback)
-	})
 	callback := hostCallbackPtr
 	state := &hostCallbackState{ctx: ctx, functions: config.functions}
 	p.mu.RLock()
@@ -734,187 +615,6 @@ func (s *hostCallbackState) setException(excType, message string) {
 	s.message = message
 }
 
-func (p *Program) runFunctionDispatchFast(ctx context.Context, inputs any, config runConfig) (Value, error) {
-	var err error
-	config, err = p.prepareRun(ctx, config)
-	if err != nil {
-		return Value{}, err
-	}
-	rawInputs, keepAlive, err := p.rawInputs(inputs)
-	if err != nil {
-		return Value{}, err
-	}
-	var ffiLimits *ffi.Limits
-	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
-	}
-	p.mu.RLock()
-	if p.handle == 0 {
-		p.mu.RUnlock()
-		p.releaseRawInputs(rawInputs, keepAlive)
-		runtime.KeepAlive(keepAlive)
-		return Value{}, fmt.Errorf("monty: program is closed")
-	}
-	progressHandle, snapshot, printed, err := ffi.ProgramStartRawSnapshot(p.handle, rawInputs, ffiLimits)
-	p.mu.RUnlock()
-	p.releaseRawInputs(rawInputs, keepAlive)
-	runtime.KeepAlive(keepAlive)
-	progressHandle, snapshot, err = finishProgressStep(config.stdout, progressHandle, snapshot, printed, err)
-	if err != nil {
-		return Value{}, err
-	}
-	for {
-		if err := ctx.Err(); err != nil {
-			if progressHandle != 0 {
-				ffi.ProgressFree(progressHandle)
-			}
-			freeProgressSnapshot(snapshot)
-			return Value{}, err
-		}
-		switch snapshot.Kind {
-		case ffi.ProgressComplete:
-			value, err := decodeRawValue(snapshot.Value)
-			return value, normalizeError(err)
-		case ffi.ProgressNameLookup:
-			function := functionByNameRef(snapshot.Name, config.functions)
-			freeSnapshotName(&snapshot)
-			var next uintptr
-			var nextSnapshot ffi.ProgressSnapshot
-			var resumePrinted string
-			if function == nil {
-				next, nextSnapshot, resumePrinted, err = ffi.ProgressResumeNameUndefinedSnapshot(progressHandle)
-			} else {
-				arena := &rawArena{}
-				var rawFunction ffi.RawValue
-				rawFunction, err = rawValue(ExternalFunction(function.Name()), arena)
-				if err != nil {
-					ffi.ProgressFree(progressHandle)
-					return Value{}, err
-				}
-				next, nextSnapshot, resumePrinted, err = ffi.ProgressResumeNameValueRawSnapshot(progressHandle, &rawFunction)
-				freeOwnedRawValue(&rawFunction)
-				runtime.KeepAlive(arena)
-			}
-			progressHandle, snapshot, err = finishProgressStep(config.stdout, next, nextSnapshot, resumePrinted, err)
-			if err != nil {
-				return Value{}, err
-			}
-		case ffi.ProgressFunctionCall:
-			function := functionByNameRef(snapshot.Name, config.functions)
-			if function == nil {
-				name := ffi.TakeString(snapshot.Name)
-				snapshot.Name = ffi.Bytes{}
-				freeProgressSnapshot(snapshot)
-				ffi.ProgressFree(progressHandle)
-				return Value{}, fmt.Errorf("monty: external function %q called but no Go function was registered", name)
-			}
-			freeSnapshotName(&snapshot)
-			var raw ffi.RawValue
-			var arena *rawArena
-			raw, arena, err = invokeHostFunctionRaw(ctx, function, &snapshot)
-			var next uintptr
-			var nextSnapshot ffi.ProgressSnapshot
-			var resumePrinted string
-			if err != nil {
-				excType, message := exceptionFromError(err)
-				next, resumePrinted, err = ffi.ProgressResumeException(progressHandle, excType, message)
-				if err == nil {
-					nextSnapshot, err = ffi.ProgressSnapshotGet(next)
-				}
-			} else {
-				next, nextSnapshot, resumePrinted, err = ffi.ProgressResumeReturnRawSnapshot(progressHandle, &raw)
-				freeOwnedRawValue(&raw)
-				runtime.KeepAlive(arena)
-			}
-			progressHandle, snapshot, err = finishProgressStep(config.stdout, next, nextSnapshot, resumePrinted, err)
-			if err != nil {
-				return Value{}, err
-			}
-		default:
-			freeProgressSnapshot(snapshot)
-			progress, err := progressFromHandle(progressHandle, config.stdout)
-			if err != nil {
-				return Value{}, err
-			}
-			return p.runProgressLoop(ctx, progress, config)
-		}
-	}
-}
-
-// finishProgressStep flushes the print buffer after a snapshot-style FFI step
-// (start or resume) and either advances the loop to (next, nextSnapshot) or
-// returns the joined error after freeing the partially-built next state.
-func finishProgressStep(
-	stdout io.Writer,
-	next uintptr,
-	nextSnapshot ffi.ProgressSnapshot,
-	printed string,
-	callErr error,
-) (uintptr, ffi.ProgressSnapshot, error) {
-	writeErr := writePrinted(stdout, printed)
-	if callErr != nil || writeErr != nil {
-		if next != 0 {
-			ffi.ProgressFree(next)
-		}
-		freeProgressSnapshot(nextSnapshot)
-		return 0, ffi.ProgressSnapshot{}, joinErrors(normalizeError(callErr), writeErr)
-	}
-	return next, nextSnapshot, nil
-}
-
-// invokeHostFunctionRaw runs function with the snapshot's positional and
-// keyword args and returns the marshaled raw result. The fast path passes the
-// raw args through directly; the slow path decodes them into typed Values.
-// Either way, snapshot.Args and snapshot.Kwargs are consumed.
-func invokeHostFunctionRaw(ctx context.Context, function *Function, snapshot *ffi.ProgressSnapshot) (ffi.RawValue, *rawArena, error) {
-	if function.fastRawCall != nil {
-		raw, err := function.fastRawCall(ctx, snapshot.Args, snapshot.Kwargs)
-		ffi.RawValueFree(&snapshot.Args)
-		ffi.RawValueFree(&snapshot.Kwargs)
-		return raw, nil, err
-	}
-	args, err := valuesFromRawList(snapshot.Args)
-	if err != nil {
-		ffi.RawValueFree(&snapshot.Kwargs)
-		return ffi.RawValue{}, nil, err
-	}
-	kwargs, err := pairsFromRawDict(snapshot.Kwargs)
-	if err != nil {
-		return ffi.RawValue{}, nil, err
-	}
-	result, err := function.call(ctx, args, kwargs)
-	if err != nil {
-		return ffi.RawValue{}, nil, err
-	}
-	arena := &rawArena{}
-	raw, err := rawValue(result, arena)
-	runtime.KeepAlive(result)
-	return raw, arena, err
-}
-
-func functionByNameRef(name ffi.Bytes, functions map[string]*Function) *Function {
-	if name.Len == 0 {
-		return functions[""]
-	}
-	if name.Ptr == nil {
-		return nil
-	}
-	text := unsafe.String((*byte)(name.Ptr), int(name.Len))
-	return functions[text]
-}
-
-func freeSnapshotName(snapshot *ffi.ProgressSnapshot) {
-	ffi.MaybeBytesFree(snapshot.Name)
-	snapshot.Name = ffi.Bytes{}
-}
-
-func freeProgressSnapshot(snapshot ffi.ProgressSnapshot) {
-	ffi.MaybeBytesFree(snapshot.Name)
-	ffi.RawValueFree(&snapshot.Args)
-	ffi.RawValueFree(&snapshot.Kwargs)
-	ffi.RawValueFree(&snapshot.Value)
-}
-
 // RunAs executes program and converts the final Python value into T.
 //
 // Primitive Go types, structs, maps, slices, and Value are supported through
@@ -924,13 +624,7 @@ func RunAs[T any](ctx context.Context, program *Program, inputs any, opts ...Run
 	if program == nil {
 		return zero, fmt.Errorf("monty: program is closed")
 	}
-	var config runConfig
-	if len(opts) == 0 {
-		config.functions = program.functions
-		config.functionNames = program.funcNames
-	} else {
-		config = program.runConfig(opts...)
-	}
+	config := program.runConfig(opts...)
 	if !config.needsDispatchLoop() {
 		return runAsDirect[T](ctx, program, inputs, config)
 	}
@@ -945,11 +639,7 @@ func RunAs[T any](ctx context.Context, program *Program, inputs any, opts ...Run
 	if err != nil {
 		return zero, err
 	}
-	result, err := As[T](value)
-	if err != nil {
-		return zero, err
-	}
-	return result, nil
+	return As[T](value)
 }
 
 func runAsDirect[T any](ctx context.Context, program *Program, inputs any, config runConfig) (T, error) {
@@ -957,36 +647,6 @@ func runAsDirect[T any](ctx context.Context, program *Program, inputs any, confi
 	config, err := program.prepareRun(ctx, config)
 	if err != nil {
 		return zero, err
-	}
-	// T is narrowed by each case below; the inner assertions to T cannot fail.
-	switch any(zero).(type) {
-	case int:
-		value, kind, err := program.runDirectRawInt(inputs, config)
-		if err != nil {
-			return zero, err
-		}
-		if kind != IntKind {
-			return zero, fmt.Errorf("monty: cannot convert %s to int", kind)
-		}
-		return any(int(value)).(T), nil //nolint:errcheck // T is int here
-	case int64:
-		value, kind, err := program.runDirectRawInt(inputs, config)
-		if err != nil {
-			return zero, err
-		}
-		if kind != IntKind {
-			return zero, fmt.Errorf("monty: cannot convert %s to int64", kind)
-		}
-		return any(value).(T), nil //nolint:errcheck // T is int64 here
-	case string:
-		value, kind, err := program.runDirectRawText(inputs, config)
-		if err != nil {
-			return zero, err
-		}
-		if !isStringLikeKind(kind) {
-			return zero, fmt.Errorf("monty: cannot convert %s to string", kind)
-		}
-		return any(value).(T), nil //nolint:errcheck // T is string here
 	}
 	rawResult, err := program.runDirectRaw(inputs, config)
 	if err != nil {
@@ -1039,18 +699,6 @@ func rawAs[T any](raw ffi.RawValue) (T, error) {
 	return As[T](value)
 }
 
-func (p *Program) withHandle(call func(uintptr) error) error {
-	if p == nil {
-		return fmt.Errorf("monty: program is closed")
-	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.handle == 0 {
-		return fmt.Errorf("monty: program is closed")
-	}
-	return call(p.handle)
-}
-
 func (p *Program) prepareRun(ctx context.Context, config runConfig) (runConfig, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1083,16 +731,23 @@ func (p *Program) rawInputs(inputs any) ([]ffi.RawValue, rawInputKeepAlive, erro
 		return nil, rawInputKeepAlive{}, err
 	}
 	var arena rawArena
-	rawInputs := p.getRawInputs()
+	var rawInputs []ffi.RawValue
+	if len(p.inputs) != 0 {
+		rawInputs = make([]ffi.RawValue, len(p.inputs))
+	}
 	for i, name := range p.inputs {
 		value, ok := inputValues[name]
 		if !ok {
-			p.putRawInputs(rawInputs, arena.ownsHandles)
+			if arena.ownsHandles {
+				freeOwnedRawValues(rawInputs)
+			}
 			return nil, rawInputKeepAlive{}, fmt.Errorf("monty: missing input %q", name)
 		}
-		rawInput, err := rawValue(value, &arena)
+		rawInput, err := valueToRaw(value, &arena)
 		if err != nil {
-			p.putRawInputs(rawInputs, arena.ownsHandles)
+			if arena.ownsHandles {
+				freeOwnedRawValues(rawInputs)
+			}
 			return nil, rawInputKeepAlive{}, err
 		}
 		rawInputs[i] = rawInput
@@ -1100,45 +755,10 @@ func (p *Program) rawInputs(inputs any) ([]ffi.RawValue, rawInputKeepAlive, erro
 	return rawInputs, rawInputKeepAlive{inputValues: inputValues, arena: arena}, nil
 }
 
-func (p *Program) getRawInputs() []ffi.RawValue {
-	if len(p.inputs) == 0 {
-		return nil
-	}
-	if pool := rawInputPool(len(p.inputs)); pool != nil {
-		select {
-		case raw := <-pool:
-			return raw[:len(p.inputs)]
-		default:
-		}
-	}
-	return make([]ffi.RawValue, len(p.inputs))
-}
-
 func (p *Program) releaseRawInputs(raw []ffi.RawValue, keepAlive rawInputKeepAlive) {
-	p.putRawInputs(raw, keepAlive.arena.ownsHandles)
-}
-
-func (p *Program) putRawInputs(raw []ffi.RawValue, freeOwned bool) {
-	if len(raw) == 0 {
-		return
-	}
-	if freeOwned {
+	if keepAlive.arena.ownsHandles {
 		freeOwnedRawValues(raw)
 	}
-	clear(raw)
-	if pool := rawInputPool(len(raw)); pool != nil {
-		select {
-		case pool <- raw:
-		default:
-		}
-	}
-}
-
-func rawInputPool(count int) chan []ffi.RawValue {
-	if count < minPooledInputCount || count > maxPooledInputCount {
-		return nil
-	}
-	return rawInputPools[count]
 }
 
 func joinStubs(prefix string, functions map[string]*Function) string {

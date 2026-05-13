@@ -135,7 +135,7 @@ func (r *Repl) CallFunction(ctx context.Context, name string, args []Value, opts
 	for _, opt := range opts {
 		opt(&config)
 	}
-	handles, err := handlesForValues(args)
+	handles, err := valuesToHandles(args)
 	if err != nil {
 		return Value{}, err
 	}
@@ -205,7 +205,7 @@ func replInputHandles(inputs any) ([]string, []uintptr, error) {
 	names := slices.Sorted(maps.Keys(inputValues))
 	handles := make([]uintptr, len(names))
 	for i, name := range names {
-		handle, err := valueHandle(inputValues[name])
+		handle, err := valueToHandle(inputValues[name])
 		if err != nil {
 			freeHandles(handles)
 			return nil, nil, err

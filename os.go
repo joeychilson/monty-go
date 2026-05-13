@@ -12,25 +12,6 @@ import (
 	"github.com/joeychilson/monty/internal/ffi"
 )
 
-const (
-	osFuncExists     = "Path.exists"
-	osFuncIsFile     = "Path.is_file"
-	osFuncIsDir      = "Path.is_dir"
-	osFuncIsSymlink  = "Path.is_symlink"
-	osFuncReadText   = "Path.read_text"
-	osFuncReadBytes  = "Path.read_bytes"
-	osFuncWriteText  = "Path.write_text"
-	osFuncWriteBytes = "Path.write_bytes"
-	osFuncMkdir      = "Path.mkdir"
-	osFuncUnlink     = "Path.unlink"
-	osFuncRmdir      = "Path.rmdir"
-	osFuncIterdir    = "Path.iterdir"
-	osFuncStat       = "Path.stat"
-	osFuncRename     = "Path.rename"
-	osFuncResolve    = "Path.resolve"
-	osFuncAbsolute   = "Path.absolute"
-)
-
 // OSRequest describes a Python operation that needs host OS cooperation.
 type OSRequest struct {
 	// Function is the Python-visible operation, such as "Path.read_text".
@@ -226,12 +207,8 @@ func (c runConfig) needsDispatchLoop() bool {
 	return len(c.functions) != 0 || c.osHandler != nil || len(c.mounts) != 0 || len(c.mountDirs) != 0
 }
 
-func (c runConfig) canUseFunctionDispatchFast() bool {
-	return len(c.functions) != 0 && c.osHandler == nil && len(c.mounts) == 0 && len(c.mountDirs) == 0
-}
-
 func (c runConfig) canUseFunctionCallbackFast() bool {
-	if !c.canUseFunctionDispatchFast() {
+	if len(c.functions) == 0 || c.osHandler != nil || len(c.mounts) != 0 || len(c.mountDirs) != 0 {
 		return false
 	}
 	for _, function := range c.functions {
@@ -264,12 +241,12 @@ func (c runConfig) handleMount(call *OSCall) (result Value, handled bool, err er
 	if len(c.mountHandles) == 0 || !isPathFunction(call.Function) || len(call.Args) == 0 {
 		return Value{}, false, nil
 	}
-	argHandles, err := handlesForValues(call.Args)
+	argHandles, err := valuesToHandles(call.Args)
 	if err != nil {
 		return Value{}, true, err
 	}
 	defer freeHandles(argHandles)
-	kwargKeyHandles, kwargValueHandles, err := handlesForPairs(call.Kwargs)
+	kwargKeyHandles, kwargValueHandles, err := pairsToHandles(call.Kwargs)
 	if err != nil {
 		return Value{}, true, err
 	}
@@ -337,10 +314,10 @@ func (mount Mount) openHandle() (uintptr, error) {
 	return handle, normalizeError(err)
 }
 
-func handlesForValues(values []Value) ([]uintptr, error) {
+func valuesToHandles(values []Value) ([]uintptr, error) {
 	handles := make([]uintptr, len(values))
 	for i, value := range values {
-		handle, err := valueHandle(value)
+		handle, err := valueToHandle(value)
 		if err != nil {
 			freeHandles(handles)
 			return nil, err
@@ -350,18 +327,18 @@ func handlesForValues(values []Value) ([]uintptr, error) {
 	return handles, nil
 }
 
-func handlesForPairs(pairs []Pair) ([]uintptr, []uintptr, error) {
+func pairsToHandles(pairs []Pair) ([]uintptr, []uintptr, error) {
 	keyHandles := make([]uintptr, len(pairs))
 	valueHandles := make([]uintptr, len(pairs))
 	for i := range pairs {
-		key, err := valueHandle(pairs[i].Key)
+		key, err := valueToHandle(pairs[i].Key)
 		if err != nil {
 			freeHandles(keyHandles)
 			freeHandles(valueHandles)
 			return nil, nil, err
 		}
 		keyHandles[i] = key
-		value, err := valueHandle(pairs[i].Value)
+		value, err := valueToHandle(pairs[i].Value)
 		if err != nil {
 			freeHandles(keyHandles)
 			freeHandles(valueHandles)
@@ -374,10 +351,10 @@ func handlesForPairs(pairs []Pair) ([]uintptr, []uintptr, error) {
 
 func isPathFunction(function string) bool {
 	switch function {
-	case osFuncExists, osFuncIsFile, osFuncIsDir, osFuncIsSymlink,
-		osFuncReadText, osFuncReadBytes, osFuncWriteText, osFuncWriteBytes,
-		osFuncMkdir, osFuncUnlink, osFuncRmdir, osFuncIterdir, osFuncStat,
-		osFuncRename, osFuncResolve, osFuncAbsolute:
+	case "Path.exists", "Path.is_file", "Path.is_dir", "Path.is_symlink",
+		"Path.read_text", "Path.read_bytes", "Path.write_text", "Path.write_bytes",
+		"Path.mkdir", "Path.unlink", "Path.rmdir", "Path.iterdir", "Path.stat",
+		"Path.rename", "Path.resolve", "Path.absolute":
 		return true
 	default:
 		return false

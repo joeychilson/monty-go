@@ -100,12 +100,12 @@ type FunctionCall struct {
 
 // Resume returns value to Python and continues execution.
 func (call *FunctionCall) Resume(ctx context.Context, value Value) (Progress, error) {
-	return resumeProgressWithRawValue(ctx, &call.progressBase, value, ffi.ProgressResumeReturnRaw)
+	return resumeWithValue(ctx, &call.progressBase, value, ffi.ProgressResumeReturnRaw)
 }
 
 // ResumeException raises an exception at the paused Python call and continues execution.
 func (call *FunctionCall) ResumeException(ctx context.Context, excType, message string) (Progress, error) {
-	return resumeProgressException(ctx, &call.progressBase, excType, message)
+	return resumeWithException(ctx, &call.progressBase, excType, message)
 }
 
 // ResumePending marks the call as pending so it can later be resolved through ResolveFutures.
@@ -118,7 +118,7 @@ func (call *FunctionCall) ResumePending(ctx context.Context) (Progress, error) {
 		return nil, err
 	}
 	nextHandle, printed, err := ffi.ProgressResumePending(handle)
-	return finishResume(call.stdout, nextHandle, printed, err)
+	return decodeResumeResult(call.stdout, nextHandle, printed, err)
 }
 
 // NameLookup is a paused lookup for an unknown Python global name.
@@ -130,7 +130,7 @@ type NameLookup struct {
 
 // Resume provides the Python value for the requested name and continues execution.
 func (lookup *NameLookup) Resume(ctx context.Context, value Value) (Progress, error) {
-	return resumeProgressWithRawValue(ctx, &lookup.progressBase, value, ffi.ProgressResumeNameValueRaw)
+	return resumeWithValue(ctx, &lookup.progressBase, value, ffi.ProgressResumeNameValueRaw)
 }
 
 // ResumeUndefined reports the requested name as undefined and continues execution.
@@ -143,7 +143,7 @@ func (lookup *NameLookup) ResumeUndefined(ctx context.Context) (Progress, error)
 		return nil, err
 	}
 	nextHandle, printed, err := ffi.ProgressResumeNameUndefined(handle)
-	return finishResume(lookup.stdout, nextHandle, printed, err)
+	return decodeResumeResult(lookup.stdout, nextHandle, printed, err)
 }
 
 // OSCall is a paused operation that would access the host operating system.
@@ -161,12 +161,12 @@ type OSCall struct {
 
 // Resume returns value to Python and continues execution.
 func (call *OSCall) Resume(ctx context.Context, value Value) (Progress, error) {
-	return resumeProgressWithRawValue(ctx, &call.progressBase, value, ffi.ProgressResumeReturnRaw)
+	return resumeWithValue(ctx, &call.progressBase, value, ffi.ProgressResumeReturnRaw)
 }
 
 // ResumeException raises an exception at the paused OS call and continues execution.
 func (call *OSCall) ResumeException(ctx context.Context, excType, message string) (Progress, error) {
-	return resumeProgressException(ctx, &call.progressBase, excType, message)
+	return resumeWithException(ctx, &call.progressBase, excType, message)
 }
 
 // ResolveFutures is a paused state waiting for one or more pending function calls.
@@ -200,7 +200,7 @@ func (futures *ResolveFutures) Resume(ctx context.Context, results ...FutureResu
 			Message: ffi.StringRef(result.message),
 		}
 		if result.kind == futureResultReturn {
-			raw, err := rawValue(result.value, arena)
+			raw, err := valueToRaw(result.value, arena)
 			if err != nil {
 				freeFutureResultValues(ffiResults)
 				ffi.ProgressFree(handle)
@@ -213,7 +213,7 @@ func (futures *ResolveFutures) Resume(ctx context.Context, results ...FutureResu
 	nextHandle, printed, err := ffi.ProgressResumeFutures(handle, ffiResults)
 	runtime.KeepAlive(arena)
 	runtime.KeepAlive(results)
-	return finishResume(futures.stdout, nextHandle, printed, err)
+	return decodeResumeResult(futures.stdout, nextHandle, printed, err)
 }
 
 type futureResultKind uint32
@@ -249,9 +249,9 @@ func FutureNotFound(callID uint32, name string) FutureResult {
 	return FutureResult{CallID: callID, kind: futureResultNotFound, message: name}
 }
 
-// resumeProgressWithRawValue resumes execution by passing value back through
+// resumeWithValue resumes execution by passing value back through
 // the supplied FFI entry point (return-value or name-lookup paths).
-func resumeProgressWithRawValue(
+func resumeWithValue(
 	ctx context.Context,
 	base *progressBase,
 	value Value,
@@ -265,7 +265,7 @@ func resumeProgressWithRawValue(
 		return nil, err
 	}
 	arena := &rawArena{}
-	raw, err := rawValue(value, arena)
+	raw, err := valueToRaw(value, arena)
 	if err != nil {
 		ffi.ProgressFree(handle)
 		return nil, err
@@ -274,7 +274,7 @@ func resumeProgressWithRawValue(
 	nextHandle, printed, err := resume(handle, &raw)
 	runtime.KeepAlive(arena)
 	runtime.KeepAlive(value)
-	return finishResume(base.stdout, nextHandle, printed, err)
+	return decodeResumeResult(base.stdout, nextHandle, printed, err)
 }
 
 func freeFutureResultValues(results []ffi.FutureResult) {
@@ -283,7 +283,7 @@ func freeFutureResultValues(results []ffi.FutureResult) {
 	}
 }
 
-func resumeProgressException(ctx context.Context, base *progressBase, excType, message string) (Progress, error) {
+func resumeWithException(ctx context.Context, base *progressBase, excType, message string) (Progress, error) {
 	if err := ctxErr(ctx); err != nil {
 		return nil, err
 	}
@@ -292,10 +292,10 @@ func resumeProgressException(ctx context.Context, base *progressBase, excType, m
 		return nil, err
 	}
 	nextHandle, printed, err := ffi.ProgressResumeException(handle, excType, message)
-	return finishResume(base.stdout, nextHandle, printed, err)
+	return decodeResumeResult(base.stdout, nextHandle, printed, err)
 }
 
-func finishResume(stdout io.Writer, nextHandle uintptr, printed string, err error) (Progress, error) {
+func decodeResumeResult(stdout io.Writer, nextHandle uintptr, printed string, err error) (Progress, error) {
 	writeErr := writePrinted(stdout, printed)
 	if err != nil {
 		return nil, joinErrors(normalizeError(err), writeErr)
