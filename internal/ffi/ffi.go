@@ -1665,7 +1665,7 @@ func ValueDataclassFrozen(v uintptr) bool { return mgValueDataclassFrozen(v) != 
 func stringListFromValue(handle uintptr) ([]string, error) {
 	count := int(ValueLen(handle))
 	if count == 0 {
-		return []string{}, nil
+		return nil, nil
 	}
 	rawItems := make([]RawValue, count)
 	if err := ValueItemsRaw(handle, rawItems); err != nil {
