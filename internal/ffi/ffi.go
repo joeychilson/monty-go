@@ -784,21 +784,14 @@ func UnsafeBytes(buf Bytes) []byte {
 }
 
 // TakeString consumes a Rust-owned buffer and returns its contents as a Go
-// string, freeing the source. The intermediate copy + unsafe.String avoids
-// the second allocation that string(unsafe.Slice(...)) would incur.
+// string, freeing the source. Converting a []byte to string is a single
+// alloc+copy, so there is nothing to optimize over string(unsafe.Slice(...)).
 func TakeString(buf Bytes) string {
 	if buf.Ptr == nil {
 		return ""
 	}
 	defer mgBytesFree(buf.Ptr, buf.Len)
-	if buf.Len == 0 {
-		return ""
-	}
-	bytes := make([]byte, buf.Len)
-	copy(bytes, unsafe.Slice((*byte)(buf.Ptr), buf.Len))
-	value := unsafe.String(unsafe.SliceData(bytes), len(bytes))
-	runtime.KeepAlive(bytes)
-	return value
+	return string(unsafe.Slice((*byte)(buf.Ptr), buf.Len))
 }
 
 // RawValueFree releases any Rust-owned payload referenced by a RawValue.
