@@ -50,7 +50,9 @@ func embeddedLibraryPath(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("monty: decompress embedded Rust shared library %s: %w", assetPath, err)
 	}
-	defer closeGzipReader(reader)
+	// The gzip CRC is validated when CopyN below reaches EOF, so any Close error
+	// here is redundant.
+	defer func() { _ = reader.Close() }()
 
 	tmp, err := os.CreateTemp(cacheDir, name+".*.tmp")
 	if err != nil {
@@ -60,7 +62,7 @@ func embeddedLibraryPath(name string) (string, error) {
 	keep := false
 	defer func() {
 		if !keep {
-			removeFile(tmpPath)
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -85,16 +87,4 @@ func embeddedLibraryPath(name string) (string, error) {
 	}
 	keep = true
 	return target, nil
-}
-
-func closeGzipReader(reader *gzip.Reader) {
-	if err := reader.Close(); err != nil {
-		return
-	}
-}
-
-func removeFile(name string) {
-	if err := os.Remove(name); err != nil {
-		return
-	}
 }
