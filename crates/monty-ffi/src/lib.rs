@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::{
+    borrow::Cow,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice, str,
     sync::{Arc, Mutex},
@@ -608,6 +609,25 @@ fn read_string_list(ptr: *const MgStr, len: usize) -> Result<Vec<String>, MgErro
         .collect()
 }
 
+/// Borrowed variant of `read_string_list` for strings that only need to live
+/// for the duration of the FFI call — avoids one allocation per entry.
+fn read_borrowed_str_list(ptr: *const MgStr, len: usize) -> Result<Vec<&'static str>, MgError> {
+    if ptr.is_null() {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(ffi_error(
+            "TypeError",
+            "non-empty string array has null pointer",
+        ));
+    }
+    // SAFETY: caller promises ptr points to len MgStr entries.
+    unsafe { slice::from_raw_parts(ptr, len) }
+        .iter()
+        .map(|value| as_str(*value))
+        .collect()
+}
+
 fn string_list_value(values: &[String]) -> *mut MgValue {
     let items = values
         .iter()
@@ -1009,20 +1029,21 @@ fn read_raw_value_slice(values: &mut [MgRawValue]) -> Result<Vec<MontyObject>, M
     Ok(objects)
 }
 
-fn text_for_raw(object: &MontyObject) -> String {
+fn text_for_raw(object: &MontyObject) -> Cow<'_, str> {
     match object {
         MontyObject::String(value)
         | MontyObject::Path(value)
         | MontyObject::Repr(value)
-        | MontyObject::Cycle(_, value) => value.clone(),
-        MontyObject::BigInt(value) => value.to_string(),
-        MontyObject::Type(value) => value.to_string(),
-        MontyObject::BuiltinFunction(value) => value.to_string(),
-        MontyObject::Function { name, .. } => name.clone(),
-        MontyObject::Exception { exc_type, arg } => arg
-            .as_ref()
-            .map_or_else(|| exc_type.to_string(), |arg| format!("{exc_type}: {arg}")),
-        _ => object.py_repr(),
+        | MontyObject::Cycle(_, value) => Cow::Borrowed(value),
+        MontyObject::BigInt(value) => Cow::Owned(value.to_string()),
+        MontyObject::Type(value) => Cow::Owned(value.to_string()),
+        MontyObject::BuiltinFunction(value) => Cow::Owned(value.to_string()),
+        MontyObject::Function { name, .. } => Cow::Borrowed(name),
+        MontyObject::Exception { exc_type, arg } => arg.as_ref().map_or_else(
+            || Cow::Owned(exc_type.to_string()),
+            |arg| Cow::Owned(format!("{exc_type}: {arg}")),
+        ),
+        _ => Cow::Owned(object.py_repr()),
     }
 }
 
@@ -1321,21 +1342,19 @@ fn limits_from_raw(raw: *const MgLimits) -> Option<ResourceLimits> {
 }
 
 fn start_with_print(
-    program: &MgProgram,
+    runner: &MontyRun,
     inputs: Vec<MontyObject>,
     limits: Option<ResourceLimits>,
 ) -> Result<(MgProgress, String), MgError> {
     let mut stdout = String::new();
     let writer = PrintWriter::CollectString(&mut stdout);
     let progress = if let Some(limits) = limits {
-        program
-            .runner
+        runner
             .clone()
             .start(inputs, LimitedTracker::new(limits), writer)
             .map(MgProgress::Limited)
     } else {
-        program
-            .runner
+        runner
             .clone()
             .start(inputs, NoLimitTracker, writer)
             .map(MgProgress::NoLimit)
@@ -1345,34 +1364,32 @@ fn start_with_print(
 }
 
 fn run_with_print(
-    program: &MgProgram,
+    runner: &MontyRun,
     inputs: Vec<MontyObject>,
     limits: Option<ResourceLimits>,
 ) -> Result<(MontyObject, String), MgError> {
     let mut stdout = String::new();
     let writer = PrintWriter::CollectString(&mut stdout);
     let value = if let Some(limits) = limits {
-        program
-            .runner
-            .run(inputs, LimitedTracker::new(limits), writer)
+        runner.run(inputs, LimitedTracker::new(limits), writer)
     } else {
-        program.runner.run(inputs, NoLimitTracker, writer)
+        runner.run(inputs, NoLimitTracker, writer)
     }
     .map_err(|exc| from_monty_error(&exc))?;
     Ok((value, stdout))
 }
 
 fn run_with_host_callback(
-    program: &MgProgram,
+    runner: &MontyRun,
     inputs: Vec<MontyObject>,
     limits: Option<ResourceLimits>,
-    host_names: &[String],
+    host_names: &[&str],
     callback: MgHostFunctionCallback,
     user_data: usize,
 ) -> Result<(MontyObject, String), MgError> {
     let callback =
         callback.ok_or_else(|| ffi_error("TypeError", "host function callback is null"))?;
-    let (progress, mut stdout) = start_with_print(program, inputs, limits)?;
+    let (progress, mut stdout) = start_with_print(runner, inputs, limits)?;
     let value = match progress {
         MgProgress::NoLimit(progress) => {
             run_host_progress_loop(progress, host_names, callback, user_data, &mut stdout)?
@@ -1386,7 +1403,7 @@ fn run_with_host_callback(
 
 fn run_host_progress_loop<T: ResourceTracker>(
     mut progress: RunProgress<T>,
-    host_names: &[String],
+    host_names: &[&str],
     callback: unsafe extern "C" fn(
         usize,
         *const u8,
@@ -1402,7 +1419,7 @@ fn run_host_progress_loop<T: ResourceTracker>(
         progress = match progress {
             RunProgress::Complete(value) => return Ok(value),
             RunProgress::NameLookup(lookup) => {
-                let result = if host_names.iter().any(|name| name == &lookup.name) {
+                let result = if host_names.iter().any(|name| *name == lookup.name) {
                     NameLookupResult::Value(MontyObject::Function {
                         name: lookup.name.clone(),
                         docstring: None,
@@ -1449,28 +1466,20 @@ fn call_host_function_callback<T: ResourceTracker>(
     ) -> i32,
     user_data: usize,
 ) -> Result<ExtFunctionResult, MgError> {
-    if call.args.len() == 1
-        && call.kwargs.is_empty()
-        && let Some(mut arg) = borrowed_raw_value(&call.args[0])
-    {
+    // Fast path: when every positional and keyword value is a scalar, encode
+    // borrowed views over the call's own storage — no MontyObject clones and
+    // no owned raw trees to free afterwards.
+    if let Some((mut arg_items, mut kwarg_pairs)) = borrowed_call_views(call) {
         let mut args = raw_value(KIND_LIST);
-        args.ptr = ptr::addr_of_mut!(arg).cast();
-        args.len = 1;
-        let kwargs = raw_value(KIND_DICT);
-        return invoke_host_function_callback(call, callback, user_data, &args, &kwargs);
-    }
-    if call.args.is_empty()
-        && call.kwargs.len() == 2
-        && let (Some(first), Some(second)) = (
-            borrowed_raw_pair(&call.kwargs[0]),
-            borrowed_raw_pair(&call.kwargs[1]),
-        )
-    {
-        let args = raw_value(KIND_LIST);
-        let mut pairs = [first, second];
+        if !arg_items.is_empty() {
+            args.ptr = arg_items.as_mut_ptr().cast();
+            args.len = arg_items.len();
+        }
         let mut kwargs = raw_value(KIND_DICT);
-        kwargs.ptr = pairs.as_mut_ptr().cast();
-        kwargs.len = pairs.len();
+        if !kwarg_pairs.is_empty() {
+            kwargs.ptr = kwarg_pairs.as_mut_ptr().cast();
+            kwargs.len = kwarg_pairs.len();
+        }
         return invoke_host_function_callback(call, callback, user_data, &args, &kwargs);
     }
     let mut args = raw_sequence(KIND_LIST, call.args.clone())?;
@@ -1479,6 +1488,22 @@ fn call_host_function_callback<T: ResourceTracker>(
     free_raw_value(&mut args);
     free_raw_value(&mut kwargs);
     result
+}
+
+/// Borrowed raw views of every positional and keyword argument, or `None` when
+/// any value is a non-scalar that needs the owned (cloning) encoding instead.
+fn borrowed_call_views<T: ResourceTracker>(
+    call: &FunctionCall<T>,
+) -> Option<(Vec<MgRawValue>, Vec<MgRawPair>)> {
+    let mut args = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        args.push(borrowed_raw_value(arg)?);
+    }
+    let mut kwargs = Vec::with_capacity(call.kwargs.len());
+    for pair in &call.kwargs {
+        kwargs.push(borrowed_raw_pair(pair)?);
+    }
+    Some((args, kwargs))
 }
 
 fn invoke_host_function_callback<T: ResourceTracker>(
@@ -2029,7 +2054,7 @@ pub unsafe extern "C" fn mg_repl_dump(
         // SAFETY: handle validity is owned by the Go side contract.
         let bytes = postcard::to_allocvec(unsafe { &*repl })
             .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        write_bytes(out, &bytes)
+        write_owned_bytes(out, bytes)
     })
 }
 
@@ -2223,22 +2248,7 @@ pub unsafe extern "C" fn mg_program_compile(
         let args = unsafe { &*args };
         let code = as_str(args.code)?.to_owned();
         let script_name = as_str(args.script_name)?.to_owned();
-        let names = if args.input_names.is_null() {
-            if args.input_count == 0 {
-                Vec::new()
-            } else {
-                return Err(ffi_error(
-                    "TypeError",
-                    "non-empty input-name array has null pointer",
-                ));
-            }
-        } else {
-            // SAFETY: caller promises input_names points to input_count MgStr entries.
-            unsafe { slice::from_raw_parts(args.input_names, args.input_count) }
-                .iter()
-                .map(|name| as_str(*name).map(str::to_owned))
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        let names = read_string_list(args.input_names, args.input_count)?;
         let runner = MontyRun::new(code, &script_name, names.clone())
             .map_err(|exc| from_monty_error(&exc))?;
         let program = MgProgram {
@@ -2279,7 +2289,7 @@ pub unsafe extern "C" fn mg_program_dump(
         };
         let bytes = postcard::to_allocvec(&stored)
             .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        write_bytes(out, &bytes)
+        write_owned_bytes(out, bytes)
     })
 }
 
@@ -2382,8 +2392,11 @@ pub unsafe extern "C" fn mg_program_start_raw(
         }
         let input_values = read_raw_values(inputs, input_count)?;
         // SAFETY: handle validity is owned by the Go side contract.
-        let (progress, stdout) =
-            start_with_print(unsafe { &*program }, input_values, limits_from_raw(limits))?;
+        let (progress, stdout) = start_with_print(
+            unsafe { &(*program).runner },
+            input_values,
+            limits_from_raw(limits),
+        )?;
         // SAFETY: out is checked for null above.
         unsafe {
             write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
@@ -2413,8 +2426,11 @@ pub unsafe extern "C" fn mg_program_start_raw_snapshot(
         }
         let input_values = read_raw_values(inputs, input_count)?;
         // SAFETY: handle validity is owned by the Go side contract.
-        let (progress, stdout) =
-            start_with_print(unsafe { &*program }, input_values, limits_from_raw(limits))?;
+        let (progress, stdout) = start_with_print(
+            unsafe { &(*program).runner },
+            input_values,
+            limits_from_raw(limits),
+        )?;
         // SAFETY: out is checked for null above.
         unsafe { write_progress_snapshot_output(out, progress, stdout) }
     })
@@ -2443,8 +2459,11 @@ pub unsafe extern "C" fn mg_program_run_raw(
         }
         let input_values = read_raw_values(inputs, input_count)?;
         // SAFETY: handle validity is owned by the Go side contract.
-        let (value, stdout) =
-            run_with_print(unsafe { &*program }, input_values, limits_from_raw(limits))?;
+        let (value, stdout) = run_with_print(
+            unsafe { &(*program).runner },
+            input_values,
+            limits_from_raw(limits),
+        )?;
         // SAFETY: out is checked for null above.
         unsafe {
             write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
@@ -2479,10 +2498,10 @@ pub unsafe extern "C" fn mg_program_run_host_raw(
             return Err(ffi_error("TypeError", "raw value output pointer is null"));
         }
         let input_values = read_raw_values(inputs, input_count)?;
-        let names = read_string_list(host_names, host_name_count)?;
+        let names = read_borrowed_str_list(host_names, host_name_count)?;
         // SAFETY: handle validity is owned by the Go side contract.
         let (value, stdout) = run_with_host_callback(
-            unsafe { &*program },
+            unsafe { &(*program).runner },
             input_values,
             limits_from_raw(limits),
             &names,
@@ -2520,8 +2539,11 @@ pub unsafe extern "C" fn mg_program_run_fast_raw(
         }
         let input_values = read_raw_values(inputs, input_count)?;
         // SAFETY: handle validity is owned by the Go side contract.
-        let (value, stdout) =
-            run_with_print(unsafe { &*program }, input_values, limits_from_raw(limits))?;
+        let (value, stdout) = run_with_print(
+            unsafe { &(*program).runner },
+            input_values,
+            limits_from_raw(limits),
+        )?;
         // SAFETY: out is checked for null above.
         unsafe { write_fast_output(out, value, stdout) }
     })
@@ -2553,32 +2575,14 @@ pub unsafe extern "C" fn mg_program_compile_run_fast_raw(
         // SAFETY: args was checked for null and is only read during this call.
         let args = unsafe { &*args };
         let code = as_str(args.code)?.to_owned();
-        let script_name = as_str(args.script_name)?.to_owned();
-        let names = if args.input_names.is_null() {
-            if args.input_count == 0 {
-                Vec::new()
-            } else {
-                return Err(ffi_error(
-                    "TypeError",
-                    "non-empty input-name array has null pointer",
-                ));
-            }
-        } else {
-            // SAFETY: caller promises input_names points to input_count MgStr entries.
-            unsafe { slice::from_raw_parts(args.input_names, args.input_count) }
-                .iter()
-                .map(|name| as_str(*name).map(str::to_owned))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let runner = MontyRun::new(code, &script_name, names.clone())
-            .map_err(|exc| from_monty_error(&exc))?;
-        let program = MgProgram {
-            runner,
-            script_name,
-            input_names: names,
-        };
+        let script_name = as_str(args.script_name)?;
+        let names = read_string_list(args.input_names, args.input_count)?;
+        // The program never outlives this call, so no MgProgram (and no clone
+        // of names or script_name) is materialized.
+        let runner =
+            MontyRun::new(code, script_name, names).map_err(|exc| from_monty_error(&exc))?;
         let input_values = read_raw_values(args.input_values, args.input_value_count)?;
-        let (value, stdout) = run_with_print(&program, input_values, limits_from_raw(args.limits))?;
+        let (value, stdout) = run_with_print(&runner, input_values, limits_from_raw(args.limits))?;
         // SAFETY: out was checked for null above.
         unsafe { write_fast_output(out, value, stdout) }
     })
@@ -2614,7 +2618,9 @@ unsafe fn write_fast_output(
         unsafe { (*out).value = raw };
         return Ok(());
     }
-    let mut bytes = Vec::new();
+    // Pre-size to the scratch capacity: one allocation covers every payload
+    // that will land in scratch, instead of a doubling realloc chain.
+    let mut bytes = Vec::with_capacity(FAST_SCRATCH_CAP);
     match write_flat_value(&mut bytes, &value) {
         Ok(()) => {
             // SAFETY: out is non-null by contract; scratch ownership is handled
@@ -2700,8 +2706,11 @@ pub unsafe extern "C" fn mg_program_run_json_raw(
         }
         let input_values = read_raw_values(inputs, input_count)?;
         // SAFETY: handle validity is owned by the Go side contract.
-        let (value, stdout) =
-            run_with_print(unsafe { &*program }, input_values, limits_from_raw(limits))?;
+        let (value, stdout) = run_with_print(
+            unsafe { &(*program).runner },
+            input_values,
+            limits_from_raw(limits),
+        )?;
         let json = serde_json::to_vec(&JsonMontyObject(&value))
             .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
         // SAFETY: out is checked for null above.
@@ -2733,7 +2742,7 @@ pub unsafe extern "C" fn mg_value_json(
         // SAFETY: handle validity is owned by the Go side contract.
         let bytes = serde_json::to_vec(&JsonMontyObject(unsafe { &(*value).object }))
             .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        write_bytes(out, &bytes)
+        write_owned_bytes(out, bytes)
     })
 }
 
@@ -3988,7 +3997,7 @@ pub unsafe extern "C" fn mg_progress_dump(
         // SAFETY: handle validity is owned by the Go side contract.
         let bytes = postcard::to_allocvec(unsafe { &*progress })
             .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        write_bytes(out, &bytes)
+        write_owned_bytes(out, bytes)
     })
 }
 
