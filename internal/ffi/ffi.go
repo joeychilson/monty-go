@@ -86,8 +86,14 @@ const (
 
 // Str is a borrowed (ptr, len) pair pointing at Go-owned string memory. The
 // pointee must outlive the FFI call; never store Str across calls.
+//
+// Ptr is an unsafe.Pointer rather than a uintptr so the garbage collector
+// traces it: any reachable Str (e.g. embedded in a struct passed by pointer,
+// or held in a []Str passed via slicePointer) transitively keeps its backing
+// string alive for the duration of the call. The C ABI is unchanged — Rust
+// sees *const u8, usize either way.
 type Str struct {
-	Ptr uintptr
+	Ptr unsafe.Pointer
 	Len uintptr
 }
 
@@ -400,7 +406,7 @@ var (
 	mgErrorDisplay func(uintptr, unsafe.Pointer) int32
 
 	// Program, REPL, and mount symbols.
-	mgTypeCheck                 func(uintptr, uintptr, uintptr, uintptr, uintptr, uintptr, uintptr, uintptr, unsafe.Pointer) int32
+	mgTypeCheck                 func(unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
 	mgMountNew                  func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	mgMountFree                 func(uintptr)
 	mgMountHandleOSCall         func(unsafe.Pointer, unsafe.Pointer) int32
@@ -411,8 +417,8 @@ var (
 	mgReplFeedRun               func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgReplCallFunction          func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgReplFunctionNames         func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgReplHasFunction           func(uintptr, uintptr, uintptr) uint8
-	mgReplContinuationMode      func(uintptr, uintptr) uint32
+	mgReplHasFunction           func(uintptr, unsafe.Pointer, uintptr) uint8
+	mgReplContinuationMode      func(unsafe.Pointer, uintptr) uint32
 	mgProgramCompile            func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	mgProgramFree               func(uintptr)
 	mgProgramDump               func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
@@ -434,14 +440,14 @@ var (
 	mgValueNone                 func() uintptr
 	mgValueBool                 func(uint8) uintptr
 	mgValueInt                  func(int64) uintptr
-	mgValueBigInt               func(uintptr, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgValueBigInt               func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueFloat                func(float64) uintptr
-	mgValueString               func(uintptr, uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgValuePath                 func(uintptr, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgValueString               func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgValuePath                 func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueBytes                func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueListRaw              func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueTupleRaw             func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgValueNamedTupleRaw        func(uintptr, uintptr, unsafe.Pointer, unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgValueNamedTupleRaw        func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueSetRaw               func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueFrozenSetRaw         func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueDictRaw              func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
@@ -450,8 +456,8 @@ var (
 	mgValueTimeDelta            func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueTimeZone             func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueDataclassRaw         func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
-	mgValueFunction             func(uintptr, uintptr, uintptr, uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgValueException            func(uintptr, uintptr, uintptr, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgValueFunction             func(unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgValueException            func(unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueExceptionType        func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueExceptionMessage     func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgValueKind                 func(uintptr) uint32
@@ -481,7 +487,7 @@ var (
 	mgProgressPendingID           func(uintptr, uintptr) uint32
 	mgProgressResumePending       func(uintptr, unsafe.Pointer) int32
 	mgProgressResumeReturnRawAddr uintptr
-	mgProgressResumeException     func(uintptr, uintptr, uintptr, uintptr, uintptr, unsafe.Pointer) int32
+	mgProgressResumeException     func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
 	mgProgressResumeNameValueRaw  func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgProgressResumeNameUndefined func(uintptr, unsafe.Pointer) int32
 	mgProgressResumeFutures       func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
@@ -668,10 +674,14 @@ func StringRef(s string) Str {
 	if s == "" {
 		return Str{}
 	}
-	return Str{Ptr: uintptr(unsafe.Pointer(unsafe.StringData(s))), Len: uintptr(len(s))}
+	return Str{Ptr: unsafe.Pointer(unsafe.StringData(s)), Len: uintptr(len(s))}
 }
 
-func stringArgs(s string) (uintptr, uintptr) {
+// stringArgs decomposes s into the (ptr, len) pair a C function expects. The
+// pointer is an unsafe.Pointer so purego keeps the backing string alive across
+// the call; callers must still pass it to a function whose matching parameter
+// is typed unsafe.Pointer (not uintptr) for that protection to apply.
+func stringArgs(s string) (unsafe.Pointer, uintptr) {
 	ref := StringRef(s)
 	return ref.Ptr, ref.Len
 }
@@ -1013,6 +1023,10 @@ func ProgramStartRaw(program uintptr, inputs []RawValue, limits *Limits) (uintpt
 		uintptr(ptrOf(limits)),
 		uintptr(ptrOf(out)),
 	)
+	// The trampoline passes these as bare uintptr, so the GC does not see them
+	// as live across the Rust call; pin them until it returns.
+	runtime.KeepAlive(inputs)
+	runtime.KeepAlive(limits)
 	if status != StatusOK {
 		return 0, TakeString(out.Print), TakeError(out.Error)
 	}
@@ -1035,6 +1049,8 @@ func ProgramRunRaw(program uintptr, inputs []RawValue, limits *Limits) (RawValue
 		uintptr(ptrOf(limits)),
 		uintptr(ptrOf(out)),
 	)
+	runtime.KeepAlive(inputs)
+	runtime.KeepAlive(limits)
 	if status != StatusOK {
 		return RawValue{}, TakeString(out.Print), TakeError(out.Error)
 	}
@@ -1063,6 +1079,11 @@ func ProgramRunHostRaw(program uintptr, inputs []RawValue, limits *Limits, names
 		userData,
 		uintptr(ptrOf(out)),
 	)
+	runtime.KeepAlive(inputs)
+	runtime.KeepAlive(limits)
+	// names holds Str values whose Ptr fields point at Go strings; keeping the
+	// backing array alive transitively pins those strings across the call.
+	runtime.KeepAlive(names)
 	if status != StatusOK {
 		return RawValue{}, TakeString(out.Print), TakeError(out.Error)
 	}
@@ -1096,6 +1117,9 @@ func ProgramCompileRunFastRaw(args *CompileRunFastRawArgs, out *RunFastOutput) (
 		uintptr(ptrOf(args)),
 		uintptr(ptrOf(out)),
 	)
+	// Keeping args alive transitively pins everything it references: the Code
+	// string, the InputNames/InputValues backing arrays, and Limits.
+	runtime.KeepAlive(args)
 	if status != StatusOK {
 		return TakeString(out.Print), TakeError(out.Error)
 	}
@@ -1118,6 +1142,8 @@ func ProgramRunFastRaw(program uintptr, inputs []RawValue, limits *Limits, out *
 		uintptr(ptrOf(limits)),
 		uintptr(ptrOf(out)),
 	)
+	runtime.KeepAlive(inputs)
+	runtime.KeepAlive(limits)
 	if status != StatusOK {
 		return TakeString(out.Print), TakeError(out.Error)
 	}
@@ -1140,6 +1166,8 @@ func ProgramRunJSONRaw(program uintptr, inputs []RawValue, limits *Limits) ([]by
 		uintptr(ptrOf(limits)),
 		uintptr(ptrOf(out)),
 	)
+	runtime.KeepAlive(inputs)
+	runtime.KeepAlive(limits)
 	if status != StatusOK {
 		return nil, TakeString(out.Print), TakeError(out.Error)
 	}
@@ -1638,6 +1666,7 @@ func ProgressSnapshotGet(handle uintptr) (ProgressSnapshot, error) {
 		handle,
 		uintptr(ptrOf(&snapshot)),
 	)
+	runtime.KeepAlive(&snapshot)
 	if status != StatusOK {
 		return snapshot, TakeError(snapshot.Error)
 	}
@@ -1669,6 +1698,7 @@ func ProgressResumeReturnRaw(progress uintptr, value *RawValue) (uintptr, string
 		uintptr(ptrOf(value)),
 		uintptr(ptrOf(&out)),
 	)
+	runtime.KeepAlive(value)
 	if status != StatusOK {
 		return 0, TakeString(out.Print), TakeError(out.Error)
 	}
