@@ -107,11 +107,18 @@ func LoadProgram(snapshot []byte) (*Program, error) {
 // than Compile + Run + Close for one-shot evaluations because it pays the
 // cgocall trampoline cost once instead of three times.
 //
-// The inputs argument is normalized through the same rules as RunAs.
+// The inputs argument is normalized through the same rules as RunAs. The script
+// name used in tracebacks is fixed to "main.py" (compileAndRunScriptName); use
+// Compile + Run if you need to brand it.
 //
 // Cancellation behaves as documented on Program.Run: a ctx deadline bounds a
 // runaway snippet, but plain cancellation only takes effect at progress-loop
 // boundaries.
+// compileAndRunScriptName is the traceback filename CompileAndRun uses on both
+// its fast single-hop path and its dispatch-loop fallback, kept in one place so
+// the two cannot drift.
+const compileAndRunScriptName = "main.py"
+
 func CompileAndRun(ctx context.Context, code string, inputs any, opts ...RunOption) (Value, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -135,7 +142,7 @@ func CompileAndRun(ctx context.Context, code string, inputs any, opts ...RunOpti
 		for name := range values {
 			inputNames = append(inputNames, name)
 		}
-		program, err := Compile(code, WithInputs(inputNames...))
+		program, err := Compile(code, WithScriptName(compileAndRunScriptName), WithInputs(inputNames...))
 		if err != nil {
 			return Value{}, err
 		}
@@ -176,7 +183,7 @@ func CompileAndRun(ctx context.Context, code string, inputs any, opts ...RunOpti
 	}
 	args := ffi.CompileRunFastRawArgs{
 		Code:            ffi.StringRef(code),
-		ScriptName:      ffi.StringRef("main.py"),
+		ScriptName:      ffi.StringRef(compileAndRunScriptName),
 		InputNames:      nameRefsPtr,
 		InputCount:      uintptr(len(nameRefs)),
 		InputValues:     rawPtr,
