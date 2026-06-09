@@ -24,15 +24,27 @@ type Progress interface {
 }
 
 type progressBase struct {
-	handle uintptr
-	stdout io.Writer
-	mu     sync.Mutex
+	handle  uintptr
+	stdout  io.Writer
+	mu      sync.Mutex
+	cleanup runtime.Cleanup
+}
+
+// registerCleanup attaches a cleanup that frees the progress handle if the value
+// is dropped without Close or a resume. The cleanup captures the handle value;
+// both Close and take stop it before releasing or consuming the handle, so it is
+// freed exactly once.
+func (p *progressBase) registerCleanup() {
+	if p.handle != 0 {
+		p.cleanup = runtime.AddCleanup(p, ffi.ProgressFree, p.handle)
+	}
 }
 
 func (p *progressBase) Close() error {
 	if p == nil {
 		return nil
 	}
+	p.cleanup.Stop()
 	p.mu.Lock()
 	handle := p.handle
 	p.handle = 0
@@ -60,6 +72,9 @@ func (p *progressBase) take() (uintptr, error) {
 	if p == nil {
 		return 0, fmt.Errorf("monty: progress is closed")
 	}
+	// The resume call about to receive this handle consumes it (Rust frees it),
+	// so stop the cleanup to avoid a double free.
+	p.cleanup.Stop()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.handle == 0 {
@@ -345,6 +360,7 @@ func progressFromHandle(handle uintptr, stdout io.Writer) (Progress, error) {
 			ffi.ProgressFree(handle)
 			return nil, err
 		}
+		progress.registerCleanup()
 		return progress, nil
 	case ffi.ProgressNameLookup:
 		name := ffi.TakeString(snapshot.Name)
@@ -352,6 +368,7 @@ func progressFromHandle(handle uintptr, stdout io.Writer) (Progress, error) {
 			progressBase: progressBase{handle: handle, stdout: stdout},
 			Name:         name,
 		}
+		progress.registerCleanup()
 		return progress, nil
 	case ffi.ProgressOSCall:
 		progress, err := osCallFromSnapshot(handle, snapshot, stdout)
@@ -359,12 +376,14 @@ func progressFromHandle(handle uintptr, stdout io.Writer) (Progress, error) {
 			ffi.ProgressFree(handle)
 			return nil, err
 		}
+		progress.registerCleanup()
 		return progress, nil
 	case ffi.ProgressResolveFutures:
 		progress := &ResolveFutures{
 			progressBase:   progressBase{handle: handle, stdout: stdout},
 			pendingCallIDs: pendingCallIDs(handle),
 		}
+		progress.registerCleanup()
 		return progress, nil
 	default:
 		ffi.ProgressFree(handle)

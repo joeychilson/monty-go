@@ -3,6 +3,7 @@ package monty
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -160,6 +161,39 @@ func TestCompileRejectsDuplicateFunctions(t *testing.T) {
 		t.Fatalf("single function compile: %v", err)
 	}
 	program.Close()
+}
+
+// TestProgramCleanupOnDrop guards §4.5: a Program dropped without Close must
+// have its Rust handle reclaimed by runtime.AddCleanup, and an explicit Close
+// must not double-free when the cleanup later becomes eligible. Both run under
+// -race in CI, which would flag a double free of the handle.
+func TestProgramCleanupOnDrop(t *testing.T) {
+	// Many programs created and dropped without Close: the cleanup must free
+	// each handle exactly once.
+	for i := 0; i < 200; i++ {
+		program, err := Compile("1 + 1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = program // dropped without Close
+		if i%20 == 0 {
+			runtime.GC()
+		}
+	}
+	runtime.GC()
+	runtime.GC()
+
+	// Closed programs must survive GC without a double free (Close stops the
+	// cleanup).
+	for i := 0; i < 50; i++ {
+		program, err := Compile("1 + 1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		program.Close()
+	}
+	runtime.GC()
+	runtime.GC()
 }
 
 func BenchmarkRunArithmetic(b *testing.B) {

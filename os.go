@@ -107,9 +107,10 @@ func WithMountOptions(virtualPath, hostPath string, opts ...MountOption) RunOpti
 //
 // Use Close when the mount is no longer needed.
 type MountDir struct {
-	mu     sync.Mutex
-	mount  Mount
-	handle uintptr
+	mu      sync.Mutex
+	mount   Mount
+	handle  uintptr
+	cleanup runtime.Cleanup
 }
 
 // NewMountDir creates a reusable filesystem mount. It defaults to overlay mode.
@@ -123,12 +124,11 @@ func NewMountDir(virtualPath, hostPath string, opts ...MountOption) (*MountDir, 
 		return nil, err
 	}
 	dir := &MountDir{mount: mount, handle: handle}
-	runtime.SetFinalizer(dir, (*MountDir).finalize)
+	// AddCleanup captures the handle value (not dir) so a dropped MountDir that
+	// was never Closed still frees the Rust handle. Close stops it first, so the
+	// handle is freed exactly once. Close remains the documented path.
+	dir.cleanup = runtime.AddCleanup(dir, ffi.MountFree, handle)
 	return dir, nil
-}
-
-func (m *MountDir) finalize() {
-	m.Close() //nolint:errcheck,gosec // Close cannot return an error and a finalizer cannot propagate one
 }
 
 // Close releases the Rust-side mount handle.
@@ -136,7 +136,7 @@ func (m *MountDir) Close() error {
 	if m == nil {
 		return nil
 	}
-	runtime.SetFinalizer(m, nil)
+	m.cleanup.Stop()
 	m.mu.Lock()
 	handle := m.handle
 	m.handle = 0

@@ -26,6 +26,7 @@ type Program struct {
 	inputs     []string
 	functions  map[string]*Function
 	funcNames  []ffi.Str
+	cleanup    runtime.Cleanup
 }
 
 var runFastOutputPool = sync.Pool{
@@ -68,6 +69,7 @@ func Compile(code string, opts ...CompileOption) (*Program, error) {
 		functions:  functions,
 		funcNames:  hostFunctionNameRefs(functions),
 	}
+	program.cleanup = runtime.AddCleanup(program, ffi.ProgramFree, handle)
 	return program, nil
 }
 
@@ -99,6 +101,7 @@ func LoadProgram(snapshot []byte) (*Program, error) {
 		inputs:     inputs,
 		functions:  map[string]*Function{},
 	}
+	program.cleanup = runtime.AddCleanup(program, ffi.ProgramFree, handle)
 	return program, nil
 }
 
@@ -250,6 +253,7 @@ func (p *Program) Close() {
 	if p == nil {
 		return
 	}
+	p.cleanup.Stop()
 	p.mu.Lock()
 	handle := p.handle
 	p.handle = 0

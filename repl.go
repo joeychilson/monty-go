@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"runtime"
 	"slices"
 	"sync"
 
@@ -18,8 +19,9 @@ import (
 // safe to call from multiple goroutines; calls are serialized because each
 // snippet mutates the session.
 type Repl struct {
-	mu     sync.Mutex
-	handle uintptr
+	mu      sync.Mutex
+	handle  uintptr
+	cleanup runtime.Cleanup
 }
 
 // ReplOption configures NewRepl.
@@ -54,7 +56,7 @@ func NewRepl(opts ...ReplOption) (*Repl, error) {
 	if err != nil {
 		return nil, normalizeError(err)
 	}
-	return &Repl{handle: handle}, nil
+	return newRepl(handle), nil
 }
 
 // LoadRepl restores a REPL session created by Repl.Dump.
@@ -63,7 +65,16 @@ func LoadRepl(snapshot []byte) (*Repl, error) {
 	if err != nil {
 		return nil, normalizeError(err)
 	}
-	return &Repl{handle: handle}, nil
+	return newRepl(handle), nil
+}
+
+// newRepl wraps a Rust REPL handle and attaches a cleanup that frees it if the
+// Repl is dropped without Close. The cleanup captures the handle value (not the
+// Repl), and Close stops it first, so the handle is freed exactly once.
+func newRepl(handle uintptr) *Repl {
+	r := &Repl{handle: handle}
+	r.cleanup = runtime.AddCleanup(r, ffi.ReplFree, handle)
+	return r
 }
 
 // Close releases the Rust-side REPL handle.
@@ -71,6 +82,7 @@ func (r *Repl) Close() error {
 	if r == nil {
 		return nil
 	}
+	r.cleanup.Stop()
 	r.mu.Lock()
 	handle := r.handle
 	r.handle = 0
