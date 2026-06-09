@@ -1436,7 +1436,7 @@ func decodeValue(handle uintptr) (Value, error) {
 func decodeSequence(handle uintptr, kind Kind) (Value, error) {
 	itemCount := int(ffi.ValueLen(handle))
 	if itemCount == 0 {
-		return Value{kind: kind, items: []Value{}}, nil
+		return Value{kind: kind, items: nil}, nil
 	}
 	rawItems := make([]ffi.RawValue, itemCount)
 	if err := ffi.ValueItemsRaw(handle, rawItems); err != nil {
@@ -1475,7 +1475,7 @@ func decodeNamedTuple(handle uintptr) (Value, error) {
 func decodeDict(handle uintptr, kind Kind) (Value, error) {
 	pairCount := int(ffi.ValueLen(handle))
 	if pairCount == 0 {
-		return Value{kind: kind, pairs: []Pair{}}, nil
+		return Value{kind: kind, pairs: nil}, nil
 	}
 	rawPairs := make([]ffi.RawPair, pairCount)
 	if err := ffi.ValuePairsRaw(handle, rawPairs); err != nil {
@@ -1614,7 +1614,7 @@ func decodeRawSequence(raw *ffi.RawValue, kind Kind, stringCache map[string]stri
 	itemCount := int(raw.Len)
 	if itemCount == 0 {
 		ffi.RawValueFree(raw)
-		return Value{kind: kind, items: []Value{}}, nil
+		return Value{kind: kind, items: nil}, nil
 	}
 	if raw.Ptr == nil {
 		ffi.RawValueFree(raw)
@@ -1643,7 +1643,7 @@ func decodeRawDict(raw *ffi.RawValue, kind Kind, stringCache map[string]string) 
 	pairCount := int(raw.Len)
 	if pairCount == 0 {
 		ffi.RawValueFree(raw)
-		return Value{kind: kind, pairs: []Pair{}}, nil
+		return Value{kind: kind, pairs: nil}, nil
 	}
 	if raw.Ptr == nil {
 		ffi.RawValueFree(raw)
