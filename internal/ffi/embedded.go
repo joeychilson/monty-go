@@ -52,7 +52,7 @@ func embeddedLibraryPath(name string) (string, error) {
 	}
 	// The gzip CRC is validated when CopyN below reaches EOF, so any Close error
 	// here is redundant.
-	defer func() { _ = reader.Close() }()
+	defer func() { _ = reader.Close() }() //nolint:errcheck // CRC validated by CopyN reaching EOF; Close error is redundant
 
 	tmp, err := os.CreateTemp(cacheDir, name+".*.tmp")
 	if err != nil {
@@ -62,7 +62,7 @@ func embeddedLibraryPath(name string) (string, error) {
 	keep := false
 	defer func() {
 		if !keep {
-			_ = os.Remove(tmpPath)
+			_ = os.Remove(tmpPath) //nolint:errcheck // best-effort cleanup of the temp file
 		}
 	}()
 

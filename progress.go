@@ -323,7 +323,7 @@ func resumeReturnSnapshot(ctx context.Context, base *progressBase, value Value) 
 		return nil, err
 	}
 	if writeErr := writePrinted(base.stdout, printed); writeErr != nil {
-		_ = progress.Close()
+		_ = progress.Close() //nolint:errcheck // releasing the just-resumed progress after a stdout write error
 		return nil, writeErr
 	}
 	return progress, nil

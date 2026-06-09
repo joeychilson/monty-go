@@ -329,7 +329,7 @@ func (p *Program) start(ctx context.Context, inputs any, config runConfig) (Prog
 		return nil, err
 	}
 	if writeErr := writePrinted(config.stdout, printed); writeErr != nil {
-		_ = progress.Close()
+		_ = progress.Close() //nolint:errcheck // releasing the just-started progress after a stdout write error
 		return nil, writeErr
 	}
 	return progress, nil

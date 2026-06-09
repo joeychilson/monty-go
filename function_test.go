@@ -112,7 +112,8 @@ func TestFunctionNonErrorSecondReturnNoIsNilPanic(t *testing.T) {
 func TestFunctionValueAndErrorDispatch(t *testing.T) {
 	fn := NewFunction("maybe_fail", func(in struct {
 		Fail bool `monty:"fail"`
-	}) (string, error) {
+	},
+	) (string, error) {
 		if in.Fail {
 			return "", errors.New("requested failure")
 		}
@@ -216,7 +217,8 @@ func TestFunctionNonStructInputRejectsExtraArgs(t *testing.T) {
 func TestFunctionErrorOnlyReturn(t *testing.T) {
 	fn := NewFunction("save", func(in struct {
 		Fail bool `monty:"fail"`
-	}) error {
+	},
+	) error {
 		if in.Fail {
 			return errors.New("disk full")
 		}

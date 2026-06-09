@@ -86,6 +86,7 @@ func TestEnsureLoadedStaleLibrarySticky(t *testing.T) {
 
 	libPath := loadableNonMontyLibrary(t)
 
+	//nolint:gosec,noctx // G204: re-execs this test binary with a fixed filter, no untrusted input; the child needs no context
 	cmd := exec.Command(os.Args[0], "-test.run=^TestEnsureLoadedStaleLibrarySticky$", "-test.v")
 	cmd.Env = append(env(),
 		staleChildEnv+"=1",
@@ -118,7 +119,10 @@ func loadableNonMontyLibrary(t *testing.T) string {
 		t.Skipf("no known non-monty library to load on %s", runtime.GOOS)
 	}
 	for _, pattern := range patterns {
-		matches, _ := filepath.Glob(pattern)
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
 		for _, candidate := range matches {
 			if !filepath.IsAbs(candidate) {
 				continue
@@ -130,7 +134,7 @@ func loadableNonMontyLibrary(t *testing.T) string {
 			if err != nil {
 				continue
 			}
-			_ = purego.Dlclose(handle)
+			_ = purego.Dlclose(handle) //nolint:errcheck // best-effort close of a probe handle
 			return candidate
 		}
 	}

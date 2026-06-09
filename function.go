@@ -129,6 +129,8 @@ func (f *Function) collectStructDefs() []structDef {
 				visit(field.fieldType)
 			}
 			defs = append(defs, structDef{name: t.Name(), fields: fields})
+		default:
+			// Scalars and other kinds reference no named struct types.
 		}
 	}
 	// Input fields become parameters, so visit their types (not the input

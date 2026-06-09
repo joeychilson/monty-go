@@ -542,6 +542,7 @@ func findLibrary() (string, error) {
 		if !filepath.IsAbs(path) {
 			return "", fmt.Errorf("monty: MONTY_GO_LIB must be an absolute path, got %q", path)
 		}
+		//nolint:gosec // G703: MONTY_GO_LIB is an operator-provided library path; validating its existence is the intent
 		if _, err := os.Stat(path); err != nil {
 			return "", fmt.Errorf("monty: MONTY_GO_LIB %q is not accessible: %w", path, err)
 		}
