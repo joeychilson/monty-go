@@ -146,7 +146,7 @@ type NameLookup struct {
 
 // Resume provides the Python value for the requested name and continues execution.
 func (lookup *NameLookup) Resume(ctx context.Context, value Value) (Progress, error) {
-	return resumeWithValue(ctx, &lookup.progressBase, value, ffi.ProgressResumeNameValueRaw)
+	return resumeValueSnapshot(ctx, &lookup.progressBase, value, ffi.ProgressResumeNameValueRawSnapshot)
 }
 
 // ResumeUndefined reports the requested name as undefined and continues execution.
@@ -158,8 +158,8 @@ func (lookup *NameLookup) ResumeUndefined(ctx context.Context) (Progress, error)
 	if err != nil {
 		return nil, err
 	}
-	nextHandle, printed, err := ffi.ProgressResumeNameUndefined(handle)
-	return decodeResumeResult(lookup.stdout, nextHandle, printed, err)
+	nextHandle, snapshot, printed, err := ffi.ProgressResumeNameUndefinedSnapshot(handle)
+	return decodeSnapshotResumeResult(lookup.stdout, nextHandle, snapshot, printed, err)
 }
 
 // OSCall is a paused operation that would access the host operating system.
@@ -265,13 +265,15 @@ func FutureNotFound(callID uint32, name string) FutureResult {
 	return FutureResult{CallID: callID, kind: futureResultNotFound, message: name}
 }
 
-// resumeWithValue resumes execution by passing value back through
-// the supplied FFI entry point (return-value or name-lookup paths).
-func resumeWithValue(
+// resumeValueSnapshot resumes execution by passing value back through the
+// supplied single-hop FFI entry point (return-value or name-lookup paths),
+// which yields the next progress handle and its snapshot in one FFI call —
+// avoiding the separate snapshot hop progressFromHandle would make.
+func resumeValueSnapshot(
 	ctx context.Context,
 	base *progressBase,
 	value Value,
-	resume func(progress uintptr, value *ffi.RawValue) (uintptr, string, error),
+	resume func(progress uintptr, value *ffi.RawValue) (uintptr, ffi.ProgressSnapshot, string, error),
 ) (Progress, error) {
 	if err := ctxErr(ctx); err != nil {
 		return nil, err
@@ -287,42 +289,29 @@ func resumeWithValue(
 		return nil, err
 	}
 	defer freeOwnedRawValue(&raw)
-	nextHandle, printed, err := resume(handle, &raw)
+	nextHandle, snapshot, printed, err := resume(handle, &raw)
 	runtime.KeepAlive(arena)
 	runtime.KeepAlive(value)
-	return decodeResumeResult(base.stdout, nextHandle, printed, err)
+	return decodeSnapshotResumeResult(base.stdout, nextHandle, snapshot, printed, err)
 }
 
-// resumeReturnSnapshot is the single-hop counterpart of resumeWithValue for the
-// return-value path: it resumes and fetches the next snapshot in one FFI call,
-// avoiding the separate snapshot hop progressFromHandle would make.
+// resumeReturnSnapshot resumes a paused function or OS call with a return value.
 func resumeReturnSnapshot(ctx context.Context, base *progressBase, value Value) (Progress, error) {
-	if err := ctxErr(ctx); err != nil {
-		return nil, err
-	}
-	handle, err := base.take()
+	return resumeValueSnapshot(ctx, base, value, ffi.ProgressResumeReturnRawSnapshot)
+}
+
+// decodeSnapshotResumeResult finishes a single-hop resume: flush print output
+// and build the next Progress from the snapshot already in hand.
+func decodeSnapshotResumeResult(stdout io.Writer, nextHandle uintptr, snapshot ffi.ProgressSnapshot, printed string, err error) (Progress, error) {
 	if err != nil {
-		return nil, err
-	}
-	arena := &rawArena{}
-	raw, err := valueToRaw(value, arena)
-	if err != nil {
-		ffi.ProgressFree(handle)
-		return nil, err
-	}
-	defer freeOwnedRawValue(&raw)
-	nextHandle, snapshot, printed, err := ffi.ProgressResumeReturnRawSnapshot(handle, &raw)
-	runtime.KeepAlive(arena)
-	runtime.KeepAlive(value)
-	if err != nil {
-		writeErr := writePrinted(base.stdout, printed)
+		writeErr := writePrinted(stdout, printed)
 		return nil, errors.Join(normalizeError(err), writeErr)
 	}
-	progress, err := progressFromSnapshot(nextHandle, snapshot, base.stdout)
+	progress, err := progressFromSnapshot(nextHandle, snapshot, stdout)
 	if err != nil {
 		return nil, err
 	}
-	if writeErr := writePrinted(base.stdout, printed); writeErr != nil {
+	if writeErr := writePrinted(stdout, printed); writeErr != nil {
 		_ = progress.Close() //nolint:errcheck // releasing the just-resumed progress after a stdout write error
 		return nil, writeErr
 	}

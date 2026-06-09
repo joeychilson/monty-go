@@ -230,13 +230,6 @@ type RunOutput struct {
 	Error uintptr
 }
 
-// StartOutput is the handle-returning output from starting a program.
-type StartOutput struct {
-	Progress uintptr
-	Print    Bytes
-	Error    uintptr
-}
-
 // RunRawOutput is the RawValue-returning output from raw execution.
 type RunRawOutput struct {
 	Value RawValue
@@ -443,7 +436,6 @@ var (
 	mgProgramScriptName           func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgProgramInputNames           func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgProgramLoad                 func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgProgramStartRawAddr         uintptr
 	mgProgramStartRawSnapshotAddr uintptr
 	mgProgramRunRawAddr           uintptr
 	mgProgramRunHostRawAddr       uintptr
@@ -499,18 +491,18 @@ var (
 	mgValuePairsRaw             func(uintptr, unsafe.Pointer, uintptr) int32
 
 	// Progress symbols.
-	mgProgressFree                        func(uintptr)
-	mgProgressSnapshotAddr                uintptr
-	mgProgressPendingLen                  func(uintptr) uintptr
-	mgProgressPendingID                   func(uintptr, uintptr) uint32
-	mgProgressResumePending               func(uintptr, unsafe.Pointer) int32
-	mgProgressResumeReturnRawSnapshotAddr uintptr
-	mgProgressResumeException             func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
-	mgProgressResumeNameValueRaw          func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgProgressResumeNameUndefined         func(uintptr, unsafe.Pointer) int32
-	mgProgressResumeFutures               func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
-	mgProgressDump                        func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgProgressLoad                        func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgProgressFree                            func(uintptr)
+	mgProgressSnapshotAddr                    uintptr
+	mgProgressPendingLen                      func(uintptr) uintptr
+	mgProgressPendingID                       func(uintptr, uintptr) uint32
+	mgProgressResumePending                   func(uintptr, unsafe.Pointer) int32
+	mgProgressResumeReturnRawSnapshotAddr     uintptr
+	mgProgressResumeNameValueRawSnapshotAddr  uintptr
+	mgProgressResumeNameUndefinedSnapshotAddr uintptr
+	mgProgressResumeException                 func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
+	mgProgressResumeFutures                   func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
+	mgProgressDump                            func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgProgressLoad                            func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 )
 
 // EnsureLoaded resolves the Rust shared library on first call and registers
@@ -681,8 +673,6 @@ func registerSymbols(path string) (err error) {
 		{"mg_progress_pending_id", &mgProgressPendingID},
 		{"mg_progress_resume_pending", &mgProgressResumePending},
 		{"mg_progress_resume_exception", &mgProgressResumeException},
-		{"mg_progress_resume_name_value_raw", &mgProgressResumeNameValueRaw},
-		{"mg_progress_resume_name_undefined", &mgProgressResumeNameUndefined},
 		{"mg_progress_resume_futures", &mgProgressResumeFutures},
 		{"mg_progress_dump", &mgProgressDump},
 		{"mg_progress_load", &mgProgressLoad},
@@ -703,7 +693,6 @@ func registerSymbols(path string) (err error) {
 		name   string
 		target *uintptr
 	}{
-		{"mg_program_start_raw", &mgProgramStartRawAddr},
 		{"mg_program_start_raw_snapshot", &mgProgramStartRawSnapshotAddr},
 		{"mg_program_run_raw", &mgProgramRunRawAddr},
 		{"mg_program_run_host_raw", &mgProgramRunHostRawAddr},
@@ -712,6 +701,8 @@ func registerSymbols(path string) (err error) {
 		{"mg_program_run_json_raw", &mgProgramRunJSONAddr},
 		{"mg_progress_snapshot", &mgProgressSnapshotAddr},
 		{"mg_progress_resume_return_raw_snapshot", &mgProgressResumeReturnRawSnapshotAddr},
+		{"mg_progress_resume_name_value_raw_snapshot", &mgProgressResumeNameValueRawSnapshotAddr},
+		{"mg_progress_resume_name_undefined_snapshot", &mgProgressResumeNameUndefinedSnapshotAddr},
 	}
 	for _, symbol := range rawSymbols {
 		addr, derr := purego.Dlsym(lib, symbol.name)
@@ -1045,9 +1036,6 @@ func ProgramFree(handle uintptr) {
 }
 
 var (
-	startOutputPool = sync.Pool{
-		New: func() any { return new(StartOutput) },
-	}
 	runRawOutputPool = sync.Pool{
 		New: func() any { return new(RunRawOutput) },
 	}
@@ -1068,32 +1056,6 @@ var (
 	}
 )
 
-// ProgramStartRaw starts a program using RawValue inputs.
-func ProgramStartRaw(program uintptr, inputs []RawValue, limits *Limits) (uintptr, string, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, "", err
-	}
-	out := startOutputPool.Get().(*StartOutput) //nolint:errcheck // pool only stores *StartOutput
-	*out = StartOutput{}
-	defer startOutputPool.Put(out)
-	status := syscall5(
-		mgProgramStartRawAddr,
-		program,
-		sliceAddress(inputs),
-		uintptr(len(inputs)),
-		uintptr(ptrOf(limits)),
-		uintptr(ptrOf(out)),
-	)
-	// The trampoline passes these as bare uintptr, so the GC does not see them
-	// as live across the Rust call; pin them until it returns.
-	runtime.KeepAlive(inputs)
-	runtime.KeepAlive(limits)
-	if status != StatusOK {
-		return 0, TakeString(out.Print), TakeError(out.Error)
-	}
-	return out.Progress, TakeString(out.Print), nil
-}
-
 // ProgramStartRawSnapshot starts a program and returns the first progress
 // handle and its snapshot in a single FFI hop. Progress is 0 when the snapshot
 // is Complete. The caller owns the returned snapshot's buffers.
@@ -1112,6 +1074,8 @@ func ProgramStartRawSnapshot(program uintptr, inputs []RawValue, limits *Limits)
 		uintptr(ptrOf(limits)),
 		uintptr(ptrOf(out)),
 	)
+	// The trampoline passes these as bare uintptr, so the GC does not see them
+	// as live across the Rust call; pin them until it returns.
 	runtime.KeepAlive(inputs)
 	runtime.KeepAlive(limits)
 	runtime.KeepAlive(out)
@@ -1816,24 +1780,48 @@ func ProgressResumeException(progress uintptr, excType, message string) (uintptr
 	return out.Progress, TakeString(out.Print), nil
 }
 
-// ProgressResumeNameValueRaw resumes a name lookup with a raw value.
-func ProgressResumeNameValueRaw(progress uintptr, value *RawValue) (uintptr, string, error) {
-	var out ProgressOutput
-	status := mgProgressResumeNameValueRaw(progress, ptrOf(value), ptrOf(&out))
+// ProgressResumeNameValueRawSnapshot resumes a name lookup with a raw value
+// and returns the next progress handle and its snapshot in a single FFI hop.
+// Progress is 0 when the snapshot is Complete. The caller owns the returned
+// snapshot's buffers.
+func ProgressResumeNameValueRawSnapshot(progress uintptr, value *RawValue) (uintptr, ProgressSnapshot, string, error) {
+	out := progressSnapshotOutputPool.Get().(*ProgressSnapshotOutput) //nolint:errcheck // pool only stores *ProgressSnapshotOutput
+	*out = ProgressSnapshotOutput{}
+	defer progressSnapshotOutputPool.Put(out)
+	status := syscall3(
+		mgProgressResumeNameValueRawSnapshotAddr,
+		progress,
+		uintptr(ptrOf(value)),
+		uintptr(ptrOf(out)),
+	)
+	runtime.KeepAlive(value)
+	runtime.KeepAlive(out)
+	printed := TakeString(out.Print)
 	if status != StatusOK {
-		return 0, TakeString(out.Print), TakeError(out.Error)
+		return 0, ProgressSnapshot{}, printed, TakeError(out.Error)
 	}
-	return out.Progress, TakeString(out.Print), nil
+	return out.Progress, out.Snapshot, printed, nil
 }
 
-// ProgressResumeNameUndefined resumes a name lookup as undefined.
-func ProgressResumeNameUndefined(progress uintptr) (uintptr, string, error) {
-	var out ProgressOutput
-	status := mgProgressResumeNameUndefined(progress, ptrOf(&out))
+// ProgressResumeNameUndefinedSnapshot resumes a name lookup as undefined and
+// returns the next progress handle and its snapshot in a single FFI hop.
+// Progress is 0 when the snapshot is Complete. The caller owns the returned
+// snapshot's buffers.
+func ProgressResumeNameUndefinedSnapshot(progress uintptr) (uintptr, ProgressSnapshot, string, error) {
+	out := progressSnapshotOutputPool.Get().(*ProgressSnapshotOutput) //nolint:errcheck // pool only stores *ProgressSnapshotOutput
+	*out = ProgressSnapshotOutput{}
+	defer progressSnapshotOutputPool.Put(out)
+	status := syscall2(
+		mgProgressResumeNameUndefinedSnapshotAddr,
+		progress,
+		uintptr(ptrOf(out)),
+	)
+	runtime.KeepAlive(out)
+	printed := TakeString(out.Print)
 	if status != StatusOK {
-		return 0, TakeString(out.Print), TakeError(out.Error)
+		return 0, ProgressSnapshot{}, printed, TakeError(out.Error)
 	}
-	return out.Progress, TakeString(out.Print), nil
+	return out.Progress, out.Snapshot, printed, nil
 }
 
 // ProgressResumeFutures resumes a progress handle with resolved future results.
