@@ -98,8 +98,6 @@ type valueExtra struct {
 	typeName   string
 	typeID     uint64
 	fieldNames []string
-	rawValues  []ffi.RawValue
-	rawPairs   []ffi.RawPair
 	frozen     bool
 }
 
@@ -295,19 +293,14 @@ func Set(v ...Value) Value { return sequenceValue(SetKind, slices.Clone(v)) }
 func FrozenSet(v ...Value) Value { return sequenceValue(FrozenSetKind, slices.Clone(v)) }
 
 func sequenceValue(kind Kind, items []Value) Value {
-	value := Value{kind: kind, items: items}
-	if raw, ok := tryBorrowRawValues(items); ok && len(raw) != 0 {
-		value.valueExtra = &valueExtra{rawValues: raw}
-	}
-	return value
+	// The FFI mirror slice is built on demand by valueToRaw (via the arena) when
+	// the value actually crosses the boundary, so constructors do not build one
+	// eagerly: values that are only inspected or never sent to Rust pay nothing.
+	return Value{kind: kind, items: items}
 }
 
 func dictValue(pairs []Pair) Value {
-	value := Value{kind: DictKind, pairs: pairs}
-	if raw, ok := tryBorrowRawPairs(pairs); ok && len(raw) != 0 {
-		value.valueExtra = &valueExtra{rawPairs: raw}
-	}
-	return value
+	return Value{kind: DictKind, pairs: pairs}
 }
 
 // Date returns a Python datetime.date.
@@ -1075,58 +1068,20 @@ func tryBorrowRawValue(v Value) (ffi.RawValue, bool) {
 		}
 		return raw, true
 	case ListKind, TupleKind, SetKind, FrozenSetKind:
+		// Empty containers borrow trivially (no item buffer); non-empty ones are
+		// built on demand by valueToRaw via the arena.
 		if len(v.items) == 0 {
 			return raw, true
 		}
-		extra := v.valueExtra
-		if extra == nil || len(extra.rawValues) != len(v.items) {
-			return ffi.RawValue{}, false
-		}
-		raw.Ptr = unsafe.Pointer(unsafe.SliceData(extra.rawValues))
-		raw.Len = uintptr(len(extra.rawValues))
-		return raw, true
+		return ffi.RawValue{}, false
 	case DictKind:
 		if len(v.pairs) == 0 {
 			return raw, true
 		}
-		extra := v.valueExtra
-		if extra == nil || len(extra.rawPairs) != len(v.pairs) {
-			return ffi.RawValue{}, false
-		}
-		raw.Ptr = unsafe.Pointer(unsafe.SliceData(extra.rawPairs))
-		raw.Len = uintptr(len(extra.rawPairs))
-		return raw, true
+		return ffi.RawValue{}, false
 	default:
 		return ffi.RawValue{}, false
 	}
-}
-
-func tryBorrowRawValues(items []Value) ([]ffi.RawValue, bool) {
-	rawItems := make([]ffi.RawValue, len(items))
-	for i, item := range items {
-		raw, ok := tryBorrowRawValue(item)
-		if !ok {
-			return nil, false
-		}
-		rawItems[i] = raw
-	}
-	return rawItems, true
-}
-
-func tryBorrowRawPairs(pairs []Pair) ([]ffi.RawPair, bool) {
-	rawPairItems := make([]ffi.RawPair, len(pairs))
-	for i := range pairs {
-		key, ok := tryBorrowRawValue(pairs[i].Key)
-		if !ok {
-			return nil, false
-		}
-		value, ok := tryBorrowRawValue(pairs[i].Value)
-		if !ok {
-			return nil, false
-		}
-		rawPairItems[i] = ffi.RawPair{Key: key, Value: value}
-	}
-	return rawPairItems, true
 }
 
 func sequenceHandle(items []Value, asTuple bool) (uintptr, error) {
