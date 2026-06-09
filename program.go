@@ -105,6 +105,10 @@ func LoadProgram(snapshot []byte) (*Program, error) {
 // cgocall trampoline cost once instead of three times.
 //
 // The inputs argument is normalized through the same rules as RunAs.
+//
+// Cancellation behaves as documented on Program.Run: a ctx deadline bounds a
+// runaway snippet, but plain cancellation only takes effect at progress-loop
+// boundaries.
 func CompileAndRun(ctx context.Context, code string, inputs any, opts ...RunOption) (Value, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -273,6 +277,10 @@ func (p *Program) Inputs() []string { return slices.Clone(p.inputs) }
 // Use Start when the caller wants to manually resolve external calls,
 // filesystem calls, futures, or persisted snapshots. For ordinary run-to-value
 // execution, use Program.Run or RunAs.
+//
+// Cancellation behaves as documented on Program.Run: a ctx deadline bounds a
+// runaway snippet, but plain cancellation is only checked before each step is
+// resumed, not while Python runs inside a single Rust call.
 func (p *Program) Start(ctx context.Context, inputs any, opts ...RunOption) (Progress, error) {
 	if p == nil {
 		return nil, fmt.Errorf("monty: program is closed")
@@ -354,6 +362,13 @@ func (p *Program) runDirectRaw(inputs any, config runConfig) (ffi.RawValue, erro
 //
 // Registered Go functions are resolved automatically. Runs without registered
 // functions use a direct FFI path for lower overhead.
+//
+// Cancellation: a ctx deadline is enforced as a hard resource limit (translated
+// to Limits.MaxDuration), so it reliably bounds a runaway snippet. Plain
+// cancellation (context.WithCancel) is only observed before the run starts and
+// at progress-loop boundaries between Go-resolved calls; it cannot interrupt
+// Python executing inside a single Rust call. To bound a snippet that may loop
+// forever, use a ctx deadline or WithLimits(Limits{MaxDuration: ...}).
 func (p *Program) Run(ctx context.Context, inputs any, opts ...RunOption) (Value, error) {
 	if p == nil {
 		return Value{}, fmt.Errorf("monty: program is closed")
@@ -580,6 +595,10 @@ func (s *hostCallbackState) writeException(out *ffi.HostFunctionOutput, excType,
 //
 // Primitive Go types, structs, maps, slices, and Value are supported through
 // the same conversion rules as As.
+//
+// Cancellation behaves as documented on Program.Run: a ctx deadline bounds a
+// runaway snippet, but plain cancellation only takes effect at progress-loop
+// boundaries.
 func RunAs[T any](ctx context.Context, program *Program, inputs any, opts ...RunOption) (T, error) {
 	var zero T
 	if program == nil {

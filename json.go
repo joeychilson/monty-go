@@ -60,6 +60,10 @@ func (complete *Complete) JSONString() (string, error) {
 }
 
 // RunJSON executes p and returns the final value in Monty's natural JSON form.
+//
+// Cancellation behaves as documented on Program.Run: a ctx deadline bounds a
+// runaway snippet, but plain cancellation only takes effect at progress-loop
+// boundaries.
 func (p *Program) RunJSON(ctx context.Context, inputs any, opts ...RunOption) ([]byte, error) {
 	if p == nil {
 		return nil, fmt.Errorf("monty: program is closed")

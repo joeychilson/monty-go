@@ -99,6 +99,11 @@ func (r *Repl) Dump() ([]byte, error) {
 // per-call resource limits, host functions, OS handlers, or mounts; use
 // WithReplLimits to apply limits to the whole session. Passing any other
 // RunOption returns an error rather than silently ignoring it.
+//
+// Cancellation: ctx is only checked before the snippet starts. A snippet runs
+// to completion in a single Rust call, so neither cancellation nor a ctx
+// deadline can interrupt it once started; bound runaway snippets with
+// WithReplLimits(Limits{MaxDuration: ...}) when creating the session.
 func (r *Repl) FeedRun(ctx context.Context, code string, inputs any, opts ...RunOption) (Value, error) {
 	if err := ctxErr(ctx); err != nil {
 		return Value{}, err
