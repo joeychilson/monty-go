@@ -138,6 +138,18 @@ func CompileAndRun(ctx context.Context, code string, inputs any, opts ...RunOpti
 	var arena rawArena
 	nameRefs := make([]ffi.Str, 0, len(values))
 	raw := make([]ffi.RawValue, 0, len(values))
+	// Inputs whose Kind has no inline raw form (Date, DateTime, Path,
+	// NamedTuple, Dataclass, ...) are converted to owned Rust handles, which
+	// arena.ownsHandles records. Rust's read_raw_value consumes those handles
+	// in place on a successful read — nulling each slot — so freeing here is a
+	// no-op on success but reclaims handles Rust never read: when valueToRaw
+	// fails partway through this loop, and (the real leak) when compilation
+	// fails before the inputs are read at all. Mirrors Program.rawInputs.
+	defer func() {
+		if arena.ownsHandles {
+			freeOwnedRawValues(raw)
+		}
+	}()
 	for name, value := range values {
 		rawInput, err := valueToRaw(value, &arena)
 		if err != nil {
