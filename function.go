@@ -83,31 +83,100 @@ func (f *Function) validateHandler() {
 // Name returns the Python-visible function name.
 func (f *Function) Name() string { return f.name }
 
+type structDef struct {
+	name   string
+	fields []taggedField
+}
+
+// collectStructDefs returns a TypedDict definition for every named struct type
+// referenced by the stub, in dependency order (a referenced type precedes the
+// type that references it). The input struct itself is not defined — its fields
+// become function parameters — but named structs nested inside input fields are,
+// and so is the output struct and anything it references. Without this, pythonType
+// renders a named struct field as its bare Go name (e.g. Coords) while only the
+// output type ever got a definition, producing a stub that names undefined
+// classes and fails type checking. Anonymous structs have no name to reference
+// and render inline as dict[str, Any] (see pythonType), so they get no definition.
+func (f *Function) collectStructDefs() []structDef {
+	seen := map[string]bool{}
+	var defs []structDef
+	var visit func(t reflect.Type)
+	visit = func(t reflect.Type) {
+		if t == nil {
+			return
+		}
+		switch t.Kind() {
+		case reflect.Pointer, reflect.Slice, reflect.Array:
+			visit(t.Elem())
+		case reflect.Map:
+			visit(t.Key())
+			visit(t.Elem())
+		case reflect.Struct:
+			fields := taggedFieldsFor(t).fields
+			if t.Name() == "" {
+				// Anonymous structs render as dict[str, Any]; only recurse for
+				// named structs nested in their fields.
+				for _, field := range fields {
+					visit(field.fieldType)
+				}
+				return
+			}
+			if seen[t.Name()] {
+				return
+			}
+			seen[t.Name()] = true
+			for _, field := range fields {
+				visit(field.fieldType)
+			}
+			defs = append(defs, structDef{name: t.Name(), fields: fields})
+		}
+	}
+	// Input fields become parameters, so visit their types (not the input
+	// struct itself); the output type does become a TypedDict.
+	for _, field := range f.inputFields {
+		visit(field.fieldType)
+	}
+	visit(f.outputType)
+	return defs
+}
+
 // PythonStub returns the generated Python type stub for this host function.
 func (f *Function) PythonStub() string {
-	var b strings.Builder
+	defs := f.collectStructDefs()
+
 	var outputName string
-	if len(f.outputFields) > 0 {
+	switch {
+	case f.returnsErrorOnly:
+		outputName = "None"
+	case len(f.outputFields) > 0:
 		outputType := f.outputType
 		if outputType != nil && outputType.Kind() == reflect.Pointer {
 			outputType = outputType.Elem()
 		}
-		outputName = "Return"
 		if outputType != nil && outputType.Name() != "" {
-			outputName = outputType.Name()
+			outputName = outputType.Name() // defined by collectStructDefs
+		} else {
+			// Anonymous output struct: synthesize a TypedDict named Return. Its
+			// referenced types were already collected from the output fields.
+			outputName = "Return"
+			defs = append(defs, structDef{name: "Return", fields: f.outputFields})
 		}
+	default:
+		outputName = pythonType(f.outputType)
+	}
+
+	var b strings.Builder
+	if len(defs) > 0 {
 		b.WriteString("from typing import Any, TypedDict\n\n")
-		fmt.Fprintf(&b, "class %s(TypedDict):\n", outputName)
-		for _, field := range f.outputFields {
+	} else {
+		b.WriteString("from typing import Any\n\n")
+	}
+	for _, def := range defs {
+		fmt.Fprintf(&b, "class %s(TypedDict):\n", def.name)
+		for _, field := range def.fields {
 			fmt.Fprintf(&b, "    %s: %s\n", field.name, pythonType(field.fieldType))
 		}
 		b.WriteByte('\n')
-	} else if f.returnsErrorOnly {
-		b.WriteString("from typing import Any\n\n")
-		outputName = "None"
-	} else {
-		b.WriteString("from typing import Any\n\n")
-		outputName = pythonType(f.outputType)
 	}
 	if f.doc != "" {
 		fmt.Fprintf(&b, "# %s\n", f.doc)

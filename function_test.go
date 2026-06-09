@@ -140,6 +140,46 @@ func TestFunctionValueAndErrorDispatch(t *testing.T) {
 	}
 }
 
+// TestPythonStubDefinesReferencedStructs guards §3.10: every named struct the
+// stub references — input field types and structs nested in the output — must
+// have a TypedDict definition, so WithTypeCheck+WithAutoStubs accepts the
+// registration instead of failing on an undefined class.
+func TestPythonStubDefinesReferencedStructs(t *testing.T) {
+	type Coords struct {
+		Lat float64 `monty:"lat"`
+		Lng float64 `monty:"lng"`
+	}
+	type Place struct {
+		Name string `monty:"name"`
+		At   Coords `monty:"at"`
+	}
+	type locateInput struct {
+		Where Coords `monty:"where"`
+	}
+	fn := NewFunction("locate", func(_ context.Context, _ locateInput) Place {
+		return Place{}
+	})
+
+	stub := fn.PythonStub()
+	for _, want := range []string{"class Coords(TypedDict):", "class Place(TypedDict):", "where: Coords", "-> Place"} {
+		if !strings.Contains(stub, want) {
+			t.Fatalf("stub missing %q:\n%s", want, stub)
+		}
+	}
+	// Coords is referenced by both an input field and a Place field; it must be
+	// defined exactly once.
+	if n := strings.Count(stub, "class Coords(TypedDict):"); n != 1 {
+		t.Fatalf("Coords defined %d times, want 1:\n%s", n, stub)
+	}
+
+	// The strong check: type checking the stub must succeed.
+	program, err := Compile("locate(where={'lat': 1.0, 'lng': 2.0})", WithFunction(fn), WithTypeCheck())
+	if err != nil {
+		t.Fatalf("type check failed (stub names an undefined class?): %v\nstub:\n%s", err, stub)
+	}
+	program.Close()
+}
+
 // TestFunctionNonStructInputRejectsExtraArgs guards §3.9: a handler with a
 // non-struct input binds exactly one positional argument and no keywords;
 // extra positional args or any kwarg must error rather than be silently
