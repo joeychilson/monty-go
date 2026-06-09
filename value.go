@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unsafe"
 
 	"github.com/joeychilson/monty/internal/ffi"
@@ -839,15 +840,27 @@ func fieldName(field reflect.StructField) (string, bool) {
 	return snakeCase(field.Name), true
 }
 
+// snakeCase converts a Go field name to a Python-style snake_case input name.
+// It is acronym-aware and Unicode-aware: an underscore is inserted before an
+// upper-case rune only when it begins a new word — i.e. the previous rune is
+// not upper-case, or it ends an acronym (previous rune upper-case, next rune
+// lower-case). So HTTPTimeout -> http_timeout, UserID -> user_id,
+// APIKey2 -> api_key2, and an already-snake name is left unchanged.
 func snakeCase(name string) string {
+	runes := []rune(name)
 	var b strings.Builder
-	for i, r := range name {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			b.WriteByte('_')
+	b.Grow(len(name) + 4)
+	for i, r := range runes {
+		if i > 0 && unicode.IsUpper(r) {
+			prevIsUpper := unicode.IsUpper(runes[i-1])
+			nextIsLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+			if !prevIsUpper || nextIsLower {
+				b.WriteByte('_')
+			}
 		}
-		b.WriteRune(r)
+		b.WriteRune(unicode.ToLower(r))
 	}
-	return strings.ToLower(b.String())
+	return b.String()
 }
 
 type rawArena struct {
