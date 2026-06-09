@@ -1408,11 +1408,10 @@ func decodeSequence(handle uintptr, kind Kind) (Value, error) {
 	}
 	items := make([]Value, itemCount)
 	for i := range rawItems {
-		item, err := decodeRawValue(rawItems[i])
+		item, err := decodeRawValueIntern(&rawItems[i], nil)
 		if err != nil {
-			for j := i; j < len(rawItems); j++ {
-				ffi.RawValueFree(&rawItems[j])
-			}
+			// decodeRawValueIntern consumed and zeroed rawItems[i]; free the rest.
+			freeAllRawValues(rawItems[i+1:])
 			return Value{}, err
 		}
 		items[i] = item
@@ -1448,16 +1447,17 @@ func decodeDict(handle uintptr, kind Kind) (Value, error) {
 	}
 	pairs := make([]Pair, pairCount)
 	for i := range rawPairs {
-		key, err := decodeRawValue(rawPairs[i].Key)
+		key, err := decodeRawValueIntern(&rawPairs[i].Key, nil)
 		if err != nil {
-			ffi.RawValueFree(&rawPairs[i].Key)
+			// Key consumed and zeroed; its value slot is still owned, as are
+			// the remaining pairs.
 			ffi.RawValueFree(&rawPairs[i].Value)
 			freeAllRawPairs(rawPairs[i+1:])
 			return Value{}, err
 		}
-		value, err := decodeRawValue(rawPairs[i].Value)
+		value, err := decodeRawValueIntern(&rawPairs[i].Value, nil)
 		if err != nil {
-			ffi.RawValueFree(&rawPairs[i].Value)
+			// Both slots of pair i are now consumed; free the remaining pairs.
 			freeAllRawPairs(rawPairs[i+1:])
 			return Value{}, err
 		}
@@ -1494,63 +1494,94 @@ func decodeOwnedValue(handle uintptr) (Value, error) {
 }
 
 func decodeRawValue(raw ffi.RawValue) (Value, error) {
-	return decodeRawValueIntern(raw, nil)
+	return decodeRawValueIntern(&raw, nil)
 }
 
-func decodeRawValueIntern(raw ffi.RawValue, stringCache map[string]string) (Value, error) {
+// decodeRawValueIntern decodes one raw value, consuming it: on every exit path,
+// success or failure, it releases whatever *raw owns (string/bytes buffers,
+// child arrays, owned handles) and zeros *raw. Callers iterating an array of
+// raw values therefore never need to free a slot they have already passed here,
+// and a parent RawValueFree only ever walks already-zeroed slots for processed
+// items — which is what prevents the partial-failure double-free when a nested
+// container decode errors midway.
+func decodeRawValueIntern(raw *ffi.RawValue, stringCache map[string]string) (Value, error) {
 	kind := Kind(raw.Kind)
 	switch kind {
 	case InvalidKind:
+		*raw = ffi.RawValue{}
 		return Value{}, fmt.Errorf("monty: invalid raw value")
 	case EllipsisKind:
+		*raw = ffi.RawValue{}
 		return Ellipsis(), nil
 	case NoneKind:
+		*raw = ffi.RawValue{}
 		return None(), nil
 	case BoolKind:
-		return Bool(raw.Bool != 0), nil
+		b := raw.Bool != 0
+		*raw = ffi.RawValue{}
+		return Bool(b), nil
 	case IntKind:
-		return Int64(raw.Int), nil
+		n := raw.Int
+		*raw = ffi.RawValue{}
+		return Int64(n), nil
 	case FloatKind:
-		return Float(raw.Float), nil
+		f := raw.Float
+		*raw = ffi.RawValue{}
+		return Float(f), nil
 	case StringKind:
 		text := ffi.TakeString(ffi.Bytes{Ptr: raw.Ptr, Len: raw.Len})
+		*raw = ffi.RawValue{}
 		return Value{kind: StringKind, text: text}, nil
 	case BigIntKind, PathKind, ReprKind, CycleKind, FunctionKind, TypeKind, BuiltinFunctionKind:
 		text := ffi.TakeString(ffi.Bytes{Ptr: raw.Ptr, Len: raw.Len})
+		*raw = ffi.RawValue{}
 		return Value{kind: kind, text: text}, nil
 	case ExceptionKind:
 		text := ffi.TakeString(ffi.Bytes{Ptr: raw.Ptr, Len: raw.Len})
+		*raw = ffi.RawValue{}
 		if excType, message, ok := strings.Cut(text, ": "); ok && excType != "" {
 			return Exception(excType, message), nil
 		}
 		return Exception(text, ""), nil
 	case BytesKind:
 		bytes := ffi.TakeBytes(ffi.Bytes{Ptr: raw.Ptr, Len: raw.Len})
+		*raw = ffi.RawValue{}
 		return Value{kind: BytesKind, bytes: bytes}, nil
 	case ListKind, TupleKind, SetKind, FrozenSetKind:
 		if raw.Handle != 0 {
-			return decodeOwnedValue(raw.Handle)
+			handle := raw.Handle
+			*raw = ffi.RawValue{}
+			return decodeOwnedValue(handle)
 		}
 		return decodeRawSequence(raw, kind, stringCache)
 	case DictKind:
 		if raw.Handle != 0 {
-			return decodeOwnedValue(raw.Handle)
+			handle := raw.Handle
+			*raw = ffi.RawValue{}
+			return decodeOwnedValue(handle)
 		}
 		return decodeRawDict(raw, kind, stringCache)
 	default:
 		if raw.Handle == 0 {
+			// Unknown kind with no handle (binding/library version skew).
+			// Free any buffer it carries before reporting the error.
+			ffi.RawValueFree(raw)
 			return Value{}, fmt.Errorf("monty: raw %s value did not include a value handle", kind)
 		}
-		return decodeOwnedValue(raw.Handle)
+		handle := raw.Handle
+		*raw = ffi.RawValue{}
+		return decodeOwnedValue(handle)
 	}
 }
 
-func decodeRawSequence(raw ffi.RawValue, kind Kind, stringCache map[string]string) (Value, error) {
+func decodeRawSequence(raw *ffi.RawValue, kind Kind, stringCache map[string]string) (Value, error) {
 	itemCount := int(raw.Len)
 	if itemCount == 0 {
+		ffi.RawValueFree(raw)
 		return Value{kind: kind, items: []Value{}}, nil
 	}
 	if raw.Ptr == nil {
+		ffi.RawValueFree(raw)
 		return Value{}, fmt.Errorf("monty: raw %s value has null item pointer", kind)
 	}
 	if stringCache == nil {
@@ -1559,24 +1590,27 @@ func decodeRawSequence(raw ffi.RawValue, kind Kind, stringCache map[string]strin
 	rawItems := unsafe.Slice((*ffi.RawValue)(raw.Ptr), itemCount)
 	items := make([]Value, itemCount)
 	for i := range rawItems {
-		item, err := decodeRawValueIntern(rawItems[i], stringCache)
+		item, err := decodeRawValueIntern(&rawItems[i], stringCache)
 		if err != nil {
-			ffi.RawValueFree(&raw)
+			// rawItems[i] is already consumed and zeroed; RawValueFree(raw)
+			// frees the backing array plus the still-owned slots after i.
+			ffi.RawValueFree(raw)
 			return Value{}, err
 		}
-		rawItems[i] = ffi.RawValue{}
 		items[i] = item
 	}
-	ffi.RawValueFree(&raw)
+	ffi.RawValueFree(raw)
 	return Value{kind: kind, items: items}, nil
 }
 
-func decodeRawDict(raw ffi.RawValue, kind Kind, stringCache map[string]string) (Value, error) {
+func decodeRawDict(raw *ffi.RawValue, kind Kind, stringCache map[string]string) (Value, error) {
 	pairCount := int(raw.Len)
 	if pairCount == 0 {
+		ffi.RawValueFree(raw)
 		return Value{kind: kind, pairs: []Pair{}}, nil
 	}
 	if raw.Ptr == nil {
+		ffi.RawValueFree(raw)
 		return Value{}, fmt.Errorf("monty: raw %s value has null pair pointer", kind)
 	}
 	if stringCache == nil {
@@ -1588,24 +1622,23 @@ func decodeRawDict(raw ffi.RawValue, kind Kind, stringCache map[string]string) (
 		var key Value
 		var err error
 		if Kind(rawPairs[i].Key.Kind) == StringKind {
+			// takeInternedRawString consumes and zeros the key slot.
 			key = Value{kind: StringKind, text: takeInternedRawString(&rawPairs[i].Key, stringCache)}
 		} else {
-			key, err = decodeRawValueIntern(rawPairs[i].Key, stringCache)
+			key, err = decodeRawValueIntern(&rawPairs[i].Key, stringCache)
 			if err != nil {
-				ffi.RawValueFree(&raw)
+				ffi.RawValueFree(raw)
 				return Value{}, err
 			}
 		}
-		rawPairs[i].Key = ffi.RawValue{}
-		value, err := decodeRawValueIntern(rawPairs[i].Value, stringCache)
+		value, err := decodeRawValueIntern(&rawPairs[i].Value, stringCache)
 		if err != nil {
-			ffi.RawValueFree(&raw)
+			ffi.RawValueFree(raw)
 			return Value{}, err
 		}
-		rawPairs[i].Value = ffi.RawValue{}
 		pairs[i] = Pair{Key: key, Value: value}
 	}
-	ffi.RawValueFree(&raw)
+	ffi.RawValueFree(raw)
 	return Value{kind: kind, pairs: pairs}, nil
 }
 
@@ -1798,6 +1831,12 @@ func (r *flatValueReader) readString() (string, error) {
 	// separate headers but share underlying bytes, which is enough for the
 	// public Value contract.
 	return unsafe.String(unsafe.SliceData(bytes), len(bytes)), nil
+}
+
+func freeAllRawValues(values []ffi.RawValue) {
+	for i := range values {
+		ffi.RawValueFree(&values[i])
+	}
 }
 
 func freeAllRawPairs(pairs []ffi.RawPair) {

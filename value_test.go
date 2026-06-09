@@ -213,6 +213,61 @@ func TestNestedEmptyRawInputs(t *testing.T) {
 	}
 }
 
+// TestNestedRawDecodeRoundTrip exercises the recursive raw-value decode paths
+// (decodeRawSequence/decodeRawDict and their pointer-based per-item consumption)
+// on a deeply nested, mixed-container result. It guards the §3.5 refactor that
+// made each item consume and zero its own slot so a parent free never
+// double-walks an already-consumed child: every container here is freed exactly
+// once on the success path, which -race / the GC-hammer tests would flag if the
+// ownership bookkeeping were wrong.
+func TestNestedRawDecodeRoundTrip(t *testing.T) {
+	code := `[
+    {"name": "a", "tags": ["x", "y"], "meta": {"n": 1, "vals": [1, 2, 3]}},
+    {"name": "b", "tags": [], "meta": {"n": 2, "vals": [(4, 5), (6, 7)]}},
+]`
+	value, err := CompileAndRun(context.Background(), code, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := value.Items()
+	if value.Kind() != ListKind || len(items) != 2 {
+		t.Fatalf("top-level = kind %s len %d, want list of 2", value.Kind(), len(items))
+	}
+
+	first := items[0]
+	if first.Kind() != DictKind {
+		t.Fatalf("items[0] kind = %s, want dict", first.Kind())
+	}
+	got, err := As[map[string]any](first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["name"] != "a" {
+		t.Fatalf("items[0][name] = %v, want a", got["name"])
+	}
+
+	// The second element nests tuples inside a list inside a dict — multiple
+	// recursion levels through decodeRawSequence/decodeRawDict.
+	second := items[1].Pairs()
+	var vals Value
+	for _, pair := range second {
+		if pair.Key.Str() == "meta" {
+			for _, metaPair := range pair.Value.Pairs() {
+				if metaPair.Key.Str() == "vals" {
+					vals = metaPair.Value
+				}
+			}
+		}
+	}
+	if vals.Kind() != ListKind || len(vals.Items()) != 2 {
+		t.Fatalf("nested vals = kind %s len %d, want list of 2 tuples", vals.Kind(), len(vals.Items()))
+	}
+	tuple := vals.Items()[0]
+	if tuple.Kind() != TupleKind || len(tuple.Items()) != 2 || tuple.Items()[0].Int() != 4 {
+		t.Fatalf("nested tuple = %s, want (4, 5)", tuple)
+	}
+}
+
 func TestAsSlicesAndMaps(t *testing.T) {
 	ints, err := As[[]int](List(Int(1), Int(2), Int(3)))
 	if err != nil {
