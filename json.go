@@ -72,7 +72,7 @@ func (p *Program) RunJSON(ctx context.Context, inputs any, opts ...RunOption) ([
 	if !config.needsDispatchLoop() {
 		return p.runJSONDirect(ctx, inputs, config)
 	}
-	value, err := p.Run(ctx, inputs, opts...)
+	value, err := p.run(ctx, inputs, config)
 	if err != nil {
 		return nil, err
 	}

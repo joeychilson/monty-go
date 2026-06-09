@@ -376,10 +376,16 @@ func (p *Program) Run(ctx context.Context, inputs any, opts ...RunOption) (Value
 	if p == nil {
 		return Value{}, fmt.Errorf("monty: program is closed")
 	}
+	return p.run(ctx, inputs, p.runConfig(opts...))
+}
+
+// run executes the program from an already-built runConfig. RunAs and RunJSON
+// call it directly so options are applied exactly once instead of being rebuilt
+// when they fall back to the value path.
+func (p *Program) run(ctx context.Context, inputs any, config runConfig) (Value, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	config := p.runConfig(opts...)
 	if !config.needsDispatchLoop() {
 		preparedConfig, err := p.prepareRun(ctx, config)
 		if err != nil {
@@ -618,7 +624,7 @@ func RunAs[T any](ctx context.Context, program *Program, inputs any, opts ...Run
 		}
 		return rawAs[T](raw)
 	}
-	value, err := program.Run(ctx, inputs, opts...)
+	value, err := program.run(ctx, inputs, config)
 	if err != nil {
 		return zero, err
 	}
