@@ -684,7 +684,16 @@ func (v Value) Interface() any {
 		values := make(map[any]any, len(v.pairs))
 		for pairIndex := range v.pairs {
 			pair := &v.pairs[pairIndex]
-			values[pair.Key.Interface()] = pair.Value.Interface()
+			key := pair.Key.Interface()
+			// A Go map key must be comparable. Python keys such as tuples
+			// convert to []any (and namedtuple/dataclass keys to structs
+			// holding slices), which would panic on insertion with "hash of
+			// unhashable type". Fall back to the key's Python-like string form
+			// for any non-comparable representation so this cannot panic.
+			if t := reflect.TypeOf(key); t != nil && !t.Comparable() {
+				key = pair.Key.String()
+			}
+			values[key] = pair.Value.Interface()
 		}
 		return values
 	case DateKind:

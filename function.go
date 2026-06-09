@@ -513,6 +513,12 @@ func valueAsReflect(value Value, target reflect.Type) (reflect.Value, error) {
 			if err != nil {
 				return reflect.Value{}, err
 			}
+			// SetMapIndex panics if the key's dynamic type is not comparable
+			// (e.g. a Python tuple key landing in a map[any]any). Reject it
+			// with a clear error instead of crashing the caller.
+			if !key.Comparable() {
+				return reflect.Value{}, fmt.Errorf("monty: dict key of kind %s is not usable as a Go map key", value.pairs[i].Key.kind)
+			}
 			mapValue, err := valueAsReflect(value.pairs[i].Value, target.Elem())
 			if err != nil {
 				return reflect.Value{}, err

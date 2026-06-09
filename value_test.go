@@ -229,3 +229,71 @@ func TestAsSlicesAndMaps(t *testing.T) {
 		t.Fatalf("map = %v", values)
 	}
 }
+
+// TestInterfaceUnhashableDictKey guards against a panic when a Python dict has
+// keys whose Go representation is not comparable (tuples become []any,
+// namedtuples/dataclasses become structs holding slices). Interface() must fall
+// back to a string key form instead of panicking on map insertion.
+func TestInterfaceUnhashableDictKey(t *testing.T) {
+	cases := []struct {
+		name string
+		key  Value
+	}{
+		{"tuple", Tuple(Int(1), Int(2))},
+		{"nested-tuple", Tuple(Tuple(Int(1)), Int(2))},
+		{"namedtuple", NamedTuple("Point", []string{"x", "y"}, Int(1), Int(2))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Interface() panicked on %s key: %v", tc.name, r)
+				}
+			}()
+			d := Dict(Pair{Key: tc.key, Value: Str("v")})
+			out, ok := d.Interface().(map[any]any)
+			if !ok {
+				t.Fatalf("Interface() = %T, want map[any]any", d.Interface())
+			}
+			if len(out) != 1 {
+				t.Fatalf("map has %d entries, want 1", len(out))
+			}
+			if got := out[tc.key.String()]; got != "v" {
+				t.Fatalf("map[%q] = %v, want %q", tc.key.String(), got, "v")
+			}
+		})
+	}
+}
+
+// TestInterfaceHashableDictKeyPreserved confirms comparable keys (including
+// exceptions, whose Go representation has no slices) keep their native form.
+func TestInterfaceHashableDictKeyPreserved(t *testing.T) {
+	d := Dict(
+		Pair{Key: Int(1), Value: Str("a")},
+		Pair{Key: Str("b"), Value: Int(2)},
+	)
+	out, ok := d.Interface().(map[any]any)
+	if !ok {
+		t.Fatalf("Interface() = %T, want map[any]any", d.Interface())
+	}
+	if out[int64(1)] != "a" {
+		t.Fatalf("map[1] = %v, want a", out[int64(1)])
+	}
+	if out["b"] != int64(2) {
+		t.Fatalf("map[b] = %v, want 2", out["b"])
+	}
+}
+
+// TestAsMapUnhashableKeyErrors confirms As reports a clear error instead of
+// panicking when a dict key cannot be a Go map key.
+func TestAsMapUnhashableKeyErrors(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("As[map[any]any] panicked: %v", r)
+		}
+	}()
+	d := Dict(Pair{Key: Tuple(Int(1), Int(2)), Value: Str("x")})
+	if _, err := As[map[any]any](d); err == nil {
+		t.Fatal("As[map[any]any] succeeded on unhashable key, want error")
+	}
+}
