@@ -1,3 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/monty-ffi"]
+
+# Match the release profile upstream monty uses for its Python wheels. Cargo
+# only honors the profile in the workspace root, so without this the cdylib
+# (and the whole monty interpreter inside it) builds without LTO.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
