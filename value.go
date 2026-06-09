@@ -476,7 +476,13 @@ func MontyDateFromTime(t time.Time) MontyDate {
 	return MontyDate{Year: t.Year(), Month: t.Month(), Day: t.Day()}
 }
 
-// Time converts datetime to Go time.Time. Naive datetimes use UTC.
+// Time converts datetime to a Go time.Time.
+//
+// An aware datetime (HasOffset) is placed in a fixed zone built from its UTC
+// offset and timezone name. A naive datetime is interpreted as UTC — including
+// one that carries a timezone name but no resolved offset, since the offset is
+// then unknown and cannot be materialized. Inspect the MontyDateTime fields
+// directly to distinguish naive from aware.
 func (dt MontyDateTime) Time() time.Time {
 	location := time.UTC
 	if dt.HasOffset {
@@ -596,7 +602,14 @@ func (v Value) String() string {
 		date := v.extraPtr().date
 		return fmt.Sprintf("%04d-%02d-%02d", date.Year, date.Month, date.Day)
 	case DateTimeKind:
-		return v.extraPtr().datetime.Time().Format("2006-01-02T15:04:05.999999Z07:00")
+		datetime := v.extraPtr().datetime
+		// Only an aware datetime carries a timezone suffix; a naive datetime
+		// prints without one rather than claiming a UTC ("Z") it never asserted.
+		layout := "2006-01-02T15:04:05.999999"
+		if datetime.HasOffset {
+			layout += "Z07:00"
+		}
+		return datetime.Time().Format(layout)
 	case TimeDeltaKind:
 		delta := v.extraPtr().timedelta
 		return fmt.Sprintf("%dd %ds %dus", delta.Days, delta.Seconds, delta.Microseconds)

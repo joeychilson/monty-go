@@ -103,6 +103,45 @@ from datetime import date, datetime, timedelta, timezone
 	}
 }
 
+// TestDateTimeStringNaiveVsAware guards §3.7: a naive Python datetime must not
+// print a "Z" suffix it never asserted, while an aware datetime keeps its
+// offset.
+func TestDateTimeStringNaiveVsAware(t *testing.T) {
+	program, err := Compile(`
+from datetime import datetime, timezone, timedelta
+(
+    datetime(2026, 1, 2, 10, 0, 0),
+    datetime(2026, 1, 2, 10, 0, 0, tzinfo=timezone(timedelta(hours=-5))),
+)
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer program.Close()
+
+	value, err := program.Run(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := value.Items()
+
+	naive := items[0]
+	if naive.DateTime().HasOffset {
+		t.Fatal("first datetime should be naive")
+	}
+	if got := naive.String(); got != "2026-01-02T10:00:00" {
+		t.Fatalf("naive datetime String() = %q, want no timezone suffix", got)
+	}
+
+	aware := items[1]
+	if !aware.DateTime().HasOffset {
+		t.Fatal("second datetime should be aware")
+	}
+	if got := aware.String(); got != "2026-01-02T10:00:00-05:00" {
+		t.Fatalf("aware datetime String() = %q, want -05:00 suffix", got)
+	}
+}
+
 func TestRichNamedTupleAndDataclassValues(t *testing.T) {
 	program, err := Compile(`point`, WithInputs("point"))
 	if err != nil {
