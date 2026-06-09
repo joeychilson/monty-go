@@ -514,7 +514,7 @@ func EnsureLoaded() error {
 			loadErr = fmt.Errorf("monty: load %s: %w", path, err)
 			return
 		}
-		registerSymbols()
+		loadErr = registerSymbols(path)
 	})
 	return loadErr
 }
@@ -560,7 +560,22 @@ func libraryFileName() string {
 	}
 }
 
-func registerSymbols() {
+// registerSymbols resolves and binds every FFI symbol from the loaded library.
+// It returns a descriptive error (rather than panicking) when a symbol is
+// missing — the common case when an old library is found via MONTY_GO_LIB or a
+// stale build directory. Errors must be sticky: registerSymbols runs inside
+// loadOnce, which is never retried, so a failure here is recorded in loadErr
+// and reported to every subsequent caller. The deferred recover is a backstop
+// for purego.RegisterFunc, which panics on an unsupported function signature
+// (a programmer error); converting it to loadErr keeps the Once from completing
+// with half-registered, nil function pointers that would crash on first use.
+func registerSymbols(path string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("monty: register FFI symbols from %s: %v", path, r)
+		}
+	}()
+
 	symbols := []struct {
 		name   string
 		target any
@@ -648,24 +663,38 @@ func registerSymbols() {
 		{"mg_progress_load", &mgProgressLoad},
 	}
 	for _, symbol := range symbols {
-		purego.RegisterLibFunc(symbol.target, lib, symbol.name)
-	}
-	dlsym := func(name string) uintptr {
-		addr, err := purego.Dlsym(lib, name)
-		if err != nil {
-			panic(err)
+		addr, derr := purego.Dlsym(lib, symbol.name)
+		if derr != nil {
+			return fmt.Errorf("monty: symbol %s not found in %s; library is older than the Go binding: %w", symbol.name, path, derr)
 		}
-		return addr
+		// Equivalent to purego.RegisterLibFunc, but resolving the address
+		// ourselves lets a missing symbol return an error instead of panicking.
+		purego.RegisterFunc(symbol.target, addr)
 	}
 
-	mgProgramStartRawAddr = dlsym("mg_program_start_raw")
-	mgProgramRunRawAddr = dlsym("mg_program_run_raw")
-	mgProgramRunHostRawAddr = dlsym("mg_program_run_host_raw")
-	mgProgramRunFastAddr = dlsym("mg_program_run_fast_raw")
-	mgProgramCompileRunFastAddr = dlsym("mg_program_compile_run_fast_raw")
-	mgProgramRunJSONAddr = dlsym("mg_program_run_json_raw")
-	mgProgressSnapshotAddr = dlsym("mg_progress_snapshot")
-	mgProgressResumeReturnRawAddr = dlsym("mg_progress_resume_return_raw")
+	// Symbols invoked through hand-rolled syscall trampolines, bound by raw
+	// address rather than a Go func pointer.
+	rawSymbols := []struct {
+		name   string
+		target *uintptr
+	}{
+		{"mg_program_start_raw", &mgProgramStartRawAddr},
+		{"mg_program_run_raw", &mgProgramRunRawAddr},
+		{"mg_program_run_host_raw", &mgProgramRunHostRawAddr},
+		{"mg_program_run_fast_raw", &mgProgramRunFastAddr},
+		{"mg_program_compile_run_fast_raw", &mgProgramCompileRunFastAddr},
+		{"mg_program_run_json_raw", &mgProgramRunJSONAddr},
+		{"mg_progress_snapshot", &mgProgressSnapshotAddr},
+		{"mg_progress_resume_return_raw", &mgProgressResumeReturnRawAddr},
+	}
+	for _, symbol := range rawSymbols {
+		addr, derr := purego.Dlsym(lib, symbol.name)
+		if derr != nil {
+			return fmt.Errorf("monty: symbol %s not found in %s; library is older than the Go binding: %w", symbol.name, path, derr)
+		}
+		*symbol.target = addr
+	}
+	return nil
 }
 
 // StringRef returns a borrowed view of s as an FFI Str. The caller must
