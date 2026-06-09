@@ -406,7 +406,13 @@ var (
 	mgErrorDisplay func(uintptr, unsafe.Pointer) int32
 
 	// Program, REPL, and mount symbols.
-	mgTypeCheck                 func(unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
+	// The final out-error argument is the 9th, which overflows the 8 arm64
+	// integer registers onto the stack. purego's stack-placement path only
+	// handles uintptr/Ptr (not unsafe.Pointer), so this parameter must stay
+	// uintptr; it points at a local uintptr handle that carries no Go heap data
+	// needing GC tracing, so 1.1's keep-alive requirement does not apply to it.
+	// The string-pointer args stay unsafe.Pointer (they sit in registers).
+	mgTypeCheck                 func(unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, uintptr) int32
 	mgMountNew                  func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	mgMountFree                 func(uintptr)
 	mgMountHandleOSCall         func(unsafe.Pointer, unsafe.Pointer) int32
@@ -825,7 +831,8 @@ func TypeCheck(code, scriptName, stubs, stubsName string) error {
 	scriptPtr, scriptLen := stringArgs(scriptName)
 	stubsPtr, stubsLen := stringArgs(stubs)
 	stubsNamePtr, stubsNameLen := stringArgs(stubsName)
-	status := mgTypeCheck(codePtr, codeLen, scriptPtr, scriptLen, stubsPtr, stubsLen, stubsNamePtr, stubsNameLen, ptrOf(&errHandle))
+	status := mgTypeCheck(codePtr, codeLen, scriptPtr, scriptLen, stubsPtr, stubsLen, stubsNamePtr, stubsNameLen, uintptr(ptrOf(&errHandle)))
+	runtime.KeepAlive(&errHandle)
 	if status != StatusOK {
 		return TakeError(errHandle)
 	}
