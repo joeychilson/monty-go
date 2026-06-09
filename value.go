@@ -691,8 +691,9 @@ func (v Value) Interface() any {
 		return v.Bytes()
 	case ListKind, TupleKind, SetKind, FrozenSetKind:
 		items := make([]any, len(v.items))
-		for i, item := range v.items {
-			items[i] = item.Interface()
+		// Index rather than range to avoid copying each ~100-byte Value element.
+		for i := range v.items {
+			items[i] = v.items[i].Interface()
 		}
 		return items
 	case NamedTupleKind:
