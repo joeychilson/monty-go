@@ -508,7 +508,7 @@ func hostFunctionNameRefs(functions map[string]*Function) []ffi.Str {
 	return names
 }
 
-func hostFunctionCallback(userData unsafe.Pointer, namePtr unsafe.Pointer, nameLen uintptr, argsPtr unsafe.Pointer, kwargsPtr unsafe.Pointer, outPtr unsafe.Pointer) int32 {
+func hostFunctionCallback(userData unsafe.Pointer, namePtr unsafe.Pointer, nameLen uintptr, argsPtr unsafe.Pointer, kwargsPtr unsafe.Pointer, outPtr unsafe.Pointer) (status int32) {
 	if outPtr == nil {
 		return ffi.HostCallbackException
 	}
@@ -518,6 +518,15 @@ func hostFunctionCallback(userData unsafe.Pointer, namePtr unsafe.Pointer, nameL
 		return ffi.HostCallbackException
 	}
 	state := (*hostCallbackState)(userData)
+	// Rust calls this callback synchronously in the middle of an extern "C"
+	// FFI call. A panic from user handler code (function.fastRawCall) would
+	// unwind across the Rust frames, which is undefined behavior and crashes
+	// the process. Convert any panic into a Python exception instead.
+	defer func() {
+		if r := recover(); r != nil {
+			status = state.writeException(out, "RuntimeError", fmt.Sprintf("host function panicked: %v", r))
+		}
+	}()
 	if err := state.ctx.Err(); err != nil {
 		excType, message := exceptionFromError(err)
 		return state.writeException(out, excType, message)
