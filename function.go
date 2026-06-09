@@ -325,6 +325,12 @@ func bindInput(target reflect.Type, args []Value, kwargs []Pair, fields []tagged
 		return ptr, nil
 	}
 	if target.Kind() != reflect.Struct {
+		// A non-struct input binds exactly one positional argument and accepts
+		// no keywords. Reject extra positional args or any kwarg instead of
+		// silently dropping them, matching the struct path's strictness.
+		if len(args) > 1 || len(kwargs) > 0 {
+			return reflect.Value{}, fmt.Errorf("monty: %s takes a single positional argument", target)
+		}
 		if len(args) == 0 {
 			return reflect.Zero(target), nil
 		}

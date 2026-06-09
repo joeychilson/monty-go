@@ -140,6 +140,34 @@ func TestFunctionValueAndErrorDispatch(t *testing.T) {
 	}
 }
 
+// TestFunctionNonStructInputRejectsExtraArgs guards §3.9: a handler with a
+// non-struct input binds exactly one positional argument and no keywords;
+// extra positional args or any kwarg must error rather than be silently
+// dropped (which used to bind defaults and hide caller bugs).
+func TestFunctionNonStructInputRejectsExtraArgs(t *testing.T) {
+	fn := NewFunction("double", func(_ context.Context, n int) int { return n * 2 })
+
+	good, err := Compile("double(21)", WithFunction(fn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer good.Close()
+	if got, err := RunAs[int](context.Background(), good, nil); err != nil || got != 42 {
+		t.Fatalf("double(21) = %d, err %v; want 42", got, err)
+	}
+
+	for _, call := range []string{"double(1, 2, 3)", "double(n=1)"} {
+		program, err := Compile(call, WithFunction(fn))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RunAs[int](context.Background(), program, nil); err == nil {
+			t.Fatalf("%s = nil error, want rejection of extra args/kwargs", call)
+		}
+		program.Close()
+	}
+}
+
 // TestFunctionErrorOnlyReturn covers a handler whose sole return value is an
 // error: a non-nil error must raise a Python exception and a nil error must
 // surface as None, rather than marshaling the *errors.errorString as an empty
