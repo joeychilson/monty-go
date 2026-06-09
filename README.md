@@ -109,15 +109,15 @@ Side-by-side comparison of this Go binding against the Python `pydantic-monty` b
 
 | benchmark | go | python | go vs python |
 | --- | ---: | ---: | ---: |
-| ArithmeticRun | 1.36 µs | 1.12 µs | 1.22x slower |
-| ArithmeticCompileRun | 4.07 µs | 3.36 µs | 1.21x slower |
-| OrderSummaryRun | 8.84 µs | 8.10 µs | 1.09x slower |
-| OrderSummaryCompileRun | 33.97 µs | 28.56 µs | 1.19x slower |
-| OrderSummaryJSON | 8.33 µs | 9.95 µs | 1.19x faster |
-| StringNormalizationRun | 5.36 µs | 4.41 µs | 1.21x slower |
-| RecordsResult100 | 136.40 µs | 93.02 µs | 1.47x slower |
-| HostFunctionBatch | 17.75 µs | 11.37 µs | 1.56x slower |
-| HostFunctionStructKwargs | 3.36 µs | 2.23 µs | 1.50x slower |
+| ArithmeticRun | 1.34 µs | 1.19 µs | 1.13x slower |
+| ArithmeticCompileRun | 3.53 µs | 3.23 µs | 1.09x slower |
+| OrderSummaryRun | 9.27 µs | 7.80 µs | 1.19x slower |
+| OrderSummaryCompileRun | 32.78 µs | 26.39 µs | 1.24x slower |
+| OrderSummaryJSON | 8.71 µs | 9.58 µs | 1.10x faster |
+| StringNormalizationRun | 4.74 µs | 4.38 µs | 1.08x slower |
+| RecordsResult100 | 109.49 µs | 91.70 µs | 1.19x slower |
+| HostFunctionBatch | 20.66 µs | 12.19 µs | 1.69x slower |
+| HostFunctionStructKwargs | 3.16 µs | 2.34 µs | 1.35x slower |
 
 Measured on darwin/arm64 with `go test -benchtime=1s` and 5 Python samples (min of samples reported).
 
