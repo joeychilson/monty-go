@@ -5,6 +5,7 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestReplStateCallAndDumpLoad(t *testing.T) {
@@ -84,5 +85,45 @@ func TestReplStdoutAndContinuationMode(t *testing.T) {
 	}
 	if got, err := DetectReplContinuationMode("if True:\n"); err != nil || got != ReplIncompleteBlock {
 		t.Fatalf("block mode = %s, err = %v", got, err)
+	}
+}
+
+func TestReplRejectsUnsupportedRunOptions(t *testing.T) {
+	ctx := context.Background()
+	repl, err := NewRepl()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repl.Close() //nolint:errcheck // best-effort cleanup in test
+
+	cases := []struct {
+		name string
+		opt  RunOption
+	}{
+		{"WithLimits", WithLimits(Limits{MaxDuration: time.Second})},
+		{"WithRunFunction", WithRunFunction(NewFunction("noop", func() int { return 0 }))},
+		{"WithOSHandler", WithOSHandler(func(context.Context, OSRequest) (Value, error) { return None(), nil })},
+		{"WithMount", WithMount("/data", t.TempDir(), MountReadOnly)},
+	}
+	for _, tc := range cases {
+		t.Run("FeedRun/"+tc.name, func(t *testing.T) {
+			if _, err := repl.FeedRun(ctx, "1 + 1", nil, tc.opt); err == nil {
+				t.Fatalf("FeedRun with %s = nil error, want rejection", tc.name)
+			}
+		})
+		t.Run("CallFunction/"+tc.name, func(t *testing.T) {
+			if _, err := repl.CallFunction(ctx, "f", nil, tc.opt); err == nil {
+				t.Fatalf("CallFunction with %s = nil error, want rejection", tc.name)
+			}
+		})
+	}
+
+	// WithStdout remains honored.
+	var out bytes.Buffer
+	if _, err := repl.FeedRun(ctx, `print("ok")`, nil, WithStdout(&out)); err != nil {
+		t.Fatalf("FeedRun with WithStdout: %v", err)
+	}
+	if out.String() != "ok\n" {
+		t.Fatalf("stdout = %q, want ok newline", out.String())
 	}
 }

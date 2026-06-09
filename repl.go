@@ -94,6 +94,11 @@ func (r *Repl) Dump() ([]byte, error) {
 }
 
 // FeedRun executes one REPL snippet to completion.
+//
+// Only WithStdout is honored. The Rust REPL entry points do not accept
+// per-call resource limits, host functions, OS handlers, or mounts; use
+// WithReplLimits to apply limits to the whole session. Passing any other
+// RunOption returns an error rather than silently ignoring it.
 func (r *Repl) FeedRun(ctx context.Context, code string, inputs any, opts ...RunOption) (Value, error) {
 	if err := ctxErr(ctx); err != nil {
 		return Value{}, err
@@ -101,6 +106,9 @@ func (r *Repl) FeedRun(ctx context.Context, code string, inputs any, opts ...Run
 	config := runConfig{}
 	for _, opt := range opts {
 		opt(&config)
+	}
+	if err := checkReplRunConfig(&config); err != nil {
+		return Value{}, err
 	}
 	names, handles, err := replInputHandles(inputs)
 	if err != nil {
@@ -127,6 +135,9 @@ func (r *Repl) Call(ctx context.Context, name string, args ...Value) (Value, err
 }
 
 // CallFunction calls a Python function defined in the REPL.
+//
+// Only WithStdout is honored; see FeedRun for the rationale. Passing any
+// other RunOption returns an error rather than silently ignoring it.
 func (r *Repl) CallFunction(ctx context.Context, name string, args []Value, opts ...RunOption) (Value, error) {
 	if err := ctxErr(ctx); err != nil {
 		return Value{}, err
@@ -134,6 +145,9 @@ func (r *Repl) CallFunction(ctx context.Context, name string, args []Value, opts
 	config := runConfig{}
 	for _, opt := range opts {
 		opt(&config)
+	}
+	if err := checkReplRunConfig(&config); err != nil {
+		return Value{}, err
 	}
 	handles, err := valuesToHandles(args)
 	if err != nil {
@@ -195,6 +209,20 @@ func (r *Repl) HasFunction(name string) bool {
 		return false
 	}
 	return ffi.ReplHasFunction(r.handle, name)
+}
+
+// checkReplRunConfig rejects RunOptions the REPL cannot honor. The Rust REPL
+// FFI entry points only flush print output; per-call limits, host functions, OS
+// handlers, and mounts have no corresponding parameter, so accepting them
+// silently would be a sandbox-relevant lie (e.g. a caller passing WithLimits
+// believing the snippet is resource-capped). TODO: honoring WithLimits requires
+// a Rust-side mg_repl_feed_run variant that accepts limits.
+func checkReplRunConfig(config *runConfig) error {
+	if config.limits != nil || config.osHandler != nil ||
+		len(config.functions) != 0 || len(config.mounts) != 0 || len(config.mountDirs) != 0 {
+		return fmt.Errorf("monty: REPL calls support only WithStdout; use WithReplLimits for session-wide limits")
+	}
+	return nil
 }
 
 func replInputHandles(inputs any) ([]string, []uintptr, error) {
