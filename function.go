@@ -39,15 +39,44 @@ func WithDoc(text string) FunctionOption {
 //
 // handler may optionally accept context.Context as its first argument. The
 // next argument, when present, is populated from positional and keyword Python
-// arguments. If handler returns two values, the second must implement error.
+// arguments. handler may return at most two values; when it returns two, the
+// second must implement error.
+//
+// NewFunction panics if handler is not a func or has an unsupported return
+// signature. A bad handler signature is a programming error that cannot be
+// recovered at runtime, so it is reported at registration time — where the
+// message names the offending function — rather than as an opaque reflect
+// panic on the first Python call.
 func NewFunction(name string, handler any, opts ...FunctionOption) *Function {
 	f := &Function{name: name, handler: reflect.ValueOf(handler)}
 	for _, opt := range opts {
 		opt(f)
 	}
+	f.validateHandler()
 	f.inspect()
 	f.fastRawCall = f.fastReflectRawCall()
 	return f
+}
+
+// validateHandler enforces the handler contract relied on by call and
+// fastReflectRawCall: a func returning at most two values, the second of which
+// (when present) implements error. Enforcing it here guarantees call's
+// callResults[1] is always an error interface — hence nilable — so
+// reflect.Value.IsNil can never panic on a non-nilable second return.
+func (f *Function) validateHandler() {
+	if !f.handler.IsValid() {
+		panic(fmt.Sprintf("monty: NewFunction %q: handler must be a func, got nil", f.name))
+	}
+	if f.handler.Kind() != reflect.Func {
+		panic(fmt.Sprintf("monty: NewFunction %q: handler must be a func, got %s", f.name, f.handler.Type()))
+	}
+	handlerType := f.handler.Type()
+	if handlerType.NumOut() > 2 {
+		panic(fmt.Sprintf("monty: NewFunction %q: handler must have at most 2 return values, got %d", f.name, handlerType.NumOut()))
+	}
+	if handlerType.NumOut() == 2 && !handlerType.Out(1).Implements(reflect.TypeFor[error]()) {
+		panic(fmt.Sprintf("monty: NewFunction %q: second return value must be error, got %s", f.name, handlerType.Out(1)))
+	}
 }
 
 // Name returns the Python-visible function name.
