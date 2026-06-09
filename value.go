@@ -1310,8 +1310,12 @@ func freeOwnedRawValue(value *ffi.RawValue) {
 	}
 	if value.Kind == ffi.KindOwnedHandle && value.Handle != 0 {
 		ffi.ValueFree(value.Handle)
-		*value = ffi.RawValue{}
 	}
+	// Zero unconditionally so a repeat call is a no-op, mirroring the Rust
+	// free_raw_value which resets to KIND_INVALID. The raw slices reaching here
+	// are built fresh per call by valueToRaw (the eager, shared mirror was
+	// removed), so clearing a container slot cannot corrupt a value's state.
+	*value = ffi.RawValue{}
 }
 
 func freeOwnedRawValues(values []ffi.RawValue) {
