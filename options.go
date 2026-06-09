@@ -86,7 +86,10 @@ func WithStdout(writer io.Writer) RunOption {
 	return func(c *runConfig) { c.stdout = writer }
 }
 
-// WithRunFunction registers a Go function for this run only.
+// WithRunFunction registers a Go function for this run only. A run function
+// with the same name as a compile-time function (registered via WithFunction)
+// overrides it for that run; this is intentional. Two WithRunFunction options
+// with the same name likewise last-write-win.
 func WithRunFunction(function *Function) RunOption {
 	return func(c *runConfig) {
 		if function == nil {

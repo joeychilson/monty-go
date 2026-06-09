@@ -42,6 +42,9 @@ func Compile(code string, opts ...CompileOption) (*Program, error) {
 	}
 	functions := make(map[string]*Function, len(config.functions))
 	for _, function := range config.functions {
+		if _, exists := functions[function.Name()]; exists {
+			return nil, fmt.Errorf("monty: duplicate function %q", function.Name())
+		}
 		functions[function.Name()] = function
 	}
 	if config.typeCheck {

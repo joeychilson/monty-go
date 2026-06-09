@@ -140,6 +140,28 @@ func TestCompileAndRunWithRunFunction(t *testing.T) {
 	}
 }
 
+// TestCompileRejectsDuplicateFunctions guards §3.11: two compile-time functions
+// with the same name must error rather than silently last-write-win.
+func TestCompileRejectsDuplicateFunctions(t *testing.T) {
+	a := NewFunction("f", func() int { return 1 })
+	b := NewFunction("f", func() int { return 2 })
+
+	_, err := Compile("f()", WithFunction(a), WithFunction(b))
+	if err == nil {
+		t.Fatal("expected duplicate function error, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate function") {
+		t.Fatalf("error = %v, want it to mention duplicate function", err)
+	}
+
+	// A single registration still compiles.
+	program, err := Compile("f()", WithFunction(a))
+	if err != nil {
+		t.Fatalf("single function compile: %v", err)
+	}
+	program.Close()
+}
+
 func BenchmarkRunArithmetic(b *testing.B) {
 	program, err := Compile("x * x + y * y", WithInputs("x", "y"))
 	if err != nil {
