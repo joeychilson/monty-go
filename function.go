@@ -266,7 +266,8 @@ func (f *Function) fastReflectRawCall() func(context.Context, ffi.RawValue, ffi.
 	if !f.handler.IsValid() || f.handler.Kind() != reflect.Func || f.inputType == nil {
 		return nil
 	}
-	if f.inputType.Kind() != reflect.Struct || !isSignedIntType(f.outputType) {
+	scalarInput := isSignedIntType(f.inputType)
+	if (f.inputType.Kind() != reflect.Struct && !scalarInput) || !isSignedIntType(f.outputType) {
 		return nil
 	}
 	handlerType := f.handlerType
@@ -289,7 +290,11 @@ func (f *Function) fastReflectRawCall() func(context.Context, ffi.RawValue, ffi.
 	nameToField := f.inputNameToField
 	return func(ctx context.Context, args ffi.RawValue, kwargs ffi.RawValue) (ffi.RawValue, error) {
 		input := reflect.New(inputType).Elem()
-		if err := bindRawStructInput(input, args, kwargs, fields, nameToField); err != nil {
+		if scalarInput {
+			if err := bindRawScalarIntInput(input, args, kwargs); err != nil {
+				return ffi.RawValue{}, err
+			}
+		} else if err := bindRawStructInput(input, args, kwargs, fields, nameToField); err != nil {
 			return ffi.RawValue{}, err
 		}
 		var results []reflect.Value
@@ -312,6 +317,28 @@ func (f *Function) fastReflectRawCall() func(context.Context, ffi.RawValue, ffi.
 		}
 		return ffi.RawValue{Kind: ffi.KindInt, Int: results[0].Int()}, nil
 	}
+}
+
+// bindRawScalarIntInput binds a non-struct integer input: exactly one
+// positional argument and no keywords, mirroring bindInput's non-struct rules
+// (zero arguments leave the zero value).
+func bindRawScalarIntInput(target reflect.Value, args ffi.RawValue, kwargs ffi.RawValue) error {
+	if Kind(args.Kind) != ListKind {
+		return fmt.Errorf("monty: expected positional args list, got %s", Kind(args.Kind))
+	}
+	if Kind(kwargs.Kind) != DictKind {
+		return fmt.Errorf("monty: expected keyword args dict, got %s", Kind(kwargs.Kind))
+	}
+	if kwargs.Len != 0 || args.Len > 1 {
+		return fmt.Errorf("monty: %s takes a single positional argument", target.Type())
+	}
+	if args.Len == 0 {
+		return nil
+	}
+	if args.Ptr == nil {
+		return fmt.Errorf("monty: raw args pointer is null")
+	}
+	return setRawIntField(target, *(*ffi.RawValue)(args.Ptr))
 }
 
 func bindRawStructInput(target reflect.Value, args ffi.RawValue, kwargs ffi.RawValue, fields []taggedField, nameToField map[string]taggedField) error {
