@@ -224,12 +224,22 @@ func decodeFastOutput(out *ffi.RunFastOutput) (Value, error) {
 	if out.Format != ffi.FastFormatFlat {
 		return decodeRawValue(out.Value)
 	}
+	data := ffi.UnsafeBytes(out.Bytes)
+	if len(data) > flatStringCopyThreshold {
+		// At this size decodeFlatValue copies every string out of the buffer,
+		// so the buffer (pooled scratch or Rust-owned heap) only has to live
+		// until the decode returns — no up-front copy of the whole payload.
+		value, err := decodeFlatValue(data)
+		freeFastOutputBytes(out)
+		return value, err
+	}
 	var owned []byte
-	if out.Bytes.Len != 0 {
-		// Decoded strings borrow from this buffer, so it must outlive the
-		// returned Value tree instead of pointing at pooled scratch memory.
-		owned = make([]byte, out.Bytes.Len)
-		copy(owned, ffi.UnsafeBytes(out.Bytes))
+	if len(data) != 0 {
+		// Small result: decoded strings borrow from this buffer, so it must
+		// outlive the returned Value tree instead of pointing at pooled
+		// scratch memory.
+		owned = make([]byte, len(data))
+		copy(owned, data)
 	}
 	freeFastOutputBytes(out)
 	return decodeFlatValue(owned)
