@@ -76,13 +76,13 @@ func TestReplStdoutAndContinuationMode(t *testing.T) {
 	if out.String() != "hello\n" {
 		t.Fatalf("stdout = %q, want hello newline", out.String())
 	}
-	if got := DetectReplContinuationMode("1 + 1"); got != ReplComplete {
-		t.Fatalf("complete mode = %s", got)
+	if got, err := DetectReplContinuationMode("1 + 1"); err != nil || got != ReplComplete {
+		t.Fatalf("complete mode = %s, err = %v", got, err)
 	}
-	if got := DetectReplContinuationMode("(1 +"); got != ReplIncompleteImplicit {
-		t.Fatalf("implicit mode = %s", got)
+	if got, err := DetectReplContinuationMode("(1 +"); err != nil || got != ReplIncompleteImplicit {
+		t.Fatalf("implicit mode = %s, err = %v", got, err)
 	}
-	if got := DetectReplContinuationMode("if True:\n"); got != ReplIncompleteBlock {
-		t.Fatalf("block mode = %s", got)
+	if got, err := DetectReplContinuationMode("if True:\n"); err != nil || got != ReplIncompleteBlock {
+		t.Fatalf("block mode = %s, err = %v", got, err)
 	}
 }

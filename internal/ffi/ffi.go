@@ -989,12 +989,12 @@ func ReplHasFunction(repl uintptr, name string) bool {
 }
 
 // ReplContinuationMode returns the parser continuation mode for interactive code.
-func ReplContinuationMode(code string) uint32 {
+func ReplContinuationMode(code string) (uint32, error) {
 	if err := EnsureLoaded(); err != nil {
-		panic(err)
+		return 0, err
 	}
 	codePtr, codeLen := stringArgs(code)
-	return mgReplContinuationMode(codePtr, codeLen)
+	return mgReplContinuationMode(codePtr, codeLen), nil
 }
 
 // ProgramCompile compiles code into a Rust-side program handle.

@@ -242,8 +242,13 @@ func (mode ReplContinuationMode) String() string {
 }
 
 // DetectReplContinuationMode reports whether interactive source is ready to run.
-func DetectReplContinuationMode(code string) ReplContinuationMode {
-	return ReplContinuationMode(ffi.ReplContinuationMode(code))
+// It returns an error if the shared library cannot be loaded.
+func DetectReplContinuationMode(code string) (ReplContinuationMode, error) {
+	mode, err := ffi.ReplContinuationMode(code)
+	if err != nil {
+		return ReplComplete, normalizeError(err)
+	}
+	return ReplContinuationMode(mode), nil
 }
 
 var _ io.Closer = (*Repl)(nil)
