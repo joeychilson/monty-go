@@ -1657,12 +1657,20 @@ func takeInternedRawString(raw *ffi.RawValue, cache map[string]string) string {
 }
 
 type flatValueReader struct {
-	data   []byte
-	offset int
+	data        []byte
+	offset      int
+	copyStrings bool
 }
 
+// flatStringCopyThreshold bounds how large the flat result buffer may grow
+// before decoded strings are copied instead of borrowed. Borrowing makes every
+// string alias the single result buffer, so retaining one small string from a
+// large result would pin the whole buffer; above this size the copy cost is
+// worth releasing the buffer.
+const flatStringCopyThreshold = 4 << 10
+
 func decodeFlatValue(data []byte) (Value, error) {
-	reader := flatValueReader{data: data}
+	reader := flatValueReader{data: data, copyStrings: len(data) > flatStringCopyThreshold}
 	value, err := reader.readValue()
 	if err != nil {
 		return Value{}, err
@@ -1820,11 +1828,15 @@ func (r *flatValueReader) readString() (string, error) {
 	if len(bytes) == 0 {
 		return "", nil
 	}
-	// The flat byte stream lives in a caller-owned buffer that outlives the
-	// returned Value tree, so every string borrows its backing directly via
-	// unsafe.String — no per-string allocation required. Repeated keys keep
-	// separate headers but share underlying bytes, which is enough for the
-	// public Value contract.
+	if r.copyStrings {
+		// Large result buffer: copy so no returned string pins the whole buffer.
+		return string(bytes), nil
+	}
+	// Small result buffer: the flat byte stream lives in a caller-owned buffer
+	// that outlives the returned Value tree, so every string borrows its backing
+	// directly via unsafe.String — no per-string allocation required. Repeated
+	// keys keep separate headers but share underlying bytes, which is enough for
+	// the public Value contract.
 	return unsafe.String(unsafe.SliceData(bytes), len(bytes)), nil
 }
 

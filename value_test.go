@@ -2,6 +2,7 @@ package monty
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -269,6 +270,35 @@ func TestNestedEmptyRawInputs(t *testing.T) {
 	}
 	if got := len(items[1].Pairs()); items[1].Kind() != DictKind || got != 0 {
 		t.Fatalf("nested dict = kind %s len %d, want empty dict", items[1].Kind(), got)
+	}
+}
+
+// TestFlatDecodeLargeResultStrings exercises the flat-decode copy path (§4.3):
+// a result larger than flatStringCopyThreshold must decode strings correctly
+// whether they are copied (large buffer) or borrowed (small buffer).
+func TestFlatDecodeLargeResultStrings(t *testing.T) {
+	// Builds a list of ~200 distinct 64-char strings, well over 4 KiB encoded.
+	code := `[f"item-{i:060d}" for i in range(200)]`
+	value, err := CompileAndRun(context.Background(), code, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := value.Items()
+	if len(items) != 200 {
+		t.Fatalf("len = %d, want 200", len(items))
+	}
+	want := fmt.Sprintf("item-%060d", 7)
+	if got := items[7].Str(); got != want {
+		t.Fatalf("items[7] = %q, want %q", got, want)
+	}
+
+	// A small result still decodes correctly via the borrow path.
+	small, err := CompileAndRun(context.Background(), `"hello"`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := small.Str(); got != "hello" {
+		t.Fatalf("small result = %q, want hello", got)
 	}
 }
 
