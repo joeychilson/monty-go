@@ -116,7 +116,7 @@ type FunctionCall struct {
 
 // Resume returns value to Python and continues execution.
 func (call *FunctionCall) Resume(ctx context.Context, value Value) (Progress, error) {
-	return resumeWithValue(ctx, &call.progressBase, value, ffi.ProgressResumeReturnRaw)
+	return resumeReturnSnapshot(ctx, &call.progressBase, value)
 }
 
 // ResumeException raises an exception at the paused Python call and continues execution.
@@ -177,7 +177,7 @@ type OSCall struct {
 
 // Resume returns value to Python and continues execution.
 func (call *OSCall) Resume(ctx context.Context, value Value) (Progress, error) {
-	return resumeWithValue(ctx, &call.progressBase, value, ffi.ProgressResumeReturnRaw)
+	return resumeReturnSnapshot(ctx, &call.progressBase, value)
 }
 
 // ResumeException raises an exception at the paused OS call and continues execution.
@@ -293,6 +293,42 @@ func resumeWithValue(
 	return decodeResumeResult(base.stdout, nextHandle, printed, err)
 }
 
+// resumeReturnSnapshot is the single-hop counterpart of resumeWithValue for the
+// return-value path: it resumes and fetches the next snapshot in one FFI call,
+// avoiding the separate snapshot hop progressFromHandle would make.
+func resumeReturnSnapshot(ctx context.Context, base *progressBase, value Value) (Progress, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	handle, err := base.take()
+	if err != nil {
+		return nil, err
+	}
+	arena := &rawArena{}
+	raw, err := valueToRaw(value, arena)
+	if err != nil {
+		ffi.ProgressFree(handle)
+		return nil, err
+	}
+	defer freeOwnedRawValue(&raw)
+	nextHandle, snapshot, printed, err := ffi.ProgressResumeReturnRawSnapshot(handle, &raw)
+	runtime.KeepAlive(arena)
+	runtime.KeepAlive(value)
+	if err != nil {
+		writeErr := writePrinted(base.stdout, printed)
+		return nil, errors.Join(normalizeError(err), writeErr)
+	}
+	progress, err := progressFromSnapshot(nextHandle, snapshot, base.stdout)
+	if err != nil {
+		return nil, err
+	}
+	if writeErr := writePrinted(base.stdout, printed); writeErr != nil {
+		_ = progress.Close()
+		return nil, writeErr
+	}
+	return progress, nil
+}
+
 func freeFutureResultValues(results []ffi.FutureResult) {
 	for i := range results {
 		freeOwnedRawValue(&results[i].Value)
@@ -337,6 +373,9 @@ func LoadProgressWithStdout(snapshot []byte, stdout io.Writer) (Progress, error)
 	return progressFromHandle(handle, stdout)
 }
 
+// progressFromHandle fetches a snapshot for handle (a second FFI hop) and builds
+// the corresponding Progress. The single-hop start/resume variants call
+// progressFromSnapshot directly with the snapshot they already obtained.
 func progressFromHandle(handle uintptr, stdout io.Writer) (Progress, error) {
 	if handle == 0 {
 		return nil, fmt.Errorf("monty: null progress handle")
@@ -346,9 +385,19 @@ func progressFromHandle(handle uintptr, stdout io.Writer) (Progress, error) {
 		ffi.ProgressFree(handle)
 		return nil, normalizeError(err)
 	}
+	return progressFromSnapshot(handle, snapshot, stdout)
+}
+
+// progressFromSnapshot builds a Progress from an already-obtained snapshot and
+// its handle. handle is 0 for a Complete snapshot from the single-hop variants
+// (Rust already released it); for the two-hop path it is the live handle, which
+// is freed here for Complete. On any error it frees handle.
+func progressFromSnapshot(handle uintptr, snapshot ffi.ProgressSnapshot, stdout io.Writer) (Progress, error) {
 	switch snapshot.Kind {
 	case ffi.ProgressComplete:
-		ffi.ProgressFree(handle)
+		if handle != 0 {
+			ffi.ProgressFree(handle)
+		}
 		value, err := decodeRawValue(snapshot.Value)
 		if err != nil {
 			return nil, err

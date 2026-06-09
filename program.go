@@ -312,20 +312,27 @@ func (p *Program) start(ctx context.Context, inputs any, config runConfig) (Prog
 		return nil, err
 	}
 	var progressHandle uintptr
+	var snapshot ffi.ProgressSnapshot
 	printed, err := p.callLocked(rawInputs, keepAlive, func(handle uintptr) (string, error) {
 		var printed string
-		progressHandle, printed, err = ffi.ProgramStartRaw(handle, rawInputs, config.ffiLimits())
+		progressHandle, snapshot, printed, err = ffi.ProgramStartRawSnapshot(handle, rawInputs, config.ffiLimits())
 		return printed, err
 	})
-	writeErr := writePrinted(config.stdout, printed)
+	// On a call error Rust did not write the snapshot or a handle, so there is
+	// nothing to release here.
 	if err != nil {
+		writeErr := writePrinted(config.stdout, printed)
 		return nil, errors.Join(normalizeError(err), writeErr)
 	}
-	if writeErr != nil {
-		ffi.ProgressFree(progressHandle)
+	progress, err := progressFromSnapshot(progressHandle, snapshot, config.stdout)
+	if err != nil {
+		return nil, err
+	}
+	if writeErr := writePrinted(config.stdout, printed); writeErr != nil {
+		_ = progress.Close()
 		return nil, writeErr
 	}
-	return progressFromHandle(progressHandle, config.stdout)
+	return progress, nil
 }
 
 func (p *Program) runDirectValue(inputs any, config runConfig) (Value, error) {
