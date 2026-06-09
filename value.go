@@ -582,8 +582,18 @@ func (v Value) String() string {
 		return extra.typeName + ": " + v.text
 	case BytesKind:
 		return fmt.Sprintf("%q", v.bytes)
-	case ListKind, SetKind, FrozenSetKind:
+	case ListKind:
 		return "[" + strings.Join(valuesToStrings(v.items), ", ") + "]"
+	case SetKind:
+		if len(v.items) == 0 {
+			return "set()"
+		}
+		return "{" + strings.Join(valuesToStrings(v.items), ", ") + "}"
+	case FrozenSetKind:
+		if len(v.items) == 0 {
+			return "frozenset()"
+		}
+		return "frozenset({" + strings.Join(valuesToStrings(v.items), ", ") + "})"
 	case TupleKind:
 		return "(" + strings.Join(valuesToStrings(v.items), ", ") + ")"
 	case NamedTupleKind:

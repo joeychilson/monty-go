@@ -103,6 +103,26 @@ from datetime import date, datetime, timedelta, timezone
 	}
 }
 
+// TestSetStringRepr guards §3.8: sets and frozensets must print with their own
+// Python-like repr rather than list brackets.
+func TestSetStringRepr(t *testing.T) {
+	if got := Set(Int(1)).String(); got != "{1}" {
+		t.Errorf("Set String() = %q, want {1}", got)
+	}
+	if got := Set().String(); got != "set()" {
+		t.Errorf("empty Set String() = %q, want set()", got)
+	}
+	if got := FrozenSet(Int(1)).String(); got != "frozenset({1})" {
+		t.Errorf("FrozenSet String() = %q, want frozenset({1})", got)
+	}
+	if got := FrozenSet().String(); got != "frozenset()" {
+		t.Errorf("empty FrozenSet String() = %q, want frozenset()", got)
+	}
+	if got := List(Int(1)).String(); got != "[1]" {
+		t.Errorf("List String() = %q, want [1]", got)
+	}
+}
+
 // TestDateTimeStringNaiveVsAware guards §3.7: a naive Python datetime must not
 // print a "Z" suffix it never asserted, while an aware datetime keeps its
 // offset.
