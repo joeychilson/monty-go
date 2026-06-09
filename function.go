@@ -21,6 +21,7 @@ type Function struct {
 	fastRawCall      func(context.Context, ffi.RawValue, ffi.RawValue) (ffi.RawValue, error)
 	inputType        reflect.Type
 	outputType       reflect.Type
+	returnsErrorOnly bool
 	takesContext     bool
 	inputFields      []taggedField
 	inputNameToField map[string]taggedField
@@ -101,6 +102,9 @@ func (f *Function) PythonStub() string {
 			fmt.Fprintf(&b, "    %s: %s\n", field.name, pythonType(field.fieldType))
 		}
 		b.WriteByte('\n')
+	} else if f.returnsErrorOnly {
+		b.WriteString("from typing import Any\n\n")
+		outputName = "None"
 	} else {
 		b.WriteString("from typing import Any\n\n")
 		outputName = pythonType(f.outputType)
@@ -130,7 +134,13 @@ func (f *Function) inspect() {
 	if inputIndex < functionType.NumIn() {
 		f.inputType = functionType.In(inputIndex)
 	}
-	if functionType.NumOut() > 0 {
+	// A handler whose sole return value is an error reports failure, not data:
+	// a non-nil error must be raised as a Python exception and a nil error must
+	// surface as None. Leaving outputType nil keeps it out of the value path
+	// (call returns None on success) and makes PythonStub emit `-> None`.
+	if functionType.NumOut() == 1 && functionType.Out(0).Implements(reflect.TypeFor[error]()) {
+		f.returnsErrorOnly = true
+	} else if functionType.NumOut() > 0 {
 		f.outputType = functionType.Out(0)
 	}
 	if f.inputType != nil {
@@ -164,6 +174,12 @@ func (f *Function) call(ctx context.Context, args []Value, kwargs []Pair) (Value
 	callResults := f.handler.Call(callArgs)
 	if len(callResults) == 0 {
 		return None(), nil
+	}
+	if f.returnsErrorOnly {
+		if callResults[0].IsNil() {
+			return None(), nil
+		}
+		return Value{}, callResults[0].Interface().(error) //nolint:errcheck // validateHandler guarantees Out(0) implements error
 	}
 	if len(callResults) > 1 && !callResults[1].IsNil() {
 		err, ok := callResults[1].Interface().(error)

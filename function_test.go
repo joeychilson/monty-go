@@ -139,3 +139,45 @@ func TestFunctionValueAndErrorDispatch(t *testing.T) {
 		t.Fatalf("error = %v, want it to mention requested failure", err)
 	}
 }
+
+// TestFunctionErrorOnlyReturn covers a handler whose sole return value is an
+// error: a non-nil error must raise a Python exception and a nil error must
+// surface as None, rather than marshaling the *errors.errorString as an empty
+// dict value (the previous behavior, where save(...) == {} regardless of
+// success or failure).
+func TestFunctionErrorOnlyReturn(t *testing.T) {
+	fn := NewFunction("save", func(in struct {
+		Fail bool `monty:"fail"`
+	}) error {
+		if in.Fail {
+			return errors.New("disk full")
+		}
+		return nil
+	})
+
+	if stub := fn.PythonStub(); !strings.Contains(stub, "-> None") {
+		t.Fatalf("stub = %q, want it to return None", stub)
+	}
+
+	program, err := Compile("result = save(fail=fail)\nresult is None", WithInputs("fail"), WithFunction(fn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer program.Close()
+
+	// nil error: Python receives None (so `result is None` is True).
+	got, err := RunAs[bool](context.Background(), program, Inputs{"fail": Bool(false)})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !got {
+		t.Fatal("save() returned a non-None value for a nil error")
+	}
+
+	// non-nil error: raised as a Python exception.
+	if _, err := RunAs[bool](context.Background(), program, Inputs{"fail": Bool(true)}); err == nil {
+		t.Fatal("expected error from handler to surface, got nil")
+	} else if !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("error = %v, want it to mention disk full", err)
+	}
+}
