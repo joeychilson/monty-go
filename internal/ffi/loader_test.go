@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -35,6 +36,21 @@ func TestRegisterSymbolsMissingSymbolReturnsError(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("error %q missing %q", got, want)
 		}
+	}
+}
+
+// TestFindLibraryValidatesMontyGoLib guards §3.12: MONTY_GO_LIB must be an
+// absolute path to an existing file, and a bad value yields a descriptive error
+// rather than being handed straight to Dlopen.
+func TestFindLibraryValidatesMontyGoLib(t *testing.T) {
+	t.Setenv("MONTY_GO_LIB", "relative/path/libmonty_ffi.so")
+	if _, err := findLibrary(); err == nil || !strings.Contains(err.Error(), "absolute path") {
+		t.Fatalf("relative MONTY_GO_LIB error = %v, want one mentioning absolute path", err)
+	}
+
+	t.Setenv("MONTY_GO_LIB", "/nonexistent/libmonty_ffi.so")
+	if _, err := findLibrary(); err == nil || !strings.Contains(err.Error(), "not accessible") {
+		t.Fatalf("missing MONTY_GO_LIB error = %v, want one mentioning not accessible", err)
 	}
 }
 
@@ -84,29 +100,41 @@ func TestEnsureLoadedStaleLibrarySticky(t *testing.T) {
 	}
 }
 
-// loadableNonMontyLibrary returns the path of a shared library that loads on
-// this platform but exports none of the mg_* symbols, skipping the test if none
-// is available.
+// loadableNonMontyLibrary returns the absolute path of a shared library that
+// exists on disk, loads on this platform, but exports none of the mg_* symbols,
+// skipping the test if none is available. The path must exist on disk because
+// findLibrary now rejects a MONTY_GO_LIB that fails os.Stat (§3.12); macOS
+// system libraries live in the dyld shared cache and are not on disk, so this
+// globs on-disk locations (Homebrew, the multiarch libc dirs) instead.
 func loadableNonMontyLibrary(t *testing.T) string {
 	t.Helper()
-	var candidates []string
+	var patterns []string
 	switch runtime.GOOS {
 	case "darwin":
-		candidates = []string{"/usr/lib/libSystem.B.dylib"}
+		patterns = []string{"/opt/homebrew/lib/*.dylib", "/usr/local/lib/*.dylib"}
 	case "linux":
-		candidates = []string{"libc.so.6", "libm.so.6", "libdl.so.2"}
+		patterns = []string{"/lib/*/libc.so.6", "/usr/lib/*/libc.so.6", "/lib/libc.so.6", "/usr/lib/libc.so.6", "/lib64/libc.so.6"}
 	default:
 		t.Skipf("no known non-monty library to load on %s", runtime.GOOS)
 	}
-	for _, candidate := range candidates {
-		handle, err := purego.Dlopen(candidate, purego.RTLD_NOW|purego.RTLD_LOCAL)
-		if err != nil {
-			continue
+	for _, pattern := range patterns {
+		matches, _ := filepath.Glob(pattern)
+		for _, candidate := range matches {
+			if !filepath.IsAbs(candidate) {
+				continue
+			}
+			if _, err := os.Stat(candidate); err != nil {
+				continue
+			}
+			handle, err := purego.Dlopen(candidate, purego.RTLD_NOW|purego.RTLD_LOCAL)
+			if err != nil {
+				continue
+			}
+			_ = purego.Dlclose(handle)
+			return candidate
 		}
-		_ = purego.Dlclose(handle)
-		return candidate
 	}
-	t.Skipf("none of %v could be loaded for the stale-library test", candidates)
+	t.Skipf("no on-disk non-monty library found for the stale-library test (patterns: %v)", patterns)
 	return ""
 }
 

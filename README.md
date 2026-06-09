@@ -27,9 +27,10 @@ go vet ./...
 
 The Go loader searches, in order:
 
-- `$MONTY_GO_LIB` (absolute path to the library)
-- `target/release/libmonty_ffi.{dylib,so}`
+- `$MONTY_GO_LIB` (must be an absolute path to an existing file; otherwise the loader returns an error)
 - `crates/monty-ffi/target/release/libmonty_ffi.{dylib,so}`
+- `target/release/libmonty_ffi.{dylib,so}`
+- the repository root: `libmonty_ffi.{dylib,so}`
 - embedded `internal/ffi/lib/$GOOS_$GOARCH/libmonty_ffi.{dylib,so}.gz`
 
 Use `-tags monty_noembed` to build without the embedded fallback.

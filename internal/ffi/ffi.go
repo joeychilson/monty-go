@@ -527,6 +527,12 @@ func EnsureLoaded() error {
 
 func findLibrary() (string, error) {
 	if path := os.Getenv("MONTY_GO_LIB"); path != "" {
+		if !filepath.IsAbs(path) {
+			return "", fmt.Errorf("monty: MONTY_GO_LIB must be an absolute path, got %q", path)
+		}
+		if _, err := os.Stat(path); err != nil {
+			return "", fmt.Errorf("monty: MONTY_GO_LIB %q is not accessible: %w", path, err)
+		}
 		return path, nil
 	}
 	name := libraryFileName()
