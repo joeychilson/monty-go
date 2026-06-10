@@ -242,3 +242,125 @@ date(2026, 6, 9)
 		}
 	}
 }
+
+// REPL history is part of the session's module, not an external stub: an
+// unannotated name rebound to an incompatible type across snippets is the
+// ordinary REPL behavior and must not be rejected. Routing history through the
+// stubs channel froze each binding's declared type and reported a spurious
+// invalid-assignment (e.g. list is not assignable to Literal["hi"]).
+func TestREPLUnannotatedRebindAcrossSnippets(t *testing.T) {
+	ctx := context.Background()
+	repl, err := NewREPL(WithTypeCheck())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repl.Close()
+
+	if _, err := repl.Eval(ctx, `x = "hi"`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repl.Eval(ctx, `x = [1, 2, 3]`, nil); err != nil {
+		t.Fatalf("rebinding an unannotated name to a new type = %v, want clean", err)
+	}
+	// The most ordinary case of all: incrementing a counter on a later line.
+	if _, err := repl.Eval(ctx, `n = 0`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repl.Eval(ctx, `n = n + 1`, nil); err != nil {
+		t.Fatalf("counter increment across snippets = %v, want clean", err)
+	}
+}
+
+// Moving history into the module must not weaken real type enforcement: an
+// annotated binding keeps its declared type, so an incompatible reassignment in
+// a later snippet still fails, and explicit WithStubs declarations stay
+// authoritative.
+func TestREPLDeclaredTypesStillEnforced(t *testing.T) {
+	ctx := context.Background()
+	repl, err := NewREPL(WithTypeCheck())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repl.Close()
+
+	if _, err := repl.Eval(ctx, `count: int = 1`, nil); err != nil {
+		t.Fatal(err)
+	}
+	var typeErr *TypeCheckError
+	if _, err := repl.Eval(ctx, `count = "nope"`, nil); !errors.As(err, &typeErr) {
+		t.Fatalf("reassigning an int-declared name to str = %v, want TypeCheckError", err)
+	}
+
+	stubbed, err := NewREPL(WithStubs("config: dict[str, int]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stubbed.Close()
+	if err := stubbed.TypeCheck(`config = "nope"`); !errors.As(err, &typeErr) {
+		t.Fatalf("reassigning a stub-declared name = %v, want TypeCheckError", err)
+	}
+}
+
+// Diagnostics for a snippet checked behind accumulated history must report the
+// lines the user actually typed, not their position in the prepended module.
+func TestREPLDiagnosticsAreSnippetRelative(t *testing.T) {
+	ctx := context.Background()
+	repl, err := NewREPL(WithTypeCheck(), WithScriptName("session.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repl.Close()
+
+	// Accumulate a few lines of history so the snippet is no longer at line 1.
+	if _, err := repl.Eval(ctx, "a = 1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repl.Eval(ctx, "b = 2", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The error sits on the snippet's own line 2 (c is an int).
+	err = repl.TypeCheck("c = 3\nc + \"x\"")
+	var typeErr *TypeCheckError
+	if !errors.As(err, &typeErr) {
+		t.Fatalf("err = %v, want TypeCheckError", err)
+	}
+	if len(typeErr.Diagnostics) == 0 {
+		t.Fatal("no diagnostics")
+	}
+	if got := typeErr.Diagnostics[0].Line; got != 2 {
+		t.Fatalf("diagnostic line = %d, want 2 (snippet-relative)", got)
+	}
+	if got := typeErr.Render(DiagnosticConcise, false); !strings.Contains(got, "session.py:2:") {
+		t.Fatalf("concise render = %q, want a session.py:2: location", got)
+	}
+}
+
+// The history offset must compose with the stub-import line that Monty injects
+// internally for genuine stubs: a snippet checked behind both a stub and
+// accumulated history still reports snippet-relative lines.
+func TestREPLDiagnosticsComposeWithStubs(t *testing.T) {
+	ctx := context.Background()
+	repl, err := NewREPL(WithTypeCheck(), WithStubs("limit: int"), WithScriptName("session.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repl.Close()
+
+	if _, err := repl.Eval(ctx, "a = 1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repl.Eval(ctx, "d = 2", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Line 1 reads the genuine stub; line 2 is the error (int + str).
+	err = repl.TypeCheck("c = limit\nc + \"x\"")
+	var typeErr *TypeCheckError
+	if !errors.As(err, &typeErr) || len(typeErr.Diagnostics) == 0 {
+		t.Fatalf("err = %v, want TypeCheckError", err)
+	}
+	if got := typeErr.Diagnostics[0].Line; got != 2 {
+		t.Fatalf("diagnostic line = %d, want 2 (snippet-relative)", got)
+	}
+}

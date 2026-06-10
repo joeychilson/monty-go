@@ -234,44 +234,59 @@ func (r *REPL) snippetRunConfig(opts []RunOption) runConfig {
 	return config
 }
 
-// typeCheckContext builds the stub context for one snippet: explicit stubs,
-// function and dataclass stubs, then previously executed snippets.
-func (r *REPL) typeCheckContext(functions map[string]*Function) string {
-	parts := make([]string, 0, 2)
-	if base := joinStubs(r.config.stubs, functions, r.config.dataclasses); strings.TrimSpace(base) != "" {
-		parts = append(parts, base)
+// typeCheckCode statically checks code in the session's module context.
+//
+// Genuine external declarations — explicit WithStubs text plus function and
+// dataclass signatures — go through the stubs channel, which gives them
+// declaration semantics (their declared types are fixed, as a .pyi stub
+// intends). Previously executed snippets are instead prepended into the
+// snippet's own module so that unannotated rebinding and narrowing stay legal,
+// exactly as they are in a single continuous module. Routing history through
+// the stubs channel would freeze each history binding's declared type and
+// reject ordinary REPL reassignment (e.g. "x = 1" then "x = x + 1").
+//
+// Prepending shifts the snippet off line 1, so the resulting diagnostics are
+// remapped back to snippet-relative coordinates by newTypeCheckErrorOffset.
+func (r *REPL) typeCheckCode(code string, functions map[string]*Function, extraStubs string) error {
+	stubs := joinStubs(r.config.stubs, functions, r.config.dataclasses)
+	if strings.TrimSpace(extraStubs) != "" {
+		if strings.TrimSpace(stubs) != "" {
+			stubs += "\n\n" + extraStubs
+		} else {
+			stubs = extraStubs
+		}
 	}
+
 	r.mu.Lock()
-	if len(r.typeSnippets) != 0 {
-		parts = append(parts, strings.Join(r.typeSnippets, "\n\n"))
-	}
+	history := strings.Join(r.typeSnippets, "\n\n")
 	r.mu.Unlock()
-	return strings.Join(parts, "\n\n")
+
+	module, offset := code, 0
+	if history != "" {
+		module = history + "\n" + code
+		offset = strings.Count(history, "\n") + 1
+	}
+
+	diags, err := ffi.TypeCheck(module, r.config.scriptName, stubs, "type_stubs.pyi")
+	if err != nil {
+		return execError(err)
+	}
+	if diags != 0 {
+		if tcErr := newTypeCheckErrorOffset(diags, offset); tcErr != nil {
+			return tcErr
+		}
+	}
+	return nil
 }
 
 // TypeCheck statically checks a snippet against the session's stubs and
-// accumulated context without executing it. It returns nil or a
+// accumulated history without executing it. It returns nil or a
 // *TypeCheckError.
 func (r *REPL) TypeCheck(code string, extraStubs ...string) error {
 	if r == nil {
 		return ErrClosed
 	}
-	stubs := r.typeCheckContext(r.functions)
-	if extra := strings.Join(extraStubs, "\n\n"); strings.TrimSpace(extra) != "" {
-		if stubs != "" {
-			stubs += "\n\n" + extra
-		} else {
-			stubs = extra
-		}
-	}
-	diags, err := ffi.TypeCheck(code, r.config.scriptName, stubs, "type_stubs.pyi")
-	if err != nil {
-		return execError(err)
-	}
-	if diags != 0 {
-		return newTypeCheckError(diags)
-	}
-	return nil
+	return r.typeCheckCode(code, r.functions, strings.Join(extraStubs, "\n\n"))
 }
 
 // Eval executes one snippet against the persistent session state and returns
@@ -391,15 +406,7 @@ func (r *REPL) Eval(ctx context.Context, code string, inputs any, opts ...RunOpt
 }
 
 func (r *REPL) typeCheckSnippet(code string, functions map[string]*Function) error {
-	stubs := r.typeCheckContext(functions)
-	diags, err := ffi.TypeCheck(code, r.config.scriptName, stubs, "type_stubs.pyi")
-	if err != nil {
-		return execError(err)
-	}
-	if diags != 0 {
-		return newTypeCheckError(diags)
-	}
-	return nil
+	return r.typeCheckCode(code, functions, "")
 }
 
 // Start begins executing one snippet as a suspendable Run. The session moves

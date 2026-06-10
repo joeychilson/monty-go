@@ -32,11 +32,13 @@ func run() error {
 	}
 	defer repl.Close()
 
+	// json.loads returns Any, so int(...) pins retries to a concrete int that
+	// later snippets are type-checked against — exactly as in one module.
 	_, err = repl.Eval(ctx, `
 import json
 from pathlib import Path
 config = json.loads(Path("/data/config.json").read_text())
-retries: int = config["retries"]
+retries: int = int(config["retries"])
 `, nil, monty.WithFS("/data", dataFS))
 	if err != nil {
 		return err

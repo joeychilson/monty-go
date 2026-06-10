@@ -225,17 +225,36 @@ func (e *TypeCheckError) Error() string {
 }
 
 // Render formats the diagnostics in any supported format, optionally with
-// ANSI colors.
+// ANSI colors. Errors carrying a live Rust handle render through the upstream
+// formatter; remapped REPL errors (whose handle was released so coordinates
+// could be shifted to snippet-relative space) render locally.
 func (e *TypeCheckError) Render(format DiagnosticFormat, color bool) string {
-	if e == nil || e.handle == nil {
-		return e.Error()
+	if e == nil {
+		return ""
 	}
-	rendered, err := ffi.DiagnosticsRender(e.handle.handle, string(format), color)
-	runtime.KeepAlive(e.handle)
-	if err != nil {
-		return e.Error()
+	if e.handle != nil {
+		rendered, err := ffi.DiagnosticsRender(e.handle.handle, string(format), color)
+		runtime.KeepAlive(e.handle)
+		if err == nil {
+			return rendered
+		}
 	}
-	return rendered
+	return e.renderLocal(format)
+}
+
+// renderLocal formats remapped diagnostics without the upstream handle. JSON
+// formats are reconstructed from the structured diagnostics; everything else
+// falls back to the concise listing (the format the REPL surfaces).
+func (e *TypeCheckError) renderLocal(format DiagnosticFormat) string {
+	switch format {
+	case DiagnosticJSON, DiagnosticJSONLines:
+		return renderDiagnosticsJSON(e.Diagnostics, format == DiagnosticJSONLines)
+	default:
+		if e.summary != "" {
+			return strings.TrimRight(e.summary, "\n")
+		}
+		return renderConcise(e.Diagnostics)
+	}
 }
 
 // newTypeCheckError builds the public error from a Rust diagnostics handle,
@@ -307,6 +326,110 @@ func parseDiagnosticsJSON(data string) []Diagnostic {
 		diagnostics = append(diagnostics, diagnostic)
 	}
 	return diagnostics
+}
+
+// newTypeCheckErrorOffset builds the public error from a Rust diagnostics
+// handle whose code was checked with offset leading lines of prepended context
+// (REPL history). Coordinates are shifted back to snippet-relative space and
+// diagnostics that fall inside the prepended region are dropped. It returns nil
+// when no diagnostics survive the shift — meaning the snippet itself is clean.
+//
+// The coordinates baked into the upstream rendering cannot be shifted after the
+// fact, so an offset error renders from its remapped structured diagnostics and
+// the handle is released here rather than retained.
+func newTypeCheckErrorOffset(handle uintptr, offset int) *TypeCheckError {
+	if offset <= 0 {
+		return newTypeCheckError(handle)
+	}
+	result := &TypeCheckError{}
+	if rendered, err := ffi.DiagnosticsRender(handle, string(DiagnosticJSON), false); err == nil {
+		result.Diagnostics = shiftDiagnostics(parseDiagnosticsJSON(rendered), offset)
+	}
+	ffi.DiagnosticsFree(handle)
+	if len(result.Diagnostics) == 0 {
+		return nil
+	}
+	result.summary = renderConcise(result.Diagnostics)
+	return result
+}
+
+// shiftDiagnostics maps diagnostics from a module with offset leading context
+// lines back to snippet-relative coordinates, discarding any that start inside
+// the prepended region.
+func shiftDiagnostics(diagnostics []Diagnostic, offset int) []Diagnostic {
+	if offset <= 0 {
+		return diagnostics
+	}
+	shifted := make([]Diagnostic, 0, len(diagnostics))
+	for _, d := range diagnostics {
+		if d.Line <= offset {
+			continue
+		}
+		d.Line -= offset
+		if d.EndLine > offset {
+			d.EndLine -= offset
+		} else {
+			d.EndLine = 0
+		}
+		shifted = append(shifted, d)
+	}
+	return shifted
+}
+
+// renderConcise formats diagnostics as one "file:line:col: severity[code]
+// message" line each, matching the upstream concise format.
+func renderConcise(diagnostics []Diagnostic) string {
+	lines := make([]string, len(diagnostics))
+	for i, d := range diagnostics {
+		lines[i] = fmt.Sprintf("%s:%d:%d: %s[%s] %s", d.File, d.Line, d.Column, d.Severity, d.Code, d.Message)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderDiagnosticsJSON reconstructs the upstream JSON (or JSON Lines)
+// rendering from structured diagnostics so remapped errors round-trip through
+// parseDiagnosticsJSON.
+func renderDiagnosticsJSON(diagnostics []Diagnostic, jsonLines bool) string {
+	type location struct {
+		Row    int `json:"row"`
+		Column int `json:"column"`
+	}
+	type entry struct {
+		Code        string   `json:"code"`
+		Message     string   `json:"message"`
+		Severity    string   `json:"severity"`
+		Filename    string   `json:"filename"`
+		Location    location `json:"location"`
+		EndLocation location `json:"end_location"`
+	}
+	entries := make([]entry, len(diagnostics))
+	for i, d := range diagnostics {
+		entries[i] = entry{
+			Code:        d.Code,
+			Message:     d.Message,
+			Severity:    d.Severity.String(),
+			Filename:    d.File,
+			Location:    location{Row: d.Line, Column: d.Column},
+			EndLocation: location{Row: d.EndLine, Column: d.EndColumn},
+		}
+	}
+	if jsonLines {
+		var b strings.Builder
+		for i := range entries {
+			line, err := json.Marshal(entries[i])
+			if err != nil {
+				continue
+			}
+			b.Write(line)
+			b.WriteByte('\n')
+		}
+		return b.String()
+	}
+	out, err := json.Marshal(entries)
+	if err != nil {
+		return "[]"
+	}
+	return string(out)
 }
 
 // --------------------------------------------------------------------------
