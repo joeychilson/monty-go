@@ -6,7 +6,9 @@ import (
 	"github.com/joeychilson/monty/internal/ffi"
 )
 
-// Limits constrains CPU time, allocation count, memory, and recursion depth for a run.
+// Limits constrains CPU time, allocation count, memory, and recursion depth
+// for a run. The zero value of each field leaves that limit at Monty's
+// default.
 type Limits struct {
 	// MaxAllocations stops execution after this many Monty allocations.
 	MaxAllocations int
@@ -50,17 +52,22 @@ func (l Limits) ffi() *ffi.Limits {
 	return &limits
 }
 
-func limitsWithContextDeadline(base *Limits, deadline time.Time) *Limits {
+// limitsWithContextDeadline tightens base so MaxDuration never exceeds the
+// remaining time before deadline. The boolean reports whether the deadline
+// actually bounds the run (so a resulting TimeoutError can be attributed to
+// the context).
+func limitsWithContextDeadline(base *Limits, deadline time.Time) (*Limits, bool) {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		remaining = time.Nanosecond
 	}
 	if base == nil {
-		return &Limits{MaxDuration: remaining}
+		return &Limits{MaxDuration: remaining}, true
 	}
 	limits := *base
 	if limits.MaxDuration <= 0 || remaining < limits.MaxDuration {
 		limits.MaxDuration = remaining
+		return &limits, true
 	}
-	return &limits
+	return &limits, false
 }

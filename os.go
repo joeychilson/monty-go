@@ -2,44 +2,156 @@ package monty
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/joeychilson/monty/internal/ffi"
 )
 
-// OSRequest describes a Python operation that needs host OS cooperation.
-type OSRequest struct {
-	// Function is the Python-visible operation, such as "Path.read_text".
-	Function string
-	// Args are positional Python arguments valid for the duration of the call.
-	Args []Value
-	// Kwargs are keyword Python arguments valid for the duration of the call.
-	Kwargs []Pair
-	// CallID identifies the call when resolving async futures.
-	CallID uint32
+// OSFunction names a Python operation that needs host OS cooperation. The
+// set is open: unknown literals pass through for forward compatibility.
+type OSFunction string
+
+// The OS functions Monty traps.
+const (
+	OSPathExists     OSFunction = "Path.exists"
+	OSPathIsFile     OSFunction = "Path.is_file"
+	OSPathIsDir      OSFunction = "Path.is_dir"
+	OSPathIsSymlink  OSFunction = "Path.is_symlink"
+	OSPathReadText   OSFunction = "Path.read_text"
+	OSPathReadBytes  OSFunction = "Path.read_bytes"
+	OSPathWriteText  OSFunction = "Path.write_text"
+	OSPathWriteBytes OSFunction = "Path.write_bytes"
+	OSPathMkdir      OSFunction = "Path.mkdir"
+	OSPathUnlink     OSFunction = "Path.unlink"
+	OSPathRmdir      OSFunction = "Path.rmdir"
+	OSPathIterDir    OSFunction = "Path.iterdir"
+	OSPathStat       OSFunction = "Path.stat"
+	OSPathRename     OSFunction = "Path.rename"
+	OSPathResolve    OSFunction = "Path.resolve"
+	OSPathAbsolute   OSFunction = "Path.absolute"
+	OSGetenv         OSFunction = "os.getenv"
+	OSDateToday      OSFunction = "date.today"
+	OSDateTimeNow    OSFunction = "datetime.now"
+)
+
+// IsFilesystem reports whether the function operates on paths.
+func (fn OSFunction) IsFilesystem() bool {
+	switch fn {
+	case OSPathExists, OSPathIsFile, OSPathIsDir, OSPathIsSymlink,
+		OSPathReadText, OSPathReadBytes, OSPathWriteText, OSPathWriteBytes,
+		OSPathMkdir, OSPathUnlink, OSPathRmdir, OSPathIterDir, OSPathStat,
+		OSPathRename, OSPathResolve, OSPathAbsolute:
+		return true
+	default:
+		return false
+	}
 }
 
-// OSHandler handles Python OS calls paused by Monty.
-//
-// Return an *Error to raise a specific Python exception. Other errors are
-// raised as RuntimeError.
-type OSHandler func(ctx context.Context, request OSRequest) (Value, error)
+// ErrNotHandled is returned by an OSHandler (or fs.FS dispatch) to decline a
+// call: Monty's default behavior then applies (PermissionError for filesystem
+// operations, RuntimeError otherwise).
+var ErrNotHandled = errors.New("monty: os call not handled")
 
-// MountMode controls what host filesystem operations a Mount permits.
+// OSHandler answers Python OS calls — filesystem operations, os.getenv,
+// date.today, datetime.now. It runs after mounts and WithFS filesystems
+// decline. The returned value converts with the same rules as From; return
+// ErrNotHandled to fall through, or a *Exception to raise a specific Python
+// exception.
+type OSHandler func(ctx context.Context, fn OSFunction, args []Value, kwargs map[string]Value) (any, error)
+
+// StatResult is an os.stat_result payload for answering Path.stat calls.
+type StatResult struct {
+	Mode  uint32
+	Ino   uint64
+	Dev   uint64
+	Nlink int
+	UID   int
+	GID   int
+	Size  int64
+	ATime time.Time
+	MTime time.Time
+	CTime time.Time
+}
+
+// MontyValue implements Valuer, encoding the canonical os.stat_result
+// namedtuple.
+func (s StatResult) MontyValue() Value {
+	toFloat := func(t time.Time) Value {
+		if t.IsZero() {
+			return Float(0)
+		}
+		return Float(float64(t.UnixNano()) / float64(time.Second))
+	}
+	return NamedTuple{
+		Type: "os.stat_result",
+		Fields: []string{
+			"st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid",
+			"st_size", "st_atime", "st_mtime", "st_ctime",
+		},
+		Values: []Value{
+			//nolint:gosec // stat fields are far below int64 range in practice
+			Int64(int64(s.Mode)), Int64(int64(s.Ino)), Int64(int64(s.Dev)),
+			Int(s.Nlink), Int(s.UID), Int(s.GID),
+			Int64(s.Size), toFloat(s.ATime), toFloat(s.MTime), toFloat(s.CTime),
+		},
+	}.MontyValue()
+}
+
+// FileStat builds a regular-file stat result with mode 0o644.
+func FileStat(size int64, modTime time.Time) StatResult {
+	return StatResult{
+		Mode:  0o100_644,
+		Nlink: 1,
+		Size:  size,
+		ATime: modTime,
+		MTime: modTime,
+		CTime: modTime,
+	}
+}
+
+// DirStat builds a directory stat result with mode 0o755.
+func DirStat(modTime time.Time) StatResult {
+	return StatResult{
+		Mode:  0o040_755,
+		Nlink: 2,
+		Size:  4096,
+		ATime: modTime,
+		MTime: modTime,
+		CTime: modTime,
+	}
+}
+
+// StatOf adapts an fs.FileInfo into a stat result.
+func StatOf(info fs.FileInfo) StatResult {
+	if info.IsDir() {
+		return DirStat(info.ModTime())
+	}
+	return FileStat(info.Size(), info.ModTime())
+}
+
+// --------------------------------------------------------------------------
+// Mounts
+// --------------------------------------------------------------------------
+
+// MountMode controls what host filesystem operations a mount permits. The
+// zero value is MountOverlay, matching upstream Monty's default.
 type MountMode int
 
 const (
+	// MountOverlay stores writes in memory while reads fall through to the
+	// host directory (copy-on-write).
+	MountOverlay MountMode = iota
 	// MountReadOnly allows reads and rejects writes with PermissionError.
-	MountReadOnly MountMode = iota
+	MountReadOnly
 	// MountReadWrite allows reads and writes through to the host directory.
 	MountReadWrite
-	// MountOverlay stores writes in memory while reads fall through to the host directory.
-	MountOverlay
 )
 
 // String returns a stable display name for mode.
@@ -56,85 +168,85 @@ func (mode MountMode) String() string {
 	}
 }
 
-// Mount maps a virtual Python path prefix to a host directory for one run.
-type Mount struct {
-	// VirtualPath is the POSIX path prefix visible to Python.
-	VirtualPath string
-	// HostPath is the host directory backing the virtual path.
-	HostPath string
-	// Mode controls whether Python may write through this mount.
-	Mode MountMode
-	// WriteBytesLimit caps cumulative bytes written through this mount when set.
-	WriteBytesLimit    uint64
-	hasWriteBytesLimit bool
-}
-
-// MountOption configures a filesystem mount.
-type MountOption func(*Mount)
-
-// WithMountMode sets the mount access policy. NewMountDir defaults to overlay mode.
-func WithMountMode(mode MountMode) MountOption {
-	return func(m *Mount) { m.Mode = mode }
-}
-
-// WithWriteBytesLimit caps cumulative bytes written through the mount.
-func WithWriteBytesLimit(limit uint64) MountOption {
-	return func(m *Mount) {
-		m.WriteBytesLimit = limit
-		m.hasWriteBytesLimit = true
+// ffiMode maps the Go enum (overlay-by-default) onto the FFI encoding.
+func (mode MountMode) ffiMode() uint32 {
+	switch mode {
+	case MountReadOnly:
+		return 0
+	case MountReadWrite:
+		return 1
+	default:
+		return 2
 	}
 }
 
-// WithMount adds a filesystem mount for Python path operations during this run.
-func WithMount(virtualPath, hostPath string, mode MountMode) RunOption {
-	return func(c *runConfig) {
-		c.mounts = append(c.mounts, newMount(virtualPath, hostPath, mode))
+// MountOption configures a MountDir.
+type MountOption func(*mountConfig)
+
+type mountConfig struct {
+	mode          MountMode
+	writeLimit    uint64
+	hasWriteLimit bool
+}
+
+// WithMode sets the mount access policy (the default is MountOverlay).
+func WithMode(mode MountMode) MountOption {
+	return func(c *mountConfig) { c.mode = mode }
+}
+
+// WithWriteLimit caps cumulative bytes written through the mount.
+func WithWriteLimit(limit uint64) MountOption {
+	return func(c *mountConfig) {
+		c.writeLimit = limit
+		c.hasWriteLimit = true
 	}
 }
 
-// WithMountOptions adds a filesystem mount using Go-style options.
-func WithMountOptions(virtualPath, hostPath string, opts ...MountOption) RunOption {
-	return func(c *runConfig) {
-		mount := newMount(virtualPath, hostPath, MountOverlay)
-		for _, opt := range opts {
-			opt(&mount)
-		}
-		c.mounts = append(c.mounts, mount)
-	}
-}
-
-// MountDir is a reusable filesystem mount with persistent overlay state.
-//
-// Use Close when the mount is no longer needed.
+// MountDir maps a virtual Python path prefix to a host directory. A MountDir
+// is reusable across runs; overlay mounts keep their in-memory writes between
+// runs. Close it when no longer needed.
 type MountDir struct {
-	mu      sync.Mutex
-	mount   Mount
-	handle  uintptr
-	cleanup runtime.Cleanup
+	mu          sync.Mutex
+	virtualPath string
+	hostPath    string
+	mode        MountMode
+	handle      uintptr
+	cleanup     runtime.Cleanup
 }
 
-// NewMountDir creates a reusable filesystem mount. It defaults to overlay mode.
+// NewMountDir creates a filesystem mount. The default mode is MountOverlay.
 func NewMountDir(virtualPath, hostPath string, opts ...MountOption) (*MountDir, error) {
-	mount := newMount(virtualPath, hostPath, MountOverlay)
+	config := mountConfig{mode: MountOverlay}
 	for _, opt := range opts {
-		opt(&mount)
+		opt(&config)
 	}
-	handle, err := mount.openHandle()
+	virtualPath = cleanVirtualPath(virtualPath)
+	hostPath = filepath.Clean(hostPath)
+	var limit *uint64
+	if config.hasWriteLimit {
+		limit = &config.writeLimit
+	}
+	handle, err := ffi.MountNew(virtualPath, hostPath, config.mode.ffiMode(), limit)
 	if err != nil {
-		return nil, err
+		return nil, normalizeError(err)
 	}
-	dir := &MountDir{mount: mount, handle: handle}
-	// AddCleanup captures the handle value (not dir) so a dropped MountDir that
-	// was never Closed still frees the Rust handle. Close stops it first, so the
-	// handle is freed exactly once. Close remains the documented path.
+	dir := &MountDir{
+		virtualPath: virtualPath,
+		hostPath:    hostPath,
+		mode:        config.mode,
+		handle:      handle,
+	}
+	// AddCleanup captures the handle value (not dir) so a dropped MountDir
+	// that was never Closed still frees the Rust handle. Close stops it first,
+	// so the handle is freed exactly once.
 	dir.cleanup = runtime.AddCleanup(dir, ffi.MountFree, handle)
 	return dir, nil
 }
 
-// Close releases the Rust-side mount handle.
-func (m *MountDir) Close() error {
+// Close releases the Rust-side mount handle. Close is idempotent.
+func (m *MountDir) Close() {
 	if m == nil {
-		return nil
+		return
 	}
 	m.cleanup.Stop()
 	m.mu.Lock()
@@ -142,7 +254,6 @@ func (m *MountDir) Close() error {
 	m.handle = 0
 	m.mu.Unlock()
 	ffi.MountFree(handle)
-	return nil
 }
 
 // VirtualPath returns the POSIX path prefix visible to Python.
@@ -150,7 +261,7 @@ func (m *MountDir) VirtualPath() string {
 	if m == nil {
 		return ""
 	}
-	return m.mount.VirtualPath
+	return m.virtualPath
 }
 
 // HostPath returns the host directory backing the mount.
@@ -158,15 +269,15 @@ func (m *MountDir) HostPath() string {
 	if m == nil {
 		return ""
 	}
-	return m.mount.HostPath
+	return m.hostPath
 }
 
 // Mode returns the mount access policy.
 func (m *MountDir) Mode() MountMode {
 	if m == nil {
-		return MountReadOnly
+		return MountOverlay
 	}
-	return m.mount.Mode
+	return m.mode
 }
 
 func (m *MountDir) ffiHandle() (uintptr, error) {
@@ -181,178 +292,125 @@ func (m *MountDir) ffiHandle() (uintptr, error) {
 	return m.handle, nil
 }
 
-// WithMountDir uses a reusable filesystem mount during this run.
-func WithMountDir(mount *MountDir) RunOption {
-	return func(c *runConfig) {
-		if mount != nil {
-			c.mountDirs = append(c.mountDirs, mount)
-		}
-	}
-}
-
-func newMount(virtualPath, hostPath string, mode MountMode) Mount {
+func cleanVirtualPath(virtualPath string) string {
 	if virtualPath == "" {
 		virtualPath = "/"
-	} else if !strings.HasPrefix(virtualPath, "/") {
+	} else if virtualPath[0] != '/' {
 		virtualPath = "/" + virtualPath
 	}
-	return Mount{
-		VirtualPath: path.Clean(virtualPath),
-		HostPath:    filepath.Clean(hostPath),
-		Mode:        mode,
-	}
+	return path.Clean(virtualPath)
 }
 
-func (c runConfig) needsDispatchLoop() bool {
-	return len(c.functions) != 0 || c.osHandler != nil || len(c.mounts) != 0 || len(c.mountDirs) != 0
-}
+// --------------------------------------------------------------------------
+// Run-config OS dispatch
+// --------------------------------------------------------------------------
 
-func (c runConfig) canUseFunctionCallbackFast() bool {
-	if len(c.functions) == 0 || c.osHandler != nil || len(c.mounts) != 0 || len(c.mountDirs) != 0 {
-		return false
-	}
-	for _, function := range c.functions {
-		if function == nil || function.fastRawCall == nil {
-			return false
-		}
-	}
-	return true
-}
-
-func (c runConfig) handleOSCall(ctx context.Context, call *OSCall) (Value, error) {
-	if value, handled, err := c.handleMount(call); handled {
-		return value, err
-	}
-	if c.osHandler != nil {
-		return c.osHandler(ctx, OSRequest{
-			Function: call.Function,
-			Args:     call.Args,
-			Kwargs:   call.Kwargs,
-			CallID:   call.CallID,
-		})
-	}
-	return Value{}, &Error{
-		Type:    "PermissionError",
-		Message: fmt.Sprintf("%s is not permitted", call.Function),
-	}
-}
-
-func (c runConfig) handleMount(call *OSCall) (result Value, handled bool, err error) {
-	if len(c.mountHandles) == 0 || !isPathFunction(call.Function) || len(call.Args) == 0 {
-		return Value{}, false, nil
-	}
-	argHandles, err := valuesToHandles(call.Args)
-	if err != nil {
-		return Value{}, true, err
-	}
-	defer freeHandles(argHandles)
-	kwargKeyHandles, kwargValueHandles, err := pairsToHandles(call.Kwargs)
-	if err != nil {
-		return Value{}, true, err
-	}
-	defer freeHandles(kwargKeyHandles)
-	defer freeHandles(kwargValueHandles)
-
-	valueHandle, handled, err := ffi.MountHandleOSCall(
-		c.mountHandles,
-		call.Function,
-		argHandles,
-		kwargKeyHandles,
-		kwargValueHandles,
-	)
-	if err != nil {
-		return Value{}, true, normalizeError(err)
-	}
-	if !handled {
-		return Value{}, false, nil
-	}
-	value, err := decodeOwnedValue(valueHandle)
-	return value, true, normalizeError(err)
-}
-
+// openMounts resolves the run's MountDir handles up front so a closed mount
+// fails the run before execution starts.
 func (c *runConfig) openMounts() error {
-	if len(c.mounts) == 0 && len(c.mountDirs) == 0 {
+	if len(c.mounts) == 0 {
 		return nil
 	}
-	c.mountHandles = make([]uintptr, 0, len(c.mounts)+len(c.mountDirs))
-	c.ownedMounts = make([]uintptr, 0, len(c.mounts))
 	for _, mount := range c.mounts {
-		handle, err := mount.openHandle()
-		if err != nil {
-			c.closeMounts()
+		if _, err := mount.ffiHandle(); err != nil {
 			return err
 		}
-		c.mountHandles = append(c.mountHandles, handle)
-		c.ownedMounts = append(c.ownedMounts, handle)
-	}
-	for _, mount := range c.mountDirs {
-		handle, err := mount.ffiHandle()
-		if err != nil {
-			c.closeMounts()
-			return err
-		}
-		c.mountHandles = append(c.mountHandles, handle)
 	}
 	return nil
 }
 
-func (c *runConfig) closeMounts() {
-	for _, handle := range c.ownedMounts {
-		ffi.MountFree(handle)
+// mountFFIHandles snapshots the mount handles for one FFI call.
+func (c *runConfig) mountFFIHandles() []uintptr {
+	if len(c.mounts) == 0 {
+		return nil
 	}
-	c.ownedMounts = nil
-	c.mountHandles = nil
+	handles := make([]uintptr, 0, len(c.mounts))
+	for _, mount := range c.mounts {
+		if handle, err := mount.ffiHandle(); err == nil {
+			handles = append(handles, handle)
+		}
+	}
+	return handles
 }
 
-func (mount Mount) openHandle() (uintptr, error) {
-	var limit *uint64
-	if mount.hasWriteBytesLimit {
-		limit = &mount.WriteBytesLimit
-	}
-	//nolint:gosec // MountMode is a small enum (read-only, overlay, read-write)
-	handle, err := ffi.MountNew(mount.VirtualPath, mount.HostPath, uint32(mount.Mode), limit)
-	return handle, normalizeError(err)
+// hasOSDispatch reports whether any OS-call answering is configured.
+func (c *runConfig) hasOSDispatch() bool {
+	return len(c.mounts) != 0 || len(c.fsMounts) != 0 || c.osHandler != nil
 }
 
-func valuesToHandles(values []Value) ([]uintptr, error) {
-	handles := make([]uintptr, len(values))
-	for i, value := range values {
-		handle, err := valueToHandle(value)
+// dispatchOS answers one surfaced OS call: mounts first, then WithFS
+// filesystems, then the OS handler. ErrNotHandled means nothing claimed it.
+func (c *runConfig) dispatchOS(ctx context.Context, call *Call) (Value, error) {
+	fn := OSFunction(call.Name)
+	if len(c.mounts) != 0 && fn.IsFilesystem() && len(call.Args) > 0 {
+		value, handled, err := c.dispatchMounts(call)
 		if err != nil {
-			freeHandles(handles[:i])
-			return nil, err
+			return Value{}, err
 		}
-		handles[i] = handle
+		if handled {
+			return value, nil
+		}
 	}
-	return handles, nil
+	return dispatchOSCall(ctx, c.fsMounts, c.osHandler, fn, call.Args, call.Kwargs)
 }
 
-func pairsToHandles(pairs []Pair) ([]uintptr, []uintptr, error) {
-	keys := make([]uintptr, len(pairs))
-	values := make([]uintptr, len(pairs))
-	for i := range pairs {
-		key, err := valueToHandle(pairs[i].Key)
-		if err == nil {
-			keys[i] = key
-			values[i], err = valueToHandle(pairs[i].Value)
-		}
+// dispatchMounts runs one OS call against the Rust mount table.
+func (c *runConfig) dispatchMounts(call *Call) (Value, bool, error) {
+	arena := &rawArena{}
+	rawArgs, err := valuesToRaw(call.Args, arena)
+	if err != nil {
+		return Value{}, true, err
+	}
+	defer freeOwnedRawValues(rawArgs)
+	rawKwargs := make([]ffi.RawPair, 0, len(call.Kwargs))
+	for name, value := range call.Kwargs {
+		raw, err := valueToRaw(value, arena)
 		if err != nil {
-			freeHandles(keys[:i+1])
-			freeHandles(values[:i])
-			return nil, nil, err
+			freeOwnedRawPairs(rawKwargs)
+			return Value{}, true, err
 		}
+		key, err := valueToRaw(Str(name), arena)
+		if err != nil {
+			freeOwnedRawValue(&raw)
+			freeOwnedRawPairs(rawKwargs)
+			return Value{}, true, err
+		}
+		rawKwargs = append(rawKwargs, ffi.RawPair{Key: key, Value: raw})
 	}
-	return keys, values, nil
+	defer freeOwnedRawPairs(rawKwargs)
+	result, handled, err := ffi.MountHandleOSCall(c.mountFFIHandles(), call.Name, rawArgs, rawKwargs)
+	runtime.KeepAlive(arena)
+	runtime.KeepAlive(call)
+	if err != nil {
+		return Value{}, handled, normalizeError(err)
+	}
+	if !handled {
+		return Value{}, false, nil
+	}
+	value, err := decodeRawValue(result)
+	return value, true, err
 }
 
-func isPathFunction(function string) bool {
-	switch function {
-	case "Path.exists", "Path.is_file", "Path.is_dir", "Path.is_symlink",
-		"Path.read_text", "Path.read_bytes", "Path.write_text", "Path.write_bytes",
-		"Path.mkdir", "Path.unlink", "Path.rmdir", "Path.iterdir", "Path.stat",
-		"Path.rename", "Path.resolve", "Path.absolute":
-		return true
-	default:
-		return false
+// dispatchOSCall answers one OS call from Go-side sources: WithFS read-only
+// filesystems first, then the OS handler.
+func dispatchOSCall(ctx context.Context, fsMounts []fsMount, handler OSHandler, fn OSFunction, args []Value, kwargs map[string]Value) (Value, error) {
+	if fn.IsFilesystem() && len(args) > 0 {
+		for i := range fsMounts {
+			value, handled, err := fsMounts[i].handle(fn, args, kwargs)
+			if err != nil {
+				return Value{}, err
+			}
+			if handled {
+				return value, nil
+			}
+		}
 	}
+	if handler != nil {
+		result, err := handler(ctx, fn, args, kwargs)
+		if err != nil {
+			return Value{}, err
+		}
+		return From(result)
+	}
+	return Value{}, ErrNotHandled
 }

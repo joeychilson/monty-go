@@ -4,296 +4,630 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"maps"
 	"runtime"
-	"slices"
+	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/joeychilson/monty/internal/ffi"
 )
 
-// Repl is a stateful Monty Python REPL session.
-//
-// A Repl preserves globals, heap state, and functions between snippets. It is
-// safe to call from multiple goroutines; calls are serialized because each
-// snippet mutates the session.
-type Repl struct {
+// REPL is a stateful Python session: globals and heap state persist across
+// snippets. Methods are safe for concurrent use but execute one snippet at a
+// time.
+type REPL struct {
 	mu      sync.Mutex
 	handle  uintptr
 	cleanup runtime.Cleanup
+	closed  bool
+	// busy marks a Start-run mid-snippet: the session moved into the Run and
+	// comes back when it completes or fails.
+	busy bool
+	// lost marks a session that will never come back: its in-flight run
+	// ended (failed or was closed while paused) without returning it.
+	lost bool
+
+	config       replConfig
+	functions    map[string]*Function
+	typeSnippets []string
 }
 
-// ReplOption configures NewRepl.
-type ReplOption func(*replConfig)
-
-type replConfig struct {
-	scriptName string
-	limits     *Limits
+// replFeedScratch bundles the feed argument block and callback state in one
+// pooled allocation. Both must be heap-resident: their addresses cross the
+// raw FFI trampoline as bare uintptrs, so a stack-allocated copy could be
+// moved mid-call by a stack growth while Rust still holds the old address
+// (see hostRunScratch).
+type replFeedScratch struct {
+	args  ffi.ReplFeedArgs
+	state hostCallbackState
 }
 
-// WithReplScriptName sets the filename used in REPL tracebacks.
-func WithReplScriptName(name string) ReplOption {
-	return func(c *replConfig) { c.scriptName = name }
+var replFeedScratchPool = sync.Pool{
+	New: func() any { return new(replFeedScratch) },
 }
 
-// WithReplLimits applies resource limits to the REPL session.
-func WithReplLimits(limits Limits) ReplOption {
-	return func(c *replConfig) { c.limits = new(limits) }
-}
-
-// NewRepl creates an empty stateful REPL session.
-func NewRepl(opts ...ReplOption) (*Repl, error) {
-	config := replConfig{scriptName: "<repl>"}
+// NewREPL creates an empty session. Session options set defaults applied to
+// every snippet: script name, limits, functions, type checking, stubs,
+// dataclasses, and print writers.
+func NewREPL(opts ...REPLOption) (*REPL, error) {
+	config := replConfig{scriptName: "main.py"}
 	for _, opt := range opts {
-		opt(&config)
+		opt.applyREPL(&config)
 	}
-	var ffiLimits *ffi.Limits
+	functions := make(map[string]*Function, len(config.functions))
+	for _, function := range config.functions {
+		if _, exists := functions[function.Name()]; exists {
+			return nil, fmt.Errorf("monty: duplicate function %q", function.Name())
+		}
+		functions[function.Name()] = function
+	}
+	limits := Limits{}
 	if config.limits != nil {
-		ffiLimits = config.limits.ffi()
+		limits = *config.limits
 	}
+	// Force a tracked session by attaching a (never-cancelled) token at
+	// construction: per-snippet duration budgets and context cancellation
+	// require the tracker, and upstream fixes the tracker type when the
+	// session is created.
+	token, err := ffi.CancelTokenNew()
+	if err != nil {
+		return nil, err
+	}
+	defer ffi.CancelTokenFree(token)
+	ffiLimits := limits.ffi()
+	ffiLimits.CancelToken = token
 	handle, err := ffi.ReplNew(config.scriptName, ffiLimits)
 	if err != nil {
 		return nil, normalizeError(err)
 	}
-	return newRepl(handle), nil
+	repl := &REPL{handle: handle, config: config, functions: functions}
+	repl.cleanup = runtime.AddCleanup(repl, ffi.ReplFree, handle)
+	return repl, nil
 }
 
-// LoadRepl restores a REPL session created by Repl.Dump.
-func LoadRepl(snapshot []byte) (*Repl, error) {
-	handle, err := ffi.ReplLoad(snapshot)
+// LoadREPL restores a session serialized by REPL.Dump. Session defaults
+// (functions, writers, type checking) are not serialized; re-provide them
+// here.
+func LoadREPL(data []byte, opts ...REPLOption) (*REPL, error) {
+	payload, err := unwrapSnapshot(data, snapshotKindREPL)
+	if err != nil {
+		return nil, err
+	}
+	config := replConfig{scriptName: "main.py"}
+	for _, opt := range opts {
+		opt.applyREPL(&config)
+	}
+	functions := make(map[string]*Function, len(config.functions))
+	for _, function := range config.functions {
+		functions[function.Name()] = function
+	}
+	handle, err := ffi.ReplLoad(payload)
 	if err != nil {
 		return nil, normalizeError(err)
 	}
-	return newRepl(handle), nil
+	repl := &REPL{handle: handle, config: config, functions: functions}
+	repl.cleanup = runtime.AddCleanup(repl, ffi.ReplFree, handle)
+	return repl, nil
 }
 
-// newRepl wraps a Rust REPL handle and attaches a cleanup that frees it if the
-// Repl is dropped without Close. The cleanup captures the handle value (not the
-// Repl), and Close stops it first, so the handle is freed exactly once.
-func newRepl(handle uintptr) *Repl {
-	r := &Repl{handle: handle}
-	r.cleanup = runtime.AddCleanup(r, ffi.ReplFree, handle)
-	return r
-}
-
-// Close releases the Rust-side REPL handle.
-func (r *Repl) Close() error {
-	if r == nil {
-		return nil
+// LoadREPLRun restores a mid-snippet execution serialized by Run.Dump on a
+// REPL run. It returns both the paused Run and the session it belongs to;
+// the session becomes usable when the Run completes or fails.
+func LoadREPLRun(data []byte, opts ...RunOption) (*REPL, *Run, error) {
+	payload, err := unwrapSnapshot(data, snapshotKindRun)
+	if err != nil {
+		return nil, nil, err
 	}
-	r.cleanup.Stop()
+	handle, err := ffi.ProgressLoad(payload)
+	if err != nil {
+		return nil, nil, normalizeError(err)
+	}
+	if !ffi.ProgressIsRepl(handle) {
+		ffi.ProgressFree(handle)
+		return nil, nil, fmt.Errorf("monty: snapshot is a program execution; load it with LoadRun")
+	}
+	repl := &REPL{busy: true, config: replConfig{scriptName: "main.py"}, functions: map[string]*Function{}}
+	run, err := runFromLoadedHandle(handle, repl, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return repl, run, nil
+}
+
+// Close releases the session. Close is idempotent.
+func (r *REPL) Close() {
+	if r == nil {
+		return
+	}
+	// cleanup is written by adoptHandle under the mutex; stopping it outside
+	// the lock would race a finishing Run re-registering it.
 	r.mu.Lock()
+	r.cleanup.Stop()
 	handle := r.handle
 	r.handle = 0
+	r.closed = true
 	r.mu.Unlock()
 	ffi.ReplFree(handle)
+}
+
+// Dump serializes the session (globals, heap, defined functions) so it can
+// be restored with LoadREPL, possibly in another process.
+func (r *REPL) Dump() ([]byte, error) {
+	if r == nil {
+		return nil, ErrClosed
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.usableLocked(); err != nil {
+		return nil, err
+	}
+	payload, err := ffi.ReplDump(r.handle)
+	if err != nil {
+		return nil, normalizeError(err)
+	}
+	return wrapSnapshot(snapshotKindREPL, payload), nil
+}
+
+func (r *REPL) usableLocked() error {
+	if r.lost {
+		return fmt.Errorf("monty: REPL session lost: its snippet run ended without handing the session back: %w", ErrClosed)
+	}
+	if r.closed || r.handle == 0 && !r.busy {
+		return ErrClosed
+	}
+	if r.busy {
+		return ErrBusy
+	}
 	return nil
 }
 
-// Dump serializes the REPL session so it can be restored with LoadRepl.
-func (r *Repl) Dump() ([]byte, error) {
-	if r == nil {
-		return nil, fmt.Errorf("monty: REPL is closed")
-	}
+// sessionLost marks the session unrecoverable: the Run holding it reached a
+// terminal state without handing it back. No-op once the session returned.
+func (r *REPL) sessionLost() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.handle == 0 {
-		return nil, fmt.Errorf("monty: REPL is closed")
+	if !r.busy {
+		return
 	}
-	snapshot, err := ffi.ReplDump(r.handle)
-	return snapshot, normalizeError(err)
+	r.busy = false
+	r.lost = true
 }
 
-// FeedRun executes one REPL snippet to completion.
-//
-// Only WithStdout is honored. The Rust REPL entry points do not accept
-// per-call resource limits, host functions, OS handlers, or mounts; use
-// WithReplLimits to apply limits to the whole session. Passing any other
-// RunOption returns an error rather than silently ignoring it.
-//
-// Cancellation: ctx is only checked before the snippet starts. A snippet runs
-// to completion in a single Rust call, so neither cancellation nor a ctx
-// deadline can interrupt it once started; bound runaway snippets with
-// WithReplLimits(Limits{MaxDuration: ...}) when creating the session.
-func (r *Repl) FeedRun(ctx context.Context, code string, inputs any, opts ...RunOption) (Value, error) {
-	if err := ctxErr(ctx); err != nil {
-		return Value{}, err
+// adoptHandle installs the session handle returned by a completed or failed
+// REPL run, replacing the consumed one.
+func (r *REPL) adoptHandle(handle uintptr) {
+	r.mu.Lock()
+	old := r.handle
+	r.handle = handle
+	r.busy = false
+	closed := r.closed
+	r.cleanup.Stop()
+	if !closed {
+		r.cleanup = runtime.AddCleanup(r, ffi.ReplFree, handle)
 	}
-	config := runConfig{}
+	r.mu.Unlock()
+	ffi.ReplFree(old)
+	if closed {
+		ffi.ReplFree(handle)
+	}
+}
+
+// recordSnippet appends a successfully executed snippet to the accumulated
+// type-check context.
+func (r *REPL) recordSnippet(code string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.typeSnippets = append(r.typeSnippets, code)
+}
+
+// snippetRunConfig merges session defaults with per-snippet options.
+func (r *REPL) snippetRunConfig(opts []RunOption) runConfig {
+	config := runConfig{
+		limits:    r.config.limits,
+		stdout:    r.config.stdout,
+		stderr:    r.config.stderr,
+		functions: r.functions,
+	}
 	for _, opt := range opts {
-		opt(&config)
+		opt.applyRun(&config)
 	}
-	if err := checkReplRunConfig(&config); err != nil {
-		return Value{}, err
+	return config
+}
+
+// typeCheckContext builds the stub context for one snippet: explicit stubs,
+// function and dataclass stubs, then previously executed snippets.
+func (r *REPL) typeCheckContext(functions map[string]*Function) string {
+	parts := make([]string, 0, 2)
+	if base := joinStubs(r.config.stubs, functions, r.config.dataclasses); strings.TrimSpace(base) != "" {
+		parts = append(parts, base)
 	}
-	names, handles, err := replInputHandles(inputs)
+	r.mu.Lock()
+	if len(r.typeSnippets) != 0 {
+		parts = append(parts, strings.Join(r.typeSnippets, "\n\n"))
+	}
+	r.mu.Unlock()
+	return strings.Join(parts, "\n\n")
+}
+
+// TypeCheck statically checks a snippet against the session's stubs and
+// accumulated context without executing it. It returns nil or a
+// *TypeCheckError.
+func (r *REPL) TypeCheck(code string, extraStubs ...string) error {
+	if r == nil {
+		return ErrClosed
+	}
+	stubs := r.typeCheckContext(r.functions)
+	if extra := strings.Join(extraStubs, "\n\n"); strings.TrimSpace(extra) != "" {
+		if stubs != "" {
+			stubs += "\n\n" + extra
+		} else {
+			stubs = extra
+		}
+	}
+	diags, err := ffi.TypeCheck(code, r.config.scriptName, stubs, "type_stubs.pyi")
+	if err != nil {
+		return execError(err)
+	}
+	if diags != 0 {
+		return newTypeCheckError(diags)
+	}
+	return nil
+}
+
+// Eval executes one snippet against the persistent session state and returns
+// its value. Per-snippet options may add functions, mounts, WithFS
+// filesystems, an OS handler, print writers, and a MaxDuration budget.
+func (r *REPL) Eval(ctx context.Context, code string, inputs any, opts ...RunOption) (Value, error) {
+	if r == nil {
+		return Value{}, ErrClosed
+	}
+	config := r.snippetRunConfig(opts)
+	ctx, config, err := prepareRun(ctx, config)
 	if err != nil {
 		return Value{}, err
 	}
-	defer freeHandles(handles)
-
-	if r == nil {
-		return Value{}, fmt.Errorf("monty: REPL is closed")
-	}
-	r.mu.Lock()
-	if r.handle == 0 {
-		r.mu.Unlock()
-		return Value{}, fmt.Errorf("monty: REPL is closed")
-	}
-	valueHandle, printed, err := ffi.ReplFeedRun(r.handle, code, names, handles)
-	r.mu.Unlock()
-	return decodeReplResult(valueHandle, printed, err, config.stdout)
-}
-
-// Call is a convenience wrapper around CallFunction.
-func (r *Repl) Call(ctx context.Context, name string, args ...Value) (Value, error) {
-	return r.CallFunction(ctx, name, args)
-}
-
-// CallFunction calls a Python function defined in the REPL.
-//
-// Only WithStdout is honored; see FeedRun for the rationale. Passing any
-// other RunOption returns an error rather than silently ignoring it.
-func (r *Repl) CallFunction(ctx context.Context, name string, args []Value, opts ...RunOption) (Value, error) {
-	if err := ctxErr(ctx); err != nil {
+	if err := config.openMounts(); err != nil {
 		return Value{}, err
 	}
-	config := runConfig{}
-	for _, opt := range opts {
-		opt(&config)
+	if r.config.typeCheck && !config.skipTypeCheck {
+		if err := r.typeCheckSnippet(code, config.functions); err != nil {
+			return Value{}, err
+		}
 	}
-	if err := checkReplRunConfig(&config); err != nil {
-		return Value{}, err
-	}
-	handles, err := valuesToHandles(args)
+	names, values, arena, err := replInputs(inputs)
 	if err != nil {
 		return Value{}, err
 	}
-	defer freeHandles(handles)
+	defer func() {
+		if arena.ownsHandles {
+			freeOwnedRawValues(values)
+		}
+	}()
 
-	if r == nil {
-		return Value{}, fmt.Errorf("monty: REPL is closed")
+	var token uintptr
+	if ctx.Done() != nil {
+		if token, err = ffi.CancelTokenNew(); err == nil {
+			defer ffi.CancelTokenFree(token)
+		} else {
+			token = 0
+		}
 	}
+	scratch := replFeedScratchPool.Get().(*replFeedScratch) //nolint:errcheck // pool only stores *replFeedScratch
+	state := &scratch.state
+	defer func() {
+		state.clear()
+		replFeedScratchPool.Put(scratch)
+	}()
+	state.reset(ctx, &config)
+	mounts := config.mountFFIHandles()
+	funcNames := hostFunctionNameRefs(config.functions)
+	nameRefs := ffi.StringRefs(names)
+	scratch.args = ffi.ReplFeedArgs{
+		Code:          ffi.StringRef(code),
+		InputNames:    slicePtr(nameRefs),
+		InputValues:   slicePtr(values),
+		InputCount:    uintptr(len(values)),
+		CancelToken:   token,
+		HostNames:     slicePtr(funcNames),
+		HostNameCount: uintptr(len(funcNames)),
+		Mounts:        slicePtr(mounts),
+		MountCount:    uintptr(len(mounts)),
+		Callback:      hostCallbackPtr,
+		CallbackData:  uintptr(unsafe.Pointer(state)),
+	}
+	if config.limits != nil && config.limits.MaxDuration > 0 {
+		scratch.args.HasMaxDuration = 1
+		scratch.args.MaxDurationNanos = uint64(config.limits.MaxDuration)
+	}
+	if config.stdout != nil || config.stderr != nil {
+		scratch.args.Print = printCallbackPtr
+		scratch.args.PrintData = uintptr(unsafe.Pointer(state))
+	}
+
+	output := runFastOutputPool.Get().(*ffi.RunFastOutput) //nolint:errcheck // pool only stores *ffi.RunFastOutput
+	defer runFastOutputPool.Put(output)
+
 	r.mu.Lock()
-	if r.handle == 0 {
+	if err := r.usableLocked(); err != nil {
 		r.mu.Unlock()
-		return Value{}, fmt.Errorf("monty: REPL is closed")
+		return Value{}, err
 	}
-	valueHandle, printed, err := ffi.ReplCallFunction(r.handle, name, handles)
+	handle := r.handle
+	stop := maybeWatchCancel(ctx, token)
+	callErr := ffi.ReplFeedRunRaw(handle, &scratch.args, output)
+	stop()
 	r.mu.Unlock()
-	return decodeReplResult(valueHandle, printed, err, config.stdout)
-}
+	runtime.KeepAlive(nameRefs)
+	runtime.KeepAlive(names)
+	runtime.KeepAlive(funcNames)
+	runtime.KeepAlive(mounts)
+	runtime.KeepAlive(scratch)
+	runtime.KeepAlive(&arena)
 
-// decodeReplResult finishes a REPL FFI call: flush print output, then either
-// return the FFI error joined with any write error, or decode the value
-// handle. valueHandle is freed if writing print output fails.
-func decodeReplResult(valueHandle uintptr, printed string, callErr error, stdout io.Writer) (Value, error) {
-	writeErr := writePrinted(stdout, printed)
+	printed := ffi.TakePrinted(output.Print, output.PrintFlags)
+	output.Print = ffi.Bytes{}
+	writeErr := writePrint(&config, printed)
+	if writeErr == nil {
+		writeErr = state.writeErr
+	}
 	if callErr != nil {
-		return Value{}, errors.Join(normalizeError(callErr), writeErr)
+		ffi.RawValueFree(&output.Value)
+		freeFastOutputBytes(output)
+		return Value{}, errors.Join(wrapCtxErrorBound(ctx, execError(callErr), config.deadlineBound), writeErr)
 	}
 	if writeErr != nil {
-		ffi.ValueFree(valueHandle)
+		ffi.RawValueFree(&output.Value)
+		freeFastOutputBytes(output)
 		return Value{}, writeErr
 	}
-	value, err := decodeOwnedValue(valueHandle)
-	return value, normalizeError(err)
+	value, err := decodeFastOutput(output)
+	if err != nil {
+		return Value{}, err
+	}
+	if r.config.typeCheck && !config.skipTypeCheck {
+		r.recordSnippet(code)
+	}
+	return value, nil
 }
 
-// FunctionNames returns Python functions currently defined in the REPL.
-func (r *Repl) FunctionNames() ([]string, error) {
+func (r *REPL) typeCheckSnippet(code string, functions map[string]*Function) error {
+	stubs := r.typeCheckContext(functions)
+	diags, err := ffi.TypeCheck(code, r.config.scriptName, stubs, "type_stubs.pyi")
+	if err != nil {
+		return execError(err)
+	}
+	if diags != 0 {
+		return newTypeCheckError(diags)
+	}
+	return nil
+}
+
+// Start begins executing one snippet as a suspendable Run. The session moves
+// into the Run while the snippet is in flight (other REPL methods return
+// ErrBusy) and is handed back when the Run completes or fails; closing a
+// paused REPL Run abandons the session state.
+func (r *REPL) Start(ctx context.Context, code string, inputs any, opts ...RunOption) (*Run, error) {
 	if r == nil {
-		return nil, fmt.Errorf("monty: REPL is closed")
+		return nil, ErrClosed
+	}
+	config := r.snippetRunConfig(opts)
+	ctx, config, err := prepareRun(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	if err := config.openMounts(); err != nil {
+		return nil, err
+	}
+	if r.config.typeCheck && !config.skipTypeCheck {
+		if err := r.typeCheckSnippet(code, config.functions); err != nil {
+			return nil, err
+		}
+	}
+	names, values, arena, err := replInputs(inputs)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if arena.ownsHandles {
+			freeOwnedRawValues(values)
+		}
+	}()
+
+	run := &Run{state: statePaused, config: config, repl: r}
+	if ctx.Done() != nil {
+		if token, tokenErr := ffi.CancelTokenNew(); tokenErr == nil {
+			run.cancelToken = token
+		}
+	}
+	if r.config.typeCheck && !config.skipTypeCheck {
+		run.typeSnippet = code
+	}
+	nameRefs := ffi.StringRefs(names)
+	scratch := replFeedScratchPool.Get().(*replFeedScratch) //nolint:errcheck // pool only stores *replFeedScratch
+	defer replFeedScratchPool.Put(scratch)
+	scratch.args = ffi.ReplFeedArgs{
+		Code:        ffi.StringRef(code),
+		InputNames:  slicePtr(nameRefs),
+		InputValues: slicePtr(values),
+		InputCount:  uintptr(len(values)),
+		CancelToken: run.cancelToken,
+	}
+	if config.limits != nil && config.limits.MaxDuration > 0 {
+		scratch.args.HasMaxDuration = 1
+		scratch.args.MaxDurationNanos = uint64(config.limits.MaxDuration)
+	}
+
+	r.mu.Lock()
+	if err := r.usableLocked(); err != nil {
+		r.mu.Unlock()
+		run.releaseCancelTokenLocked()
+		return nil, err
+	}
+	handle := r.handle
+	r.busy = true
+	stop := run.watchCancelLocked(ctx)
+	step, callErr := ffi.ReplFeedStart(handle, &scratch.args)
+	stop()
+	r.mu.Unlock()
+	runtime.KeepAlive(scratch)
+	runtime.KeepAlive(nameRefs)
+	runtime.KeepAlive(names)
+	runtime.KeepAlive(&arena)
+
+	run.mu.Lock()
+	run.advanceLocked(ctx, step, callErr)
+	run.mu.Unlock()
+	return run, nil
+}
+
+// Call invokes a Python function defined in the session by name.
+func (r *REPL) Call(ctx context.Context, name string, args ...any) (Value, error) {
+	if r == nil {
+		return Value{}, ErrClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Value{}, err
+	}
+	arena := &rawArena{}
+	rawArgs := make([]ffi.RawValue, len(args))
+	for i, arg := range args {
+		value, err := From(arg)
+		if err != nil {
+			freeOwnedRawValues(rawArgs)
+			return Value{}, fmt.Errorf("monty: argument %d: %w", i, err)
+		}
+		raw, err := valueToRaw(value, arena)
+		if err != nil {
+			freeOwnedRawValues(rawArgs)
+			return Value{}, err
+		}
+		rawArgs[i] = raw
+	}
+	output := runFastOutputPool.Get().(*ffi.RunFastOutput) //nolint:errcheck // pool only stores *ffi.RunFastOutput
+	defer runFastOutputPool.Put(output)
+
+	r.mu.Lock()
+	if err := r.usableLocked(); err != nil {
+		r.mu.Unlock()
+		freeOwnedRawValues(rawArgs)
+		return Value{}, err
+	}
+	callErr := ffi.ReplCallRaw(r.handle, name, rawArgs, output)
+	r.mu.Unlock()
+	runtime.KeepAlive(arena)
+	if arena.ownsHandles {
+		freeOwnedRawValues(rawArgs)
+	}
+
+	printed := ffi.TakePrinted(output.Print, output.PrintFlags)
+	output.Print = ffi.Bytes{}
+	config := runConfig{stdout: r.config.stdout, stderr: r.config.stderr}
+	writeErr := writePrint(&config, printed)
+	if callErr != nil {
+		ffi.RawValueFree(&output.Value)
+		freeFastOutputBytes(output)
+		return Value{}, execError(callErr)
+	}
+	if writeErr != nil {
+		ffi.RawValueFree(&output.Value)
+		freeFastOutputBytes(output)
+		return Value{}, writeErr
+	}
+	return decodeFastOutput(output)
+}
+
+// FunctionNames lists the Python functions defined in the session.
+func (r *REPL) FunctionNames() ([]string, error) {
+	if r == nil {
+		return nil, ErrClosed
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.handle == 0 {
-		return nil, fmt.Errorf("monty: REPL is closed")
+	if err := r.usableLocked(); err != nil {
+		return nil, err
 	}
 	names, err := ffi.ReplFunctionNames(r.handle)
 	return names, normalizeError(err)
 }
 
-// HasFunction reports whether a Python function is currently defined in the REPL.
-func (r *Repl) HasFunction(name string) bool {
+// HasFunction reports whether the session defines a Python function.
+func (r *REPL) HasFunction(name string) bool {
 	if r == nil {
 		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.handle == 0 {
+	if r.usableLocked() != nil {
 		return false
 	}
 	return ffi.ReplHasFunction(r.handle, name)
 }
 
-// checkReplRunConfig rejects RunOptions the REPL cannot honor. The Rust REPL
-// FFI entry points only flush print output; per-call limits, host functions, OS
-// handlers, and mounts have no corresponding parameter, so accepting them
-// silently would be a sandbox-relevant lie (e.g. a caller passing WithLimits
-// believing the snippet is resource-capped). TODO: honoring WithLimits requires
-// a Rust-side mg_repl_feed_run variant that accepts limits.
-func checkReplRunConfig(config *runConfig) error {
-	if config.limits != nil || config.osHandler != nil ||
-		len(config.functions) != 0 || len(config.mounts) != 0 || len(config.mountDirs) != 0 {
-		return fmt.Errorf("monty: REPL calls support only WithStdout; use WithReplLimits for session-wide limits")
-	}
-	return nil
-}
-
-func replInputHandles(inputs any) ([]string, []uintptr, error) {
-	inputValues, err := normalizeInputs(inputs)
+// replInputs converts the inputs argument into parallel name/value arrays
+// for the FFI feed calls.
+func replInputs(inputs any) ([]string, []ffi.RawValue, *rawArena, error) {
+	values, err := inputsToValues(inputs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	names := slices.Sorted(maps.Keys(inputValues))
-	handles := make([]uintptr, len(names))
-	for i, name := range names {
-		handle, err := valueToHandle(inputValues[name])
+	arena := &rawArena{}
+	if len(values) == 0 {
+		return nil, nil, arena, nil
+	}
+	names := make([]string, 0, len(values))
+	raw := make([]ffi.RawValue, 0, len(values))
+	for name, value := range values {
+		converted, err := valueToRaw(value, arena)
 		if err != nil {
-			freeHandles(handles)
-			return nil, nil, err
+			freeOwnedRawValues(raw)
+			return nil, nil, nil, err
 		}
-		handles[i] = handle
+		names = append(names, name)
+		raw = append(raw, converted)
 	}
-	return names, handles, nil
+	return names, raw, arena, nil
 }
 
-// ReplContinuationMode describes whether interactive source is ready to run.
-type ReplContinuationMode uint32
+// --------------------------------------------------------------------------
+// Continuation detection
+// --------------------------------------------------------------------------
+
+// ContinuationMode reports whether interactive source is complete enough to
+// execute.
+type ContinuationMode uint32
 
 const (
-	// ReplComplete means the source is syntactically complete.
-	ReplComplete ReplContinuationMode = iota
-	// ReplIncompleteImplicit means more input is needed for an open expression.
-	ReplIncompleteImplicit
-	// ReplIncompleteBlock means an indented block needs a trailing blank line.
-	ReplIncompleteBlock
+	// ContinuationComplete means the source parses as a complete snippet.
+	ContinuationComplete ContinuationMode = iota
+	// ContinuationImplicit means the source ends inside an implicit
+	// continuation (open bracket, trailing operator).
+	ContinuationImplicit
+	// ContinuationBlock means the source ends inside an indented block.
+	ContinuationBlock
 )
 
-// String returns a stable display name for mode.
-func (mode ReplContinuationMode) String() string {
-	switch mode {
-	case ReplComplete:
+// String returns a stable display name for the mode.
+func (m ContinuationMode) String() string {
+	switch m {
+	case ContinuationComplete:
 		return "complete"
-	case ReplIncompleteImplicit:
+	case ContinuationImplicit:
 		return "incomplete-implicit"
-	case ReplIncompleteBlock:
+	case ContinuationBlock:
 		return "incomplete-block"
 	default:
-		return fmt.Sprintf("ReplContinuationMode(%d)", uint32(mode))
+		return fmt.Sprintf("ContinuationMode(%d)", uint32(m))
 	}
 }
 
-// DetectReplContinuationMode reports whether interactive source is ready to run.
-// It returns an error if the shared library cannot be loaded.
-func DetectReplContinuationMode(code string) (ReplContinuationMode, error) {
+// DetectContinuation classifies interactive source for REPL line editors.
+func DetectContinuation(code string) (ContinuationMode, error) {
 	mode, err := ffi.ReplContinuationMode(code)
 	if err != nil {
-		return ReplComplete, normalizeError(err)
+		return ContinuationComplete, err
 	}
-	return ReplContinuationMode(mode), nil
+	return ContinuationMode(mode), nil
 }
-
-var _ io.Closer = (*Repl)(nil)

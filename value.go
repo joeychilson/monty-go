@@ -1,16 +1,16 @@
 package monty
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"iter"
 	"math"
 	"reflect"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unsafe"
 
 	"github.com/joeychilson/monty/internal/ffi"
@@ -76,7 +76,13 @@ const (
 	CycleKind Kind = ffi.KindCycle
 )
 
-// Value is a Go representation of a Python value returned by or passed into Monty.
+// Value is a Go representation of a Python value returned by or passed into
+// Monty.
+//
+// Values are read-only views: accessors and iterators expose the underlying
+// storage without defensive copies, and constructors borrow the slices they
+// are given. Do not mutate a slice after wrapping it in a Value or one
+// obtained from a Value accessor.
 type Value struct {
 	kind       Kind
 	boolValue  bool
@@ -91,10 +97,10 @@ type Value struct {
 
 type valueExtra struct {
 	doc        string
-	date       MontyDate
-	datetime   MontyDateTime
-	timedelta  MontyTimeDelta
-	timezone   MontyTimeZone
+	date       Date
+	datetime   DateTime
+	timedelta  TimeDelta
+	timezone   TimeZone
 	typeName   string
 	typeID     uint64
 	fieldNames []string
@@ -111,66 +117,9 @@ type Pair struct {
 	Value Value
 }
 
-// MontyDate is the structured payload for a Python datetime.date value.
-type MontyDate struct {
-	Year  int
-	Month time.Month
-	Day   int
-}
-
-// MontyDateTime is the structured payload for a Python datetime.datetime value.
-//
-// HasOffset reports whether OffsetSeconds is present. HasTimezoneName reports
-// whether TimezoneName is present; Monty requires a timezone name to be absent
-// for naive datetimes.
-type MontyDateTime struct {
-	Year            int
-	Month           time.Month
-	Day             int
-	Hour            int
-	Minute          int
-	Second          int
-	Microsecond     int
-	OffsetSeconds   int
-	HasOffset       bool
-	TimezoneName    string
-	HasTimezoneName bool
-}
-
-// MontyTimeDelta is the structured payload for a Python datetime.timedelta value.
-type MontyTimeDelta struct {
-	Days         int
-	Seconds      int
-	Microseconds int
-}
-
-// MontyTimeZone is the structured payload for a Python datetime.timezone value.
-type MontyTimeZone struct {
-	OffsetSeconds int
-	Name          string
-	HasName       bool
-}
-
-// MontyNamedTuple is the structured payload for a Python namedtuple value.
-type MontyNamedTuple struct {
-	TypeName   string
-	FieldNames []string
-	Values     []Value
-}
-
-// MontyDataclass is the structured payload for a Python dataclass value.
-type MontyDataclass struct {
-	Name       string
-	TypeID     uint64
-	FieldNames []string
-	Attrs      []Pair
-	Frozen     bool
-}
-
-// MontyException is the structured payload for a Python exception value.
-type MontyException struct {
-	Type    string
-	Message string
+// KV builds a string-keyed dict entry.
+func KV(key string, value Value) Pair {
+	return Pair{Key: Str(key), Value: value}
 }
 
 // String returns a stable display name for k.
@@ -231,7 +180,7 @@ func (k Kind) String() string {
 	case CycleKind:
 		return "Cycle"
 	default:
-		return fmt.Sprintf("Kind(%d)", k)
+		return fmt.Sprintf("Kind(%d)", uint32(k))
 	}
 }
 
@@ -259,197 +208,114 @@ func Float(v float64) Value { return Value{kind: FloatKind, floatValue: v} }
 // Str returns a Python str.
 func Str(v string) Value { return Value{kind: StringKind, text: v} }
 
-// Path returns a pathlib path value.
-func Path(v string) Value { return Value{kind: PathKind, text: v} }
+// Bytes returns a Python bytes value. The slice is borrowed, not copied; do
+// not mutate it afterwards.
+func Bytes(v []byte) Value { return Value{kind: BytesKind, bytes: v} }
 
-// Bytes returns a Python bytes value.
-func Bytes(v []byte) Value { return Value{kind: BytesKind, bytes: slices.Clone(v)} }
+// List returns a Python list. The values are borrowed, not copied.
+func List(v ...Value) Value { return Value{kind: ListKind, items: v} }
 
-// List returns a Python list.
-func List(v ...Value) Value { return sequenceValue(ListKind, slices.Clone(v)) }
+// Tuple returns a Python tuple. The values are borrowed, not copied.
+func Tuple(v ...Value) Value { return Value{kind: TupleKind, items: v} }
 
-// Tuple returns a Python tuple.
-func Tuple(v ...Value) Value { return sequenceValue(TupleKind, slices.Clone(v)) }
+// Set returns a Python set. The values are borrowed, not copied.
+func Set(v ...Value) Value { return Value{kind: SetKind, items: v} }
 
-// NamedTuple returns a Python namedtuple.
-func NamedTuple(typeName string, fieldNames []string, values ...Value) Value {
-	return Value{
-		kind:  NamedTupleKind,
-		items: slices.Clone(values),
-		valueExtra: &valueExtra{
-			typeName:   typeName,
-			fieldNames: slices.Clone(fieldNames),
-		},
-	}
-}
+// FrozenSet returns a Python frozenset. The values are borrowed, not copied.
+func FrozenSet(v ...Value) Value { return Value{kind: FrozenSetKind, items: v} }
 
-// Dict returns a Python dict.
-func Dict(pairs ...Pair) Value { return dictValue(slices.Clone(pairs)) }
+// Dict returns a Python dict. The pairs are borrowed, not copied.
+func Dict(pairs ...Pair) Value { return Value{kind: DictKind, pairs: pairs} }
 
-// Set returns a Python set.
-func Set(v ...Value) Value { return sequenceValue(SetKind, slices.Clone(v)) }
-
-// FrozenSet returns a Python frozenset.
-func FrozenSet(v ...Value) Value { return sequenceValue(FrozenSetKind, slices.Clone(v)) }
-
-func sequenceValue(kind Kind, items []Value) Value {
-	// The FFI mirror slice is built on demand by valueToRaw (via the arena) when
-	// the value actually crosses the boundary, so constructors do not build one
-	// eagerly: values that are only inspected or never sent to Rust pay nothing.
-	return Value{kind: kind, items: items}
-}
-
-func dictValue(pairs []Pair) Value {
-	return Value{kind: DictKind, pairs: pairs}
-}
-
-// Date returns a Python datetime.date.
-func Date(year int, month time.Month, day int) Value {
-	return DateValue(MontyDate{Year: year, Month: month, Day: day})
-}
-
-// DateValue returns a Python datetime.date from a structured date payload.
-func DateValue(date MontyDate) Value {
-	return Value{kind: DateKind, valueExtra: &valueExtra{date: date}}
-}
-
-// DateTime returns a Python datetime.datetime from a structured datetime payload.
-func DateTime(value MontyDateTime) Value {
-	return Value{kind: DateTimeKind, valueExtra: &valueExtra{datetime: value}}
-}
-
-// TimeDelta returns a Python datetime.timedelta.
-func TimeDelta(days, seconds, microseconds int) Value {
-	return TimeDeltaValue(MontyTimeDelta{Days: days, Seconds: seconds, Microseconds: microseconds})
-}
-
-// TimeDeltaValue returns a Python datetime.timedelta from a structured duration payload.
-func TimeDeltaValue(delta MontyTimeDelta) Value {
-	return Value{kind: TimeDeltaKind, valueExtra: &valueExtra{timedelta: delta}}
-}
-
-// TimeZone returns a Python datetime.timezone. An empty name is treated as absent.
-func TimeZone(offsetSeconds int, name string) Value {
-	return TimeZoneValue(MontyTimeZone{
-		OffsetSeconds: offsetSeconds,
-		Name:          name,
-		HasName:       name != "",
-	})
-}
-
-// TimeZoneValue returns a Python datetime.timezone from a structured timezone payload.
-func TimeZoneValue(tz MontyTimeZone) Value {
-	return Value{kind: TimeZoneKind, valueExtra: &valueExtra{timezone: tz}}
-}
-
-// Dataclass returns a Python dataclass instance.
-func Dataclass(name string, typeID uint64, fieldNames []string, attrs []Pair, frozen bool) Value {
-	return Value{
-		kind:  DataclassKind,
-		pairs: slices.Clone(attrs),
-		valueExtra: &valueExtra{
-			typeName:   name,
-			typeID:     typeID,
-			fieldNames: slices.Clone(fieldNames),
-			frozen:     frozen,
-		},
-	}
-}
-
-// ExternalFunction returns a Python function placeholder resolved by NameLookup.
-func ExternalFunction(name string) Value {
-	return Value{kind: FunctionKind, text: name}
-}
-
-// FunctionValue returns a Python function placeholder with an optional docstring.
-func FunctionValue(name, doc string) Value {
-	return Value{kind: FunctionKind, text: name, valueExtra: &valueExtra{doc: doc}}
-}
-
-// Exception returns a Python exception value.
-func Exception(excType, message string) Value {
-	if excType == "" {
-		excType = "RuntimeError"
-	}
-	return Value{kind: ExceptionKind, text: message, valueExtra: &valueExtra{typeName: excType}}
-}
-
-// StringDict returns a Python dict with string keys.
+// StringDict returns a Python dict with string keys. Iteration order over the
+// map is unspecified, so the resulting dict order is too.
 func StringDict(values map[string]Value) Value {
 	pairs := make([]Pair, 0, len(values))
 	for key, value := range values {
 		pairs = append(pairs, Pair{Key: Str(key), Value: value})
 	}
-	return dictValue(pairs)
+	return Value{kind: DictKind, pairs: pairs}
+}
+
+// ExternalFunction returns a Python function placeholder, typically used to
+// answer a NameLookup for a host-provided function.
+func ExternalFunction(name string) Value {
+	return Value{kind: FunctionKind, text: name}
+}
+
+func functionValue(name, doc string) Value {
+	if doc == "" {
+		return Value{kind: FunctionKind, text: name}
+	}
+	return Value{kind: FunctionKind, text: name, valueExtra: &valueExtra{doc: doc}}
+}
+
+func exceptionValue(excType, message string) Value {
+	return Exception{Type: excType, Message: message}.MontyValue()
 }
 
 // Kind returns the Python value kind.
 func (v Value) Kind() Kind { return v.kind }
 
-// Bool returns the underlying bool.
+// Bool returns the underlying bool, or false for other kinds.
 func (v Value) Bool() bool { return v.boolValue }
 
-// Int64 returns the underlying int64.
+// Int64 returns the underlying int64, or 0 for other kinds.
 func (v Value) Int64() int64 { return v.intValue }
 
-// Int returns the underlying int as a Go int.
+// Int returns the underlying int as a Go int, or 0 for other kinds.
 func (v Value) Int() int { return int(v.intValue) }
 
-// Float64 returns the underlying float64.
+// Float64 returns the underlying float64, or 0 for other kinds.
 func (v Value) Float64() float64 { return v.floatValue }
 
-// Str returns the underlying string.
+// Str returns the textual payload: the string itself for str values, and the
+// text form of string-like kinds (big ints, paths, reprs, function names).
 func (v Value) Str() string { return v.text }
 
-// Path returns the underlying pathlib path string.
-func (v Value) Path() string { return v.text }
+// Path returns the underlying pathlib path.
+func (v Value) Path() Path { return Path(v.text) }
 
-// Bytes returns a copy of the underlying byte slice.
-func (v Value) Bytes() []byte { return slices.Clone(v.bytes) }
-
-// Items returns a copy of the sequence items.
-func (v Value) Items() []Value { return slices.Clone(v.items) }
-
-// Pairs returns a copy of the dict pairs.
-func (v Value) Pairs() []Pair { return slices.Clone(v.pairs) }
+// Bytes returns the underlying byte slice as a read-only view (no copy).
+func (v Value) Bytes() []byte { return v.bytes }
 
 // Date returns the structured datetime.date payload.
-func (v Value) Date() MontyDate { return v.extraPtr().date }
+func (v Value) Date() Date { return v.extraPtr().date }
 
 // DateTime returns the structured datetime.datetime payload.
-func (v Value) DateTime() MontyDateTime { return v.extraPtr().datetime }
+func (v Value) DateTime() DateTime { return v.extraPtr().datetime }
 
 // TimeDelta returns the structured datetime.timedelta payload.
-func (v Value) TimeDelta() MontyTimeDelta { return v.extraPtr().timedelta }
+func (v Value) TimeDelta() TimeDelta { return v.extraPtr().timedelta }
 
 // TimeZone returns the structured datetime.timezone payload.
-func (v Value) TimeZone() MontyTimeZone { return v.extraPtr().timezone }
+func (v Value) TimeZone() TimeZone { return v.extraPtr().timezone }
 
-// NamedTuple returns a copy of the namedtuple metadata and values.
-func (v Value) NamedTuple() MontyNamedTuple {
+// NamedTuple returns the namedtuple payload as a read-only view.
+func (v Value) NamedTuple() NamedTuple {
 	extra := v.extraPtr()
-	return MontyNamedTuple{
-		TypeName:   extra.typeName,
-		FieldNames: slices.Clone(extra.fieldNames),
-		Values:     slices.Clone(v.items),
+	return NamedTuple{
+		Type:   extra.typeName,
+		Fields: extra.fieldNames,
+		Values: v.items,
 	}
 }
 
-// Dataclass returns a copy of the dataclass metadata and attributes.
-func (v Value) Dataclass() MontyDataclass {
+// Dataclass returns the dataclass payload as a read-only view.
+func (v Value) Dataclass() DataclassValue {
 	extra := v.extraPtr()
-	return MontyDataclass{
-		Name:       extra.typeName,
-		TypeID:     extra.typeID,
-		FieldNames: slices.Clone(extra.fieldNames),
-		Attrs:      slices.Clone(v.pairs),
-		Frozen:     extra.frozen,
+	return DataclassValue{
+		Name:   extra.typeName,
+		TypeID: extra.typeID,
+		Fields: extra.fieldNames,
+		Attrs:  v.pairs,
+		Frozen: extra.frozen,
 	}
 }
 
 // Exception returns the structured exception payload.
-func (v Value) Exception() MontyException {
-	return MontyException{Type: v.extraPtr().typeName, Message: v.text}
+func (v Value) Exception() Exception {
+	return Exception{Type: v.extraPtr().typeName, Message: v.text}
 }
 
 func (v Value) extraPtr() *valueExtra {
@@ -459,93 +325,146 @@ func (v Value) extraPtr() *valueExtra {
 	return &emptyValueExtra
 }
 
-// Time returns date as midnight UTC.
-func (d MontyDate) Time() time.Time {
-	return time.Date(d.Year, d.Month, d.Day, 0, 0, 0, 0, time.UTC)
-}
-
-// MontyDateFromTime converts a Go time to a Python date payload.
-func MontyDateFromTime(t time.Time) MontyDate {
-	return MontyDate{Year: t.Year(), Month: t.Month(), Day: t.Day()}
-}
-
-// Time converts datetime to a Go time.Time.
-//
-// An aware datetime (HasOffset) is placed in a fixed zone built from its UTC
-// offset and timezone name. A naive datetime is interpreted as UTC — including
-// one that carries a timezone name but no resolved offset, since the offset is
-// then unknown and cannot be materialized. Inspect the MontyDateTime fields
-// directly to distinguish naive from aware.
-func (dt MontyDateTime) Time() time.Time {
-	location := time.UTC
-	if dt.HasOffset {
-		location = time.FixedZone(dt.TimezoneName, dt.OffsetSeconds)
-	}
-	return time.Date(
-		dt.Year,
-		dt.Month,
-		dt.Day,
-		dt.Hour,
-		dt.Minute,
-		dt.Second,
-		dt.Microsecond*int(time.Microsecond),
-		location,
-	)
-}
-
-// MontyDateTimeFromTime converts a Go time to a Python datetime payload.
-func MontyDateTimeFromTime(t time.Time) MontyDateTime {
-	name, offset := t.Zone()
-	return MontyDateTime{
-		Year:            t.Year(),
-		Month:           t.Month(),
-		Day:             t.Day(),
-		Hour:            t.Hour(),
-		Minute:          t.Minute(),
-		Second:          t.Second(),
-		Microsecond:     t.Nanosecond() / int(time.Microsecond),
-		OffsetSeconds:   offset,
-		HasOffset:       true,
-		TimezoneName:    name,
-		HasTimezoneName: name != "",
+// Len returns the element count for sequences, sets, namedtuples, dicts, and
+// dataclasses, the byte length for str/bytes payloads, and 0 otherwise.
+func (v Value) Len() int {
+	switch v.kind {
+	case ListKind, TupleKind, SetKind, FrozenSetKind, NamedTupleKind:
+		return len(v.items)
+	case DictKind, DataclassKind:
+		return len(v.pairs)
+	case StringKind:
+		return len(v.text)
+	case BytesKind:
+		return len(v.bytes)
+	default:
+		return 0
 	}
 }
 
-// Duration converts a Python timedelta payload to time.Duration when it fits.
-func (d MontyTimeDelta) Duration() (time.Duration, bool) {
-	const (
-		microsPerSecond = int64(1_000_000)
-		microsPerDay    = int64(86_400_000_000)
-	)
-	maxMicros := int64(math.MaxInt64) / int64(time.Microsecond)
-	minMicros := int64(math.MinInt64) / int64(time.Microsecond)
-	days := int64(d.Days)
-	if days > maxMicros/microsPerDay || days < minMicros/microsPerDay {
-		return 0, false
+// Index returns the i-th element of a sequence, set, or namedtuple, or the
+// zero Value when out of range or not a sequence.
+func (v Value) Index(i int) Value {
+	if i < 0 || i >= len(v.items) {
+		return Value{}
 	}
-	totalMicros := days*microsPerDay + int64(d.Seconds)*microsPerSecond + int64(d.Microseconds)
-	if totalMicros > maxMicros || totalMicros < minMicros {
-		return 0, false
-	}
-	return time.Duration(totalMicros) * time.Microsecond, true
+	return v.items[i]
 }
 
-// MontyTimeDeltaFromDuration converts a Go duration to a normalized Python timedelta payload.
-func MontyTimeDeltaFromDuration(duration time.Duration) MontyTimeDelta {
-	totalMicros := int64(duration / time.Microsecond)
-	days := totalMicros / 86_400_000_000
-	remaining := totalMicros % 86_400_000_000
-	if remaining < 0 {
-		days--
-		remaining += 86_400_000_000
+// Get looks up a dict (or dataclass attribute) entry by key. The key is
+// converted with the same rules as From; string keys take a fast path.
+func (v Value) Get(key any) (Value, bool) {
+	if v.kind != DictKind && v.kind != DataclassKind {
+		return Value{}, false
 	}
-	seconds := remaining / 1_000_000
-	micros := remaining % 1_000_000
-	return MontyTimeDelta{
-		Days:         int(days),
-		Seconds:      int(seconds),
-		Microseconds: int(micros),
+	if name, ok := key.(string); ok {
+		for i := range v.pairs {
+			pair := &v.pairs[i]
+			if pair.Key.kind == StringKind && pair.Key.text == name {
+				return pair.Value, true
+			}
+		}
+		return Value{}, false
 	}
+	converted, err := From(key)
+	if err != nil {
+		return Value{}, false
+	}
+	for i := range v.pairs {
+		if valueEqual(v.pairs[i].Key, converted) {
+			return v.pairs[i].Value, true
+		}
+	}
+	return Value{}, false
+}
+
+// Attr returns a namedtuple field or dataclass attribute by name.
+func (v Value) Attr(name string) (Value, bool) {
+	switch v.kind {
+	case NamedTupleKind:
+		for i, field := range v.extraPtr().fieldNames {
+			if field == name && i < len(v.items) {
+				return v.items[i], true
+			}
+		}
+		return Value{}, false
+	case DataclassKind:
+		return v.Get(name)
+	default:
+		return Value{}, false
+	}
+}
+
+// Elems iterates the elements of a list, tuple, set, frozenset, or
+// namedtuple without copying. Yields nothing for other kinds.
+func (v Value) Elems() iter.Seq[Value] {
+	items := v.items
+	return func(yield func(Value) bool) {
+		for i := range items {
+			if !yield(items[i]) {
+				return
+			}
+		}
+	}
+}
+
+// Entries iterates the key/value pairs of a dict or dataclass in insertion
+// order without copying. Yields nothing for other kinds.
+func (v Value) Entries() iter.Seq2[Value, Value] {
+	pairs := v.pairs
+	return func(yield func(Value, Value) bool) {
+		for i := range pairs {
+			if !yield(pairs[i].Key, pairs[i].Value) {
+				return
+			}
+		}
+	}
+}
+
+// valueEqual reports semantic equality for hashable-style keys: scalars,
+// strings, bytes, and tuples thereof. Non-comparable kinds are never equal.
+func valueEqual(a, b Value) bool {
+	if a.kind != b.kind {
+		// Python: True == 1, 1 == 1.0. Keep it strict by kind except the
+		// int/float overlap, which round-trips often.
+		if (a.kind == IntKind && b.kind == FloatKind) || (a.kind == FloatKind && b.kind == IntKind) {
+			return a.asFloat() == b.asFloat()
+		}
+		return false
+	}
+	switch a.kind {
+	case NoneKind, EllipsisKind:
+		return true
+	case BoolKind:
+		return a.boolValue == b.boolValue
+	case IntKind:
+		return a.intValue == b.intValue
+	case FloatKind:
+		return a.floatValue == b.floatValue
+	case StringKind, BigIntKind, PathKind:
+		return a.text == b.text
+	case BytesKind:
+		return bytes.Equal(a.bytes, b.bytes)
+	case TupleKind:
+		if len(a.items) != len(b.items) {
+			return false
+		}
+		for i := range a.items {
+			if !valueEqual(a.items[i], b.items[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (v Value) asFloat() float64 {
+	if v.kind == IntKind {
+		return float64(v.intValue)
+	}
+	return v.floatValue
 }
 
 // String returns a Python-like representation of v.
@@ -609,7 +528,7 @@ func (v Value) String() string {
 		// Only an aware datetime carries a timezone suffix; a naive datetime
 		// prints without one rather than claiming a UTC ("Z") it never asserted.
 		layout := "2006-01-02T15:04:05.999999"
-		if datetime.HasOffset {
+		if datetime.TZ != nil {
 			layout += "Z07:00"
 		}
 		return datetime.Time().Format(layout)
@@ -618,11 +537,11 @@ func (v Value) String() string {
 		return fmt.Sprintf("%dd %ds %dus", delta.Days, delta.Seconds, delta.Microseconds)
 	case TimeZoneKind:
 		timezone := v.extraPtr().timezone
-		if timezone.HasName {
+		if timezone.Name != "" {
 			return timezone.Name
 		}
+		offset := int(timezone.Offset / time.Second)
 		sign := "+"
-		offset := timezone.OffsetSeconds
 		if offset < 0 {
 			sign = "-"
 			offset = -offset
@@ -672,7 +591,8 @@ func valuesToStrings(values []Value) []string {
 	return formatted
 }
 
-// Interface converts v into ordinary Go values.
+// Interface converts v into ordinary Go values: nil, bool, int64, float64,
+// string, []byte, []any, map[any]any, and the package payload types.
 func (v Value) Interface() any {
 	switch v.kind {
 	case NoneKind:
@@ -683,12 +603,14 @@ func (v Value) Interface() any {
 		return v.intValue
 	case FloatKind:
 		return v.floatValue
-	case StringKind, BigIntKind, PathKind, ReprKind, CycleKind, FunctionKind, TypeKind, BuiltinFunctionKind:
+	case StringKind, BigIntKind, ReprKind, CycleKind, FunctionKind, TypeKind, BuiltinFunctionKind:
 		return v.text
+	case PathKind:
+		return Path(v.text)
 	case ExceptionKind:
 		return v.Exception()
 	case BytesKind:
-		return v.Bytes()
+		return v.bytes
 	case ListKind, TupleKind, SetKind, FrozenSetKind:
 		items := make([]any, len(v.items))
 		// Index rather than range to avoid copying each ~100-byte Value element.
@@ -729,156 +651,24 @@ func (v Value) Interface() any {
 	}
 }
 
-// From converts a Go value into a Monty Value.
+// MarshalJSON returns Monty's natural JSON form for v.
 //
-// Struct fields use the same `monty` tag rules as InputsOf.
-func From(value any) (Value, error) {
-	return valueFromReflect(reflect.ValueOf(value), 0)
+// It intentionally mirrors upstream JsonMontyObject semantics: JSON-native
+// values serialize directly, while Python-only values use tagged objects such
+// as {"$tuple": [...]} or {"$bytes": [...]}.
+func (v Value) MarshalJSON() ([]byte, error) {
+	handle, err := valueToHandle(v)
+	if err != nil {
+		return nil, err
+	}
+	defer ffi.ValueFree(handle)
+	json, err := ffi.ValueJSON(handle)
+	return json, normalizeError(err)
 }
 
-func valueFromReflect(reflectValue reflect.Value, depth int) (Value, error) {
-	if depth > 100 {
-		return Value{}, fmt.Errorf("monty: max conversion depth exceeded")
-	}
-	if !reflectValue.IsValid() {
-		return None(), nil
-	}
-	if reflectValue.Type() == reflect.TypeFor[Value]() {
-		value, ok := reflectValue.Interface().(Value)
-		if !ok {
-			return Value{}, fmt.Errorf("monty: expected Value, got %T", reflectValue.Interface())
-		}
-		return value, nil
-	}
-	if reflectValue.CanInterface() {
-		switch value := reflectValue.Interface().(type) {
-		case MontyDate:
-			return DateValue(value), nil
-		case MontyDateTime:
-			return DateTime(value), nil
-		case MontyTimeDelta:
-			return TimeDeltaValue(value), nil
-		case MontyTimeZone:
-			return TimeZoneValue(value), nil
-		case MontyNamedTuple:
-			return NamedTuple(value.TypeName, value.FieldNames, value.Values...), nil
-		case MontyDataclass:
-			return Dataclass(value.Name, value.TypeID, value.FieldNames, value.Attrs, value.Frozen), nil
-		case time.Time:
-			return DateTime(MontyDateTimeFromTime(value)), nil
-		case time.Duration:
-			return TimeDeltaValue(MontyTimeDeltaFromDuration(value)), nil
-		}
-	}
-	if reflectValue.Kind() == reflect.Pointer || reflectValue.Kind() == reflect.Interface {
-		if reflectValue.IsNil() {
-			return None(), nil
-		}
-		return valueFromReflect(reflectValue.Elem(), depth+1)
-	}
-	switch reflectValue.Kind() {
-	case reflect.Bool:
-		return Bool(reflectValue.Bool()), nil
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return Int64(reflectValue.Int()), nil
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		unsigned := reflectValue.Uint()
-		if unsigned > math.MaxInt64 {
-			return Value{kind: BigIntKind, text: strconv.FormatUint(unsigned, 10)}, nil
-		}
-		return Int64(int64(unsigned)), nil
-	case reflect.Float32, reflect.Float64:
-		return Float(reflectValue.Float()), nil
-	case reflect.String:
-		return Str(reflectValue.String()), nil
-	case reflect.Slice:
-		if reflectValue.Type().Elem().Kind() == reflect.Uint8 {
-			return Bytes(reflectValue.Bytes()), nil
-		}
-		fallthrough
-	case reflect.Array:
-		items := make([]Value, reflectValue.Len())
-		for i := range reflectValue.Len() {
-			item, err := valueFromReflect(reflectValue.Index(i), depth+1)
-			if err != nil {
-				return Value{}, err
-			}
-			items[i] = item
-		}
-		return sequenceValue(ListKind, items), nil
-	case reflect.Map:
-		pairs := make([]Pair, 0, reflectValue.Len())
-		for k, v := range reflectValue.Seq2() {
-			key, err := valueFromReflect(k, depth+1)
-			if err != nil {
-				return Value{}, err
-			}
-			value, err := valueFromReflect(v, depth+1)
-			if err != nil {
-				return Value{}, err
-			}
-			pairs = append(pairs, Pair{Key: key, Value: value})
-		}
-		return dictValue(pairs), nil
-	case reflect.Struct:
-		return structToValue(reflectValue, depth+1)
-	default:
-		return Value{}, fmt.Errorf("monty: cannot convert %s to Value", reflectValue.Type())
-	}
-}
-
-func structToValue(structValue reflect.Value, depth int) (Value, error) {
-	pairs := make([]Pair, 0, structValue.NumField())
-	for field, fieldValue := range structValue.Fields() {
-		if field.PkgPath != "" {
-			continue
-		}
-		name, ok := fieldName(field)
-		if !ok {
-			continue
-		}
-		value, err := valueFromReflect(fieldValue, depth+1)
-		if err != nil {
-			return Value{}, err
-		}
-		pairs = append(pairs, Pair{Key: Str(name), Value: value})
-	}
-	return dictValue(pairs), nil
-}
-
-func fieldName(field reflect.StructField) (string, bool) {
-	tag := field.Tag.Get("monty")
-	if tag == "-" {
-		return "", false
-	}
-	if name, _, _ := strings.Cut(tag, ","); name != "" {
-		return name, true
-	}
-	return snakeCase(field.Name), true
-}
-
-// snakeCase converts a Go field name to a Python-style snake_case input name.
-// It is acronym-aware and Unicode-aware: an underscore is inserted before an
-// upper-case rune only when it begins a new word — i.e. the previous rune is
-// not upper-case, or it ends an acronym (previous rune upper-case, next rune
-// lower-case). So HTTPTimeout -> http_timeout, UserID -> user_id,
-// APIKey2 -> api_key2, and an already-snake name is left unchanged.
-func snakeCase(name string) string {
-	runes := []rune(name)
-	var b strings.Builder
-	b.Grow(len(name) + 4)
-	for i, r := range runes {
-		if i > 0 && unicode.IsUpper(r) {
-			prevIsUpper := unicode.IsUpper(runes[i-1])
-			nextIsLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
-			if !prevIsUpper || nextIsLower {
-				b.WriteByte('_')
-			}
-		}
-		b.WriteRune(unicode.ToLower(r))
-	}
-	return b.String()
-}
+// --------------------------------------------------------------------------
+// FFI encode (Value -> RawValue / handle)
+// --------------------------------------------------------------------------
 
 type rawArena struct {
 	rawValueSlices [][]ffi.RawValue
@@ -1165,34 +955,35 @@ func dataclassHandle(v Value) (uintptr, error) {
 	return handle, err
 }
 
-func toFFIDate(date MontyDate) ffi.Date {
+func toFFIDate(date Date) ffi.Date {
 	//nolint:gosec // Python date fields are bounded: year fits int32, month/day fit uint8
 	return ffi.Date{Year: int32(date.Year), Month: uint8(date.Month), Day: uint8(date.Day)}
 }
 
-func toFFIDateTime(value MontyDateTime) ffi.DateTime {
+func toFFIDateTime(value DateTime) ffi.DateTime {
 	//nolint:gosec // Python datetime fields are bounded by their calendar/clock ranges
 	raw := ffi.DateTime{
-		Year:          int32(value.Year),
-		Microsecond:   uint32(value.Microsecond),
-		OffsetSeconds: int32(value.OffsetSeconds),
-		Month:         uint8(value.Month),
-		Day:           uint8(value.Day),
-		Hour:          uint8(value.Hour),
-		Minute:        uint8(value.Minute),
-		Second:        uint8(value.Second),
+		Year:        int32(value.Year),
+		Microsecond: uint32(value.Microsecond),
+		Month:       uint8(value.Month),
+		Day:         uint8(value.Day),
+		Hour:        uint8(value.Hour),
+		Minute:      uint8(value.Minute),
+		Second:      uint8(value.Second),
 	}
-	if value.HasOffset {
+	if value.TZ != nil {
 		raw.HasOffset = 1
-	}
-	if value.HasTimezoneName {
-		raw.HasTimezone = 1
-		raw.TimezoneName = ffi.Bytes{Ptr: unsafe.Pointer(unsafe.StringData(value.TimezoneName)), Len: uintptr(len(value.TimezoneName))}
+		//nolint:gosec // timezone offsets are bounded to ±24h in seconds; fits int32
+		raw.OffsetSeconds = int32(value.TZ.Offset / time.Second)
+		if value.TZ.Name != "" {
+			raw.HasTimezone = 1
+			raw.TimezoneName = ffi.Bytes{Ptr: unsafe.Pointer(unsafe.StringData(value.TZ.Name)), Len: uintptr(len(value.TZ.Name))}
+		}
 	}
 	return raw
 }
 
-func toFFITimeDelta(value MontyTimeDelta) ffi.TimeDelta {
+func toFFITimeDelta(value TimeDelta) ffi.TimeDelta {
 	//nolint:gosec // Python timedelta fields fit int32 (days bounded to ~±1e9 by Python)
 	return ffi.TimeDelta{
 		Days:         int32(value.Days),
@@ -1201,55 +992,52 @@ func toFFITimeDelta(value MontyTimeDelta) ffi.TimeDelta {
 	}
 }
 
-func toFFITimeZone(value MontyTimeZone) ffi.TimeZone {
+func toFFITimeZone(value TimeZone) ffi.TimeZone {
 	//nolint:gosec // timezone offset bounded to ±14h in seconds; fits int32
-	raw := ffi.TimeZone{OffsetSeconds: int32(value.OffsetSeconds)}
-	if value.HasName {
+	raw := ffi.TimeZone{OffsetSeconds: int32(value.Offset / time.Second)}
+	if value.Name != "" {
 		raw.HasName = 1
 		raw.Name = ffi.Bytes{Ptr: unsafe.Pointer(unsafe.StringData(value.Name)), Len: uintptr(len(value.Name))}
 	}
 	return raw
 }
 
-func fromFFIDate(date ffi.Date) MontyDate {
-	return MontyDate{Year: int(date.Year), Month: time.Month(date.Month), Day: int(date.Day)}
+func fromFFIDate(date ffi.Date) Date {
+	return Date{Year: int(date.Year), Month: time.Month(date.Month), Day: int(date.Day)}
 }
 
-func fromFFIDateTime(value ffi.DateTime) MontyDateTime {
-	return MontyDateTime{
-		Year:            int(value.Year),
-		Month:           time.Month(value.Month),
-		Day:             int(value.Day),
-		Hour:            int(value.Hour),
-		Minute:          int(value.Minute),
-		Second:          int(value.Second),
-		Microsecond:     int(value.Microsecond),
-		OffsetSeconds:   int(value.OffsetSeconds),
-		HasOffset:       value.HasOffset != 0,
-		TimezoneName:    ffi.TakeString(value.TimezoneName),
-		HasTimezoneName: value.HasTimezone != 0,
+func fromFFIDateTime(value ffi.DateTime) DateTime {
+	dt := DateTime{
+		Year:        int(value.Year),
+		Month:       time.Month(value.Month),
+		Day:         int(value.Day),
+		Hour:        int(value.Hour),
+		Minute:      int(value.Minute),
+		Second:      int(value.Second),
+		Microsecond: int(value.Microsecond),
 	}
+	name := ffi.TakeString(value.TimezoneName)
+	if value.HasOffset != 0 || value.HasTimezone != 0 {
+		dt.TZ = &TimeZone{
+			Offset: time.Duration(value.OffsetSeconds) * time.Second,
+			Name:   name,
+		}
+	}
+	return dt
 }
 
-func fromFFITimeDelta(value ffi.TimeDelta) MontyTimeDelta {
-	return MontyTimeDelta{
+func fromFFITimeDelta(value ffi.TimeDelta) TimeDelta {
+	return TimeDelta{
 		Days:         int(value.Days),
 		Seconds:      int(value.Seconds),
 		Microseconds: int(value.Microseconds),
 	}
 }
 
-func fromFFITimeZone(value ffi.TimeZone) MontyTimeZone {
-	return MontyTimeZone{
-		OffsetSeconds: int(value.OffsetSeconds),
-		Name:          ffi.TakeString(value.Name),
-		HasName:       value.HasName != 0,
-	}
-}
-
-func freeHandles(handles []uintptr) {
-	for _, handle := range handles {
-		ffi.ValueFree(handle)
+func fromFFITimeZone(value ffi.TimeZone) TimeZone {
+	return TimeZone{
+		Offset: time.Duration(value.OffsetSeconds) * time.Second,
+		Name:   ffi.TakeString(value.Name),
 	}
 }
 
@@ -1314,8 +1102,8 @@ func freeOwnedRawValue(value *ffi.RawValue) {
 	}
 	// Zero unconditionally so a repeat call is a no-op, mirroring the Rust
 	// free_raw_value which resets to KIND_INVALID. The raw slices reaching here
-	// are built fresh per call by valueToRaw (the eager, shared mirror was
-	// removed), so clearing a container slot cannot corrupt a value's state.
+	// are built fresh per call by valueToRaw, so clearing a container slot
+	// cannot corrupt a value's state.
 	*value = ffi.RawValue{}
 }
 
@@ -1331,6 +1119,10 @@ func freeOwnedRawPairs(pairs []ffi.RawPair) {
 		freeOwnedRawValue(&pairs[i].Value)
 	}
 }
+
+// --------------------------------------------------------------------------
+// FFI decode (handle / RawValue / flat bytes -> Value)
+// --------------------------------------------------------------------------
 
 func decodeValue(handle uintptr) (Value, error) {
 	if handle == 0 {
@@ -1363,10 +1155,10 @@ func decodeValue(handle uintptr) (Value, error) {
 		if err != nil {
 			return Value{}, normalizeError(err)
 		}
-		return Exception(excType, message), nil
+		return exceptionValue(excType, message), nil
 	case BytesKind:
-		bytes, err := ffi.ValueBytesGet(handle)
-		return Value{kind: BytesKind, bytes: bytes}, err
+		data, err := ffi.ValueBytesGet(handle)
+		return Value{kind: BytesKind, bytes: data}, err
 	case ListKind, TupleKind, SetKind, FrozenSetKind:
 		return decodeSequence(handle, kind)
 	case NamedTupleKind:
@@ -1375,16 +1167,16 @@ func decodeValue(handle uintptr) (Value, error) {
 		return decodeDict(handle, kind)
 	case DateKind:
 		date, err := ffi.ValueDateGet(handle)
-		return DateValue(fromFFIDate(date)), err
+		return fromFFIDate(date).MontyValue(), err
 	case DateTimeKind:
 		datetime, err := ffi.ValueDateTimeGet(handle)
-		return DateTime(fromFFIDateTime(datetime)), err
+		return fromFFIDateTime(datetime).MontyValue(), err
 	case TimeDeltaKind:
 		delta, err := ffi.ValueTimeDeltaGet(handle)
-		return TimeDeltaValue(fromFFITimeDelta(delta)), err
+		return fromFFITimeDelta(delta).MontyValue(), err
 	case TimeZoneKind:
 		tz, err := ffi.ValueTimeZoneGet(handle)
-		return TimeZoneValue(fromFFITimeZone(tz)), err
+		return fromFFITimeZone(tz).MontyValue(), err
 	case DataclassKind:
 		return decodeDataclass(handle)
 	default:
@@ -1536,13 +1328,13 @@ func decodeRawValueIntern(raw *ffi.RawValue, stringCache map[string]string) (Val
 		text := ffi.TakeString(ffi.Bytes{Ptr: raw.Ptr, Len: raw.Len})
 		*raw = ffi.RawValue{}
 		if excType, message, ok := strings.Cut(text, ": "); ok && excType != "" {
-			return Exception(excType, message), nil
+			return exceptionValue(excType, message), nil
 		}
-		return Exception(text, ""), nil
+		return exceptionValue(text, ""), nil
 	case BytesKind:
-		bytes := ffi.TakeBytes(ffi.Bytes{Ptr: raw.Ptr, Len: raw.Len})
+		data := ffi.TakeBytes(ffi.Bytes{Ptr: raw.Ptr, Len: raw.Len})
 		*raw = ffi.RawValue{}
-		return Value{kind: BytesKind, bytes: bytes}, nil
+		return Value{kind: BytesKind, bytes: data}, nil
 	case ListKind, TupleKind, SetKind, FrozenSetKind:
 		if raw.Handle != 0 {
 			handle := raw.Handle
@@ -1645,8 +1437,8 @@ func takeInternedRawString(raw *ffi.RawValue, cache map[string]string) string {
 		}
 		return ""
 	}
-	bytes := unsafe.Slice((*byte)(raw.Ptr), int(raw.Len))
-	probe := unsafe.String(unsafe.SliceData(bytes), len(bytes))
+	data := unsafe.Slice((*byte)(raw.Ptr), int(raw.Len))
+	probe := unsafe.String(unsafe.SliceData(data), len(data))
 	if interned, ok := cache[probe]; ok {
 		ffi.RawValueFree(raw)
 		return interned
@@ -1822,23 +1614,23 @@ func (r *flatValueReader) readBytes() ([]byte, error) {
 }
 
 func (r *flatValueReader) readString() (string, error) {
-	bytes, err := r.readBytes()
+	data, err := r.readBytes()
 	if err != nil {
 		return "", err
 	}
-	if len(bytes) == 0 {
+	if len(data) == 0 {
 		return "", nil
 	}
 	if r.copyStrings {
 		// Large result buffer: copy so no returned string pins the whole buffer.
-		return string(bytes), nil
+		return string(data), nil
 	}
 	// Small result buffer: the flat byte stream lives in a caller-owned buffer
 	// that outlives the returned Value tree, so every string borrows its backing
 	// directly via unsafe.String — no per-string allocation required. Repeated
 	// keys keep separate headers but share underlying bytes, which is enough for
 	// the public Value contract.
-	return unsafe.String(unsafe.SliceData(bytes), len(bytes)), nil
+	return unsafe.String(unsafe.SliceData(data), len(data)), nil
 }
 
 func freeAllRawValues(values []ffi.RawValue) {

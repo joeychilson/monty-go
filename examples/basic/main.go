@@ -1,3 +1,4 @@
+// Basic: compile once, run with typed inputs and a typed result.
 package main
 
 import (
@@ -9,20 +10,38 @@ import (
 )
 
 type Coords struct {
-	X int `monty:"x"`
-	Y int `monty:"y"`
+	X int
+	Y int
 }
 
 func main() {
-	program, err := monty.Compile("x * x + y * y", monty.WithInputs("x", "y"))
-	if err != nil {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
-	defer program.Close()
+}
 
-	result, err := monty.RunAs[int](context.Background(), program, monty.InputsOf(Coords{X: 3, Y: 4}))
+func run() error {
+	prog, err := monty.Compile("x * x + y * y", monty.WithInputs("x", "y"))
 	if err != nil {
-		panic(err)
+		return err
 	}
-	fmt.Printf("3^2 + 4^2 = %d\n", result)
+	defer prog.Close()
+
+	result, err := monty.RunAs[int](context.Background(), prog, Coords{X: 3, Y: 4})
+	if err != nil {
+		return err
+	}
+	fmt.Println("3² + 4² =", result) // 25
+
+	// One-shot evaluation without keeping a program around.
+	greeting, err := monty.EvalAs[string](
+		context.Background(),
+		`"hello " + name`,
+		map[string]any{"name": "monty"},
+	)
+	if err != nil {
+		return err
+	}
+	fmt.Println(greeting)
+	return nil
 }

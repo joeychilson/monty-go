@@ -34,7 +34,20 @@ func TestEmbeddedLibraryPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := purego.Dlclose(handle); err != nil {
-		t.Fatal(err)
+	defer func() {
+		if err := purego.Dlclose(handle); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	// The committed asset must match this binding's ABI revision; a stale
+	// library should fail here in CI rather than at a consumer.
+	addr, err := purego.Dlsym(handle, "mg_abi_version")
+	if err != nil {
+		t.Fatalf("embedded library predates the ABI handshake; refresh embedded FFI assets: %v", err)
+	}
+	var abiVersion func() uint32
+	purego.RegisterFunc(&abiVersion, addr)
+	if got := abiVersion(); got != AbiVersion {
+		t.Fatalf("embedded library reports ABI version %d, binding requires %d; refresh embedded FFI assets", got, AbiVersion)
 	}
 }

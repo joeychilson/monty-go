@@ -44,10 +44,16 @@ func syscall3(fn, a1, a2, a3 uintptr) uintptr {
 	return r
 }
 
-// syscall9 calls a C function via purego's trampoline with nine uintptr
-// arguments. Used by ProgramRunHostRaw, which threads a callback pointer and
-// user-data alongside the standard run parameters.
-func syscall9(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) uintptr {
-	r, _, _ := syscall_syscall15X(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, 0, 0, 0, 0, 0, 0)
+// syscall4 calls a C function via purego's trampoline with four uintptr
+// arguments. Used by ProgressResumeFutures.
+func syscall4(fn, a1, a2, a3, a4 uintptr) uintptr {
+	r, _, _ := syscall_syscall15X(fn, a1, a2, a3, a4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	return r
+}
+
+// syscall6 calls a C function via purego's trampoline with six uintptr
+// arguments. Used by ProgressResumeException.
+func syscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) uintptr {
+	r, _, _ := syscall_syscall15X(fn, a1, a2, a3, a4, a5, a6, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 	return r
 }

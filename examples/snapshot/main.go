@@ -1,3 +1,5 @@
+// Snapshot: pause execution at an external call, serialize it, and resume
+// from the snapshot — the core pattern for durable agent workflows.
 package main
 
 import (
@@ -9,53 +11,57 @@ import (
 )
 
 func main() {
-	program, err := monty.Compile(`call_llm(prompt) + " (resumed)"`, monty.WithInputs("prompt"))
-	if err != nil {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
-	defer program.Close()
+}
 
-	progress, err := program.Start(context.Background(), monty.Inputs{"prompt": monty.Str("hello")})
+func run() error {
+	ctx := context.Background()
+	prog, err := monty.Compile(`"The answer is " + call_llm(prompt)`, monty.WithInputs("prompt"))
 	if err != nil {
-		panic(err)
+		return err
+	}
+	defer prog.Close()
+
+	paused, err := prog.Start(ctx, map[string]any{"prompt": "6 * 7?"})
+	if err != nil {
+		return err
 	}
 
-	functionCall, ok := progress.(*monty.FunctionCall)
+	call, ok := paused.Pending().(*monty.Call)
 	if !ok {
-		panic(fmt.Sprintf("expected FunctionCall pause, got %T", progress))
+		return fmt.Errorf("unexpected interrupt %T", paused.Pending())
 	}
-	fmt.Printf("Paused at %s(%v)\n", functionCall.Name, functionCall.Args)
+	fmt.Printf("paused at %s(%s)\n", call.Name, call.Args[0])
 
-	snapshot, err := functionCall.Dump()
+	// Persist the paused execution; this could go to a database and be
+	// resumed by another process.
+	snapshot, err := paused.Dump()
 	if err != nil {
-		panic(err)
+		return err
 	}
-	if err := functionCall.Close(); err != nil {
-		panic(err)
-	}
+	paused.Close()
+	fmt.Printf("snapshot: %d bytes\n", len(snapshot))
 
-	loaded, err := monty.LoadProgress(snapshot)
+	// ... later, possibly elsewhere ...
+	restored, err := monty.LoadRun(snapshot)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	defer func() {
-		if err := loaded.Close(); err != nil {
-			panic(err)
-		}
-	}()
+	defer restored.Close()
 
-	loadedCall, ok := loaded.(*monty.FunctionCall)
+	call, ok = restored.Pending().(*monty.Call)
 	if !ok {
-		panic(fmt.Sprintf("loaded progress is %T", loaded))
+		return fmt.Errorf("unexpected interrupt %T", restored.Pending())
 	}
-
-	final, err := loadedCall.Resume(context.Background(), monty.Str("the answer is 42"))
+	if err := call.Return(ctx, "42"); err != nil {
+		return err
+	}
+	result, err := monty.ResultAs[string](restored)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	complete, ok := final.(*monty.Complete)
-	if !ok {
-		panic(fmt.Sprintf("expected Complete, got %T", final))
-	}
-	fmt.Println("Final value:", complete.Value.Str())
+	fmt.Println(result)
+	return nil
 }

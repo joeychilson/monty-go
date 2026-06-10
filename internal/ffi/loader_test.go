@@ -32,7 +32,7 @@ func TestRegisterSymbolsMissingSymbolReturnsError(t *testing.T) {
 		t.Fatal("registerSymbols returned nil for a library missing every mg_* symbol")
 	}
 	got := err.Error()
-	for _, want := range []string{"mg_bytes_free", "not found", "older than the Go binding", fakePath} {
+	for _, want := range []string{"mg_abi_version", "not found", "older than the Go binding", fakePath} {
 		if !strings.Contains(got, want) {
 			t.Errorf("error %q missing %q", got, want)
 		}

@@ -1,6 +1,12 @@
+// Package ffi is the purego binding to the Rust monty-ffi cdylib.
+//
+// Layout-mirrored structs and constants here must stay in lockstep with the
+// #[repr(C)] definitions in crates/monty-ffi; both sides assert layouts in
+// tests and the loader verifies mg_abi_version at startup.
 package ffi
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -12,12 +18,28 @@ import (
 	"github.com/ebitengine/purego"
 )
 
+// AbiVersion is the C ABI revision this binding was built against. The loaded
+// library must report the same value from mg_abi_version.
+const AbiVersion = 3
+
 const (
 	// StatusOK is returned by every successful FFI call. Non-zero statuses mean
 	// an error handle was written to the trailing out-pointer; pass it to
 	// TakeError.
 	StatusOK = 0
+	// StatusErrRetained is returned by resume entry points whose payload was
+	// rejected before the progress handle was consumed: the caller still owns
+	// the live handle and the paused state is retryable.
+	StatusErrRetained = 2
 )
+
+// RetainedError wraps a resume failure that did not consume the progress
+// handle (StatusErrRetained): the paused state is still live, so the caller
+// should restore its bookkeeping instead of treating the run as failed.
+type RetainedError struct{ Err error }
+
+func (e *RetainedError) Error() string { return e.Err.Error() }
+func (e *RetainedError) Unwrap() error { return e.Err }
 
 // Encoding of values returned from the "fast" run path.
 const (
@@ -42,10 +64,29 @@ const (
 	FutureResultNotFound = 2
 )
 
-// Outcomes a host-function callback writes into HostFunctionOutput.
+// Outcomes a host callback reports for one dispatched call.
 const (
-	HostCallbackReturn    = 0
-	HostCallbackException = 1
+	HostCallbackReturn     = 0
+	HostCallbackException  = 1
+	HostCallbackNotHandled = 2
+)
+
+// Kinds of host callback requests.
+const (
+	HostCallFunction = 1
+	HostCallOS       = 2
+)
+
+// Print payload encodings; see Printed.
+const (
+	PrintPlain  = 0
+	PrintTagged = 1
+)
+
+// Print stream tags within a tagged payload.
+const (
+	StreamStdout = 0
+	StreamStderr = 1
 )
 
 // RawValue.Kind discriminants. Values mirror the Rust mg_kind enum and must
@@ -107,8 +148,8 @@ type Bytes struct {
 
 // Limits mirrors the C struct that bounds resource consumption for a single
 // program run. Each *Set field is a boolean toggle that activates the value
-// in the field below it; the explicit padding keeps the layout identical to
-// the Rust definition.
+// in the field below it. CancelToken optionally attaches a cancellation flag
+// (from CancelTokenNew) observed at Python statement boundaries.
 type Limits struct {
 	MaxAllocationsSet uint8
 	_                 [7]byte
@@ -131,6 +172,8 @@ type Limits struct {
 	MaxRecursionDepth    uintptr
 
 	DisableRecursionLimit uint8
+	_                     [7]byte
+	CancelToken           uintptr
 }
 
 // ProgramCompileArgs mirrors MgProgramCompileArgs in the Rust FFI crate.
@@ -153,6 +196,23 @@ type CompileRunFastRawArgs struct {
 	Limits          *Limits
 }
 
+// RunHostArgs mirrors MgRunHostArgs: a single-hop host-dispatch run with
+// registered function names, mounts, the unified host callback, and an
+// optional streaming print callback.
+type RunHostArgs struct {
+	Inputs        unsafe.Pointer
+	InputCount    uintptr
+	Limits        *Limits
+	HostNames     unsafe.Pointer
+	HostNameCount uintptr
+	Mounts        unsafe.Pointer
+	MountCount    uintptr
+	Callback      uintptr
+	CallbackData  uintptr
+	Print         uintptr
+	PrintData     uintptr
+}
+
 // MountNewArgs mirrors MgMountNewArgs in the Rust FFI crate.
 type MountNewArgs struct {
 	VirtualPath        Str
@@ -165,14 +225,13 @@ type MountNewArgs struct {
 
 // MountCallArgs mirrors MgMountCallArgs in the Rust FFI crate.
 type MountCallArgs struct {
-	Mounts      unsafe.Pointer
-	MountCount  uintptr
-	Function    Str
-	Args        unsafe.Pointer
-	ArgCount    uintptr
-	KwargKeys   unsafe.Pointer
-	KwargValues unsafe.Pointer
-	KwargCount  uintptr
+	Mounts     unsafe.Pointer
+	MountCount uintptr
+	Function   Str
+	Args       unsafe.Pointer
+	ArgCount   uintptr
+	Kwargs     unsafe.Pointer
+	KwargCount uintptr
 }
 
 // ReplNewArgs mirrors MgReplNewArgs in the Rust FFI crate.
@@ -181,12 +240,25 @@ type ReplNewArgs struct {
 	Limits     unsafe.Pointer
 }
 
-// ReplFeedRunArgs mirrors MgReplFeedRunArgs in the Rust FFI crate.
-type ReplFeedRunArgs struct {
-	Code        Str
-	InputNames  unsafe.Pointer
-	InputValues unsafe.Pointer
-	InputCount  uintptr
+// ReplFeedArgs mirrors MgReplFeedArgs: one REPL snippet execution with
+// per-snippet controls and (for feed_run only) host dispatch.
+type ReplFeedArgs struct {
+	Code             Str
+	InputNames       unsafe.Pointer
+	InputValues      unsafe.Pointer
+	InputCount       uintptr
+	HasMaxDuration   uint8
+	_                [7]byte
+	MaxDurationNanos uint64
+	CancelToken      uintptr
+	HostNames        unsafe.Pointer
+	HostNameCount    uintptr
+	Mounts           unsafe.Pointer
+	MountCount       uintptr
+	Callback         uintptr
+	CallbackData     uintptr
+	Print            uintptr
+	PrintData        uintptr
 }
 
 // ReplCallArgs mirrors MgReplCallArgs in the Rust FFI crate.
@@ -194,6 +266,14 @@ type ReplCallArgs struct {
 	Name     Str
 	Args     unsafe.Pointer
 	ArgCount uintptr
+}
+
+// TypeCheckArgs mirrors MgTypeCheckArgs in the Rust FFI crate.
+type TypeCheckArgs struct {
+	Code       Str
+	ScriptName Str
+	Stubs      Str
+	StubsName  Str
 }
 
 // FutureResult mirrors MgFutureResult and carries the host result for one
@@ -223,25 +303,19 @@ type RawValue struct {
 	Handle uintptr
 }
 
-// RunOutput is the handle-returning output from program and REPL execution.
-type RunOutput struct {
-	Value uintptr
-	Print Bytes
-	Error uintptr
-}
-
-// RunRawOutput is the RawValue-returning output from raw execution.
-type RunRawOutput struct {
+// RawPair is the C ABI representation of one key/value pair.
+type RawPair struct {
+	Key   RawValue
 	Value RawValue
-	Print Bytes
-	Error uintptr
 }
 
 // RunJSONOutput is the bytes-returning output from JSON execution.
 type RunJSONOutput struct {
-	Value Bytes
-	Print Bytes
-	Error uintptr
+	Value      Bytes
+	Print      Bytes
+	PrintFlags uint32
+	_          uint32
+	Error      uintptr
 }
 
 // FastScratchCap is the size of the inline scratch buffer the Rust side may
@@ -258,6 +332,8 @@ type RunFastOutput struct {
 	// free required) and 0 when Bytes references a Rust-owned heap buffer
 	// that must be released with mg_bytes_free.
 	BytesInScratch uint32
+	PrintFlags     uint32
+	_              uint32
 	Value          RawValue
 	Bytes          Bytes
 	Print          Bytes
@@ -267,37 +343,32 @@ type RunFastOutput struct {
 	Scratch [FastScratchCap]byte
 }
 
-// ProgressOutput is returned by resume operations that yield another progress
-// handle.
-type ProgressOutput struct {
-	Progress uintptr
-	Print    Bytes
-	Error    uintptr
-}
-
 // ProgressSnapshot mirrors MgProgressSnapshot and stores a zero-copy view of a
 // progress state.
 type ProgressSnapshot struct {
 	Kind       uint32
+	CallID     uint32
+	MethodCall uint8
+	_          [7]byte
 	Name       Bytes
 	Args       RawValue
 	Kwargs     RawValue
 	Value      RawValue
-	CallID     uint32
-	MethodCall uint8
-	_          [3]byte
-	Error      uintptr
 }
 
-// ProgressSnapshotOutput mirrors MgProgressSnapshotOutput: the single-hop
-// start/resume variants return the next progress handle and its snapshot in one
-// call, so the Go side avoids a second snapshot FFI hop per step. Progress is
-// null when the snapshot is Complete (no resumable handle).
+// ProgressSnapshotOutput mirrors MgProgressSnapshotOutput: start and resume
+// calls return the next progress handle and its snapshot in one hop. Progress
+// is 0 when the run finished. Repl is non-zero when a REPL execution handed
+// its session back (at completion, or alongside Error when a Python exception
+// preserved the session).
 type ProgressSnapshotOutput struct {
-	Progress uintptr
-	Snapshot ProgressSnapshot
-	Print    Bytes
-	Error    uintptr
+	Progress   uintptr
+	Repl       uintptr
+	Error      uintptr
+	Print      Bytes
+	PrintFlags uint32
+	_          uint32
+	Snapshot   ProgressSnapshot
 }
 
 // HostFunctionOutput is written by Go callbacks invoked from Rust.
@@ -309,15 +380,10 @@ type HostFunctionOutput struct {
 
 // MountOutput is returned by mounted OS call handling.
 type MountOutput struct {
-	Value   uintptr
+	Value   RawValue
 	Error   uintptr
 	Handled uint8
-}
-
-// RawPair is the C ABI representation of one key/value pair.
-type RawPair struct {
-	Key   RawValue
-	Value RawValue
+	_       [7]byte
 }
 
 // Date mirrors MgDate in the Rust FFI crate.
@@ -371,13 +437,31 @@ type DataclassRawArgs struct {
 	_          [7]byte
 }
 
+// Frame is one decoded traceback frame from an Error.
+type Frame struct {
+	File          string
+	Function      string
+	SourceLine    string
+	Line          int
+	Column        int
+	EndLine       int
+	EndColumn     int
+	HasFunction   bool
+	HasSourceLine bool
+	HideCaret     bool
+	HideFrameName bool
+}
+
 // Error is the Go form of a Rust-side panic or Python exception that escaped
 // the FFI boundary. Type and Message are taken from Rust; Display is the
-// pre-formatted string Rust would print, and takes precedence when set.
+// pre-formatted string Rust would print (a full traceback rendering for
+// Python runtime errors) and Traceback holds the structured frames,
+// outermost first (empty for synthetic FFI errors).
 type Error struct {
-	Type    string
-	Message string
-	Display string
+	Type      string
+	Message   string
+	Display   string
+	Traceback []Frame
 }
 
 // Error formats the FFI error as a Go error string.
@@ -385,13 +469,65 @@ func (e *Error) Error() string {
 	if e == nil {
 		return ""
 	}
-	if e.Display != "" {
-		return e.Display
-	}
 	if e.Message == "" {
 		return e.Type
 	}
 	return e.Type + ": " + e.Message
+}
+
+// Printed is the print output collected during one FFI hop. Flags selects the
+// encoding of Data: PrintPlain means Data is stdout text verbatim (the common
+// case); PrintTagged means Data is a sequence of [stream u8][len u32 le]
+// [bytes] chunks preserving stdout/stderr interleaving.
+type Printed struct {
+	Flags uint32
+	Data  string
+}
+
+// Empty reports whether no output was produced.
+func (p Printed) Empty() bool { return p.Data == "" }
+
+// ForEach invokes fn for every output chunk in emit order. Malformed tagged
+// payloads stop with an error.
+func (p Printed) ForEach(fn func(stream uint8, text string) error) error {
+	if p.Data == "" {
+		return nil
+	}
+	if p.Flags == PrintPlain {
+		return fn(StreamStdout, p.Data)
+	}
+	data := p.Data
+	for data != "" {
+		if len(data) < 5 {
+			return errors.New("monty: truncated tagged print payload")
+		}
+		stream := data[0]
+		size := binary.LittleEndian.Uint32([]byte(data[1:5]))
+		if len(data)-5 < int(size) {
+			return errors.New("monty: truncated tagged print chunk")
+		}
+		if err := fn(stream, data[5:5+size]); err != nil {
+			return err
+		}
+		data = data[5+size:]
+	}
+	return nil
+}
+
+// TakePrinted consumes a Rust-owned print buffer into a Printed value.
+func TakePrinted(buf Bytes, flags uint32) Printed {
+	return Printed{Flags: flags, Data: TakeString(buf)}
+}
+
+// StepResult is the uniform outcome of starting or resuming a suspendable
+// execution. Progress is 0 when the run finished; Repl is non-zero when a
+// REPL session was handed back (ownership transfers to the caller, including
+// on the error path).
+type StepResult struct {
+	Progress uintptr
+	Repl     uintptr
+	Snapshot ProgressSnapshot
+	Print    Printed
 }
 
 var (
@@ -399,36 +535,41 @@ var (
 	loadErr  error
 	lib      uintptr
 
-	// Buffer and error symbols.
+	// Buffer, error, and cancellation symbols.
 	mgBytesFree func(unsafe.Pointer, uintptr)
 
 	mgRawValueFree func(unsafe.Pointer)
 
 	mgErrorFree    func(uintptr)
-	mgErrorType    func(uintptr, unsafe.Pointer) int32
-	mgErrorMessage func(uintptr, unsafe.Pointer) int32
-	mgErrorDisplay func(uintptr, unsafe.Pointer) int32
+	mgErrorDetails func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 
-	// Program, REPL, and mount symbols.
-	// The final out-error argument is the 9th, which overflows the 8 arm64
-	// integer registers onto the stack. purego's stack-placement path only
-	// handles uintptr/Ptr (not unsafe.Pointer), so this parameter must stay
-	// uintptr; it points at a local uintptr handle that carries no Go heap data
-	// needing GC tracing, so 1.1's keep-alive requirement does not apply to it.
-	// The string-pointer args stay unsafe.Pointer (they sit in registers).
-	mgTypeCheck                   func(unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, uintptr) int32
-	mgMountNew                    func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
-	mgMountFree                   func(uintptr)
-	mgMountHandleOSCall           func(unsafe.Pointer, unsafe.Pointer) int32
-	mgReplNew                     func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
-	mgReplFree                    func(uintptr)
-	mgReplDump                    func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgReplLoad                    func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgReplFeedRun                 func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgReplCallFunction            func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgReplFunctionNames           func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgReplHasFunction             func(uintptr, unsafe.Pointer, uintptr) uint8
-	mgReplContinuationMode        func(unsafe.Pointer, uintptr) uint32
+	mgAbiVersion func() uint32
+
+	mgCancelTokenNew    func() uintptr
+	mgCancelTokenCancel func(uintptr)
+	mgCancelTokenFree   func(uintptr)
+
+	// Type checking symbols.
+	mgTypeCheck         func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
+	mgDiagnosticsRender func(uintptr, unsafe.Pointer, uintptr, uint8, unsafe.Pointer, unsafe.Pointer) int32
+	mgDiagnosticsFree   func(uintptr)
+
+	// Mount and REPL symbols.
+	mgMountNew             func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
+	mgMountFree            func(uintptr)
+	mgMountHandleOSCall    func(unsafe.Pointer, unsafe.Pointer) int32
+	mgReplNew              func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
+	mgReplFree             func(uintptr)
+	mgReplDump             func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgReplLoad             func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgReplFunctionNames    func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgReplHasFunction      func(uintptr, unsafe.Pointer, uintptr) uint8
+	mgReplContinuationMode func(unsafe.Pointer, uintptr) uint32
+	mgReplFeedRunRawAddr   uintptr
+	mgReplFeedStartAddr    uintptr
+	mgReplCallRawAddr      uintptr
+
+	// Program symbols.
 	mgProgramCompile              func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	mgProgramFree                 func(uintptr)
 	mgProgramDump                 func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
@@ -437,7 +578,6 @@ var (
 	mgProgramInputNames           func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgProgramLoad                 func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
 	mgProgramStartRawSnapshotAddr uintptr
-	mgProgramRunRawAddr           uintptr
 	mgProgramRunHostRawAddr       uintptr
 	mgProgramRunFastAddr          uintptr
 	mgProgramCompileRunFastAddr   uintptr
@@ -491,18 +631,22 @@ var (
 	mgValuePairsRaw             func(uintptr, unsafe.Pointer, uintptr) int32
 
 	// Progress symbols.
-	mgProgressFree                            func(uintptr)
-	mgProgressSnapshotAddr                    uintptr
-	mgProgressPendingLen                      func(uintptr) uintptr
-	mgProgressPendingID                       func(uintptr, uintptr) uint32
-	mgProgressResumePending                   func(uintptr, unsafe.Pointer) int32
-	mgProgressResumeReturnRawSnapshotAddr     uintptr
-	mgProgressResumeNameValueRawSnapshotAddr  uintptr
-	mgProgressResumeNameUndefinedSnapshotAddr uintptr
-	mgProgressResumeException                 func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
-	mgProgressResumeFutures                   func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer) int32
-	mgProgressDump                            func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
-	mgProgressLoad                            func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgProgressFree                    func(uintptr)
+	mgProgressSnapshot                func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgProgressPendingLen              func(uintptr) uintptr
+	mgProgressPendingID               func(uintptr, uintptr) uint32
+	mgProgressIsRepl                  func(uintptr) uint8
+	mgProgressSetCancelToken          func(uintptr, uintptr) uint8
+	mgProgressCallJSON                func(uintptr, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
+	mgProgressDump                    func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgProgressLoad                    func(unsafe.Pointer, uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	mgProgressResumeReturnRawAddr     uintptr
+	mgProgressResumeExceptionAddr     uintptr
+	mgProgressResumePendingAddr       uintptr
+	mgProgressResumeNotHandledAddr    uintptr
+	mgProgressResumeNameValueRawAddr  uintptr
+	mgProgressResumeNameUndefinedAddr uintptr
+	mgProgressResumeFuturesAddr       uintptr
 )
 
 // EnsureLoaded resolves the Rust shared library on first call and registers
@@ -579,19 +723,31 @@ func libraryFileName() string {
 
 // registerSymbols resolves and binds every FFI symbol from the loaded library.
 // It returns a descriptive error (rather than panicking) when a symbol is
-// missing — the common case when an old library is found via MONTY_GO_LIB or a
-// stale build directory. Errors must be sticky: registerSymbols runs inside
-// loadOnce, which is never retried, so a failure here is recorded in loadErr
-// and reported to every subsequent caller. The deferred recover is a backstop
-// for purego.RegisterFunc, which panics on an unsupported function signature
-// (a programmer error); converting it to loadErr keeps the Once from completing
-// with half-registered, nil function pointers that would crash on first use.
+// missing or the ABI revision mismatches — the common case when an old
+// library is found via MONTY_GO_LIB or a stale build directory. Errors must
+// be sticky: registerSymbols runs inside loadOnce, which is never retried, so
+// a failure here is recorded in loadErr and reported to every subsequent
+// caller. The deferred recover is a backstop for purego.RegisterFunc, which
+// panics on an unsupported function signature (a programmer error);
+// converting it to loadErr keeps the Once from completing with
+// half-registered, nil function pointers that would crash on first use.
 func registerSymbols(path string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("monty: register FFI symbols from %s: %v", path, r)
 		}
 	}()
+
+	// The ABI handshake comes first: layouts may have drifted even when every
+	// symbol resolves.
+	versionAddr, derr := purego.Dlsym(lib, "mg_abi_version")
+	if derr != nil {
+		return fmt.Errorf("monty: symbol mg_abi_version not found in %s; library is older than the Go binding: %w", path, derr)
+	}
+	purego.RegisterFunc(&mgAbiVersion, versionAddr)
+	if version := mgAbiVersion(); version != AbiVersion {
+		return fmt.Errorf("monty: library %s reports ABI version %d, Go binding requires %d; rebuild monty-ffi", path, version, AbiVersion)
+	}
 
 	symbols := []struct {
 		name   string
@@ -600,10 +756,13 @@ func registerSymbols(path string) (err error) {
 		{"mg_bytes_free", &mgBytesFree},
 		{"mg_raw_value_free", &mgRawValueFree},
 		{"mg_error_free", &mgErrorFree},
-		{"mg_error_type", &mgErrorType},
-		{"mg_error_message", &mgErrorMessage},
-		{"mg_error_display", &mgErrorDisplay},
+		{"mg_error_details", &mgErrorDetails},
+		{"mg_cancel_token_new", &mgCancelTokenNew},
+		{"mg_cancel_token_cancel", &mgCancelTokenCancel},
+		{"mg_cancel_token_free", &mgCancelTokenFree},
 		{"mg_type_check", &mgTypeCheck},
+		{"mg_diagnostics_render", &mgDiagnosticsRender},
+		{"mg_diagnostics_free", &mgDiagnosticsFree},
 		{"mg_mount_new", &mgMountNew},
 		{"mg_mount_free", &mgMountFree},
 		{"mg_mount_handle_os_call", &mgMountHandleOSCall},
@@ -611,8 +770,6 @@ func registerSymbols(path string) (err error) {
 		{"mg_repl_free", &mgReplFree},
 		{"mg_repl_dump", &mgReplDump},
 		{"mg_repl_load", &mgReplLoad},
-		{"mg_repl_feed_run", &mgReplFeedRun},
-		{"mg_repl_call_function", &mgReplCallFunction},
 		{"mg_repl_function_names", &mgReplFunctionNames},
 		{"mg_repl_has_function", &mgReplHasFunction},
 		{"mg_repl_continuation_mode", &mgReplContinuationMode},
@@ -669,11 +826,12 @@ func registerSymbols(path string) (err error) {
 		{"mg_value_items_raw", &mgValueItemsRaw},
 		{"mg_value_pairs_raw", &mgValuePairsRaw},
 		{"mg_progress_free", &mgProgressFree},
+		{"mg_progress_snapshot", &mgProgressSnapshot},
 		{"mg_progress_pending_len", &mgProgressPendingLen},
 		{"mg_progress_pending_id", &mgProgressPendingID},
-		{"mg_progress_resume_pending", &mgProgressResumePending},
-		{"mg_progress_resume_exception", &mgProgressResumeException},
-		{"mg_progress_resume_futures", &mgProgressResumeFutures},
+		{"mg_progress_is_repl", &mgProgressIsRepl},
+		{"mg_progress_set_cancel_token", &mgProgressSetCancelToken},
+		{"mg_progress_call_json", &mgProgressCallJSON},
 		{"mg_progress_dump", &mgProgressDump},
 		{"mg_progress_load", &mgProgressLoad},
 	}
@@ -694,15 +852,20 @@ func registerSymbols(path string) (err error) {
 		target *uintptr
 	}{
 		{"mg_program_start_raw_snapshot", &mgProgramStartRawSnapshotAddr},
-		{"mg_program_run_raw", &mgProgramRunRawAddr},
 		{"mg_program_run_host_raw", &mgProgramRunHostRawAddr},
 		{"mg_program_run_fast_raw", &mgProgramRunFastAddr},
 		{"mg_program_compile_run_fast_raw", &mgProgramCompileRunFastAddr},
 		{"mg_program_run_json_raw", &mgProgramRunJSONAddr},
-		{"mg_progress_snapshot", &mgProgressSnapshotAddr},
-		{"mg_progress_resume_return_raw_snapshot", &mgProgressResumeReturnRawSnapshotAddr},
-		{"mg_progress_resume_name_value_raw_snapshot", &mgProgressResumeNameValueRawSnapshotAddr},
-		{"mg_progress_resume_name_undefined_snapshot", &mgProgressResumeNameUndefinedSnapshotAddr},
+		{"mg_repl_feed_run_raw", &mgReplFeedRunRawAddr},
+		{"mg_repl_feed_start", &mgReplFeedStartAddr},
+		{"mg_repl_call_raw", &mgReplCallRawAddr},
+		{"mg_progress_resume_return_raw", &mgProgressResumeReturnRawAddr},
+		{"mg_progress_resume_exception", &mgProgressResumeExceptionAddr},
+		{"mg_progress_resume_pending", &mgProgressResumePendingAddr},
+		{"mg_progress_resume_not_handled", &mgProgressResumeNotHandledAddr},
+		{"mg_progress_resume_name_value_raw", &mgProgressResumeNameValueRawAddr},
+		{"mg_progress_resume_name_undefined", &mgProgressResumeNameUndefinedAddr},
+		{"mg_progress_resume_futures", &mgProgressResumeFuturesAddr},
 	}
 	for _, symbol := range rawSymbols {
 		addr, derr := purego.Dlsym(lib, symbol.name)
@@ -732,7 +895,9 @@ func stringArgs(s string) (unsafe.Pointer, uintptr) {
 	return ref.Ptr, ref.Len
 }
 
-func stringRefs(values []string) []Str {
+// StringRefs converts a string slice into borrowed Str views. The original
+// strings must outlive the FFI call; keep the returned slice alive too.
+func StringRefs(values []string) []Str {
 	if len(values) == 0 {
 		return nil
 	}
@@ -807,1057 +972,146 @@ func RawValueFree(value *RawValue) {
 	}
 }
 
+// Traceback frame flag bits in the mg_error_details encoding.
+const (
+	frameHasFunction   = 1
+	frameHasSource     = 1 << 1
+	frameHideCaret     = 1 << 2
+	frameHideFrameName = 1 << 3
+)
+
 // TakeError consumes a Rust-owned error handle and converts it to a Go
-// *Error, freeing the handle. Returns nil when handle == 0.
+// *Error (including the traceback frames), freeing the handle. Returns nil
+// when handle == 0.
 func TakeError(handle uintptr) error {
 	if handle == 0 {
 		return nil
 	}
 	defer mgErrorFree(handle)
-	var typ, message, display Bytes
-	_ = mgErrorType(handle, ptrOf(&typ))
-	_ = mgErrorMessage(handle, ptrOf(&message))
-	_ = mgErrorDisplay(handle, ptrOf(&display))
-	return &Error{
-		Type:    TakeString(typ),
-		Message: TakeString(message),
-		Display: TakeString(display),
-	}
-}
-
-// TypeCheck runs Rust-side type checking for code and optional stubs.
-func TypeCheck(code, scriptName, stubs, stubsName string) error {
-	if err := EnsureLoaded(); err != nil {
-		return err
-	}
+	var details Bytes
 	var errHandle uintptr
-	codePtr, codeLen := stringArgs(code)
-	scriptPtr, scriptLen := stringArgs(scriptName)
-	stubsPtr, stubsLen := stringArgs(stubs)
-	stubsNamePtr, stubsNameLen := stringArgs(stubsName)
-	status := mgTypeCheck(codePtr, codeLen, scriptPtr, scriptLen, stubsPtr, stubsLen, stubsNamePtr, stubsNameLen, uintptr(ptrOf(&errHandle)))
-	runtime.KeepAlive(&errHandle)
-	if status != StatusOK {
-		return TakeError(errHandle)
+	if status := mgErrorDetails(handle, ptrOf(&details), ptrOf(&errHandle)); status != StatusOK {
+		// Details encoding failed (out of memory); free the nested handle and
+		// fall back to an opaque error.
+		mgErrorFree(errHandle)
+		return &Error{Type: "RuntimeError", Message: "failed to decode FFI error details"}
 	}
-	return nil
+	decoded, err := decodeErrorDetails(TakeString(details))
+	if err != nil {
+		return &Error{Type: "RuntimeError", Message: err.Error()}
+	}
+	return decoded
 }
 
-// MountNew creates a Rust-side mount handle.
-func MountNew(virtualPath, hostPath string, mode uint32, writeBytesLimit *uint64) (uintptr, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, err
-	}
-	args := MountNewArgs{
-		VirtualPath: StringRef(virtualPath),
-		HostPath:    StringRef(hostPath),
-		Mode:        mode,
-	}
-	if writeBytesLimit != nil {
-		args.HasWriteBytesLimit = 1
-		args.WriteBytesLimit = *writeBytesLimit
-	}
-	var handle, errHandle uintptr
-	status := mgMountNew(ptrOf(&args), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// MountFree releases a Rust-side mount handle.
-func MountFree(handle uintptr) {
-	if handle != 0 {
-		mgMountFree(handle)
-	}
-}
-
-// MountHandleOSCall asks the mounted filesystem layer to handle one OS call.
-func MountHandleOSCall(mounts []uintptr, function string, args, kwargKeys, kwargValues []uintptr) (uintptr, bool, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, false, err
-	}
-	if len(kwargKeys) != len(kwargValues) {
-		return 0, false, errors.New("monty: kwarg keys and values have different lengths")
-	}
-	callArgs := MountCallArgs{
-		Mounts:      slicePointer(mounts),
-		MountCount:  uintptr(len(mounts)),
-		Function:    StringRef(function),
-		Args:        slicePointer(args),
-		ArgCount:    uintptr(len(args)),
-		KwargKeys:   slicePointer(kwargKeys),
-		KwargValues: slicePointer(kwargValues),
-		KwargCount:  uintptr(len(kwargKeys)),
-	}
-	var out MountOutput
-	status := mgMountHandleOSCall(ptrOf(&callArgs), ptrOf(&out))
-	if status != StatusOK {
-		return 0, out.Handled != 0, TakeError(out.Error)
-	}
-	return out.Value, out.Handled != 0, nil
-}
-
-// ReplNew creates a Rust-side REPL handle.
-func ReplNew(scriptName string, limits *Limits) (uintptr, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, err
-	}
-	args := ReplNewArgs{ScriptName: StringRef(scriptName)}
-	if limits != nil {
-		args.Limits = ptrOf(limits)
-	}
-	var handle, errHandle uintptr
-	status := mgReplNew(ptrOf(&args), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ReplFree releases a Rust-side REPL handle.
-func ReplFree(handle uintptr) {
-	if handle != 0 {
-		mgReplFree(handle)
-	}
-}
-
-// ReplDump serializes a REPL handle into a Rust-owned snapshot buffer.
-func ReplDump(handle uintptr) ([]byte, error) {
-	var buffer Bytes
-	var errHandle uintptr
-	status := mgReplDump(handle, ptrOf(&buffer), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	return TakeBytes(buffer), nil
-}
-
-// ReplLoad restores a REPL handle from a snapshot created by ReplDump.
-func ReplLoad(snapshot []byte) (uintptr, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, err
-	}
-	snapshotPtr, snapshotLen := BytesRef(snapshot)
-	var handle, errHandle uintptr
-	status := mgReplLoad(snapshotPtr, snapshotLen, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ReplFeedRun executes code in an existing REPL handle.
-func ReplFeedRun(repl uintptr, code string, inputNames []string, inputValues []uintptr) (uintptr, string, error) {
-	if len(inputNames) != len(inputValues) {
-		return 0, "", errors.New("monty: REPL input names and values have different lengths")
-	}
-	names := stringRefs(inputNames)
-	args := ReplFeedRunArgs{
-		Code:        StringRef(code),
-		InputNames:  slicePointer(names),
-		InputValues: slicePointer(inputValues),
-		InputCount:  uintptr(len(names)),
-	}
-	var out RunOutput
-	status := mgReplFeedRun(repl, ptrOf(&args), ptrOf(&out))
-	if status != StatusOK {
-		return 0, TakeString(out.Print), TakeError(out.Error)
-	}
-	return out.Value, TakeString(out.Print), nil
-}
-
-// ReplCallFunction calls a named Python function in an existing REPL handle.
-func ReplCallFunction(repl uintptr, name string, args []uintptr) (uintptr, string, error) {
-	callArgs := ReplCallArgs{
-		Name:     StringRef(name),
-		Args:     slicePointer(args),
-		ArgCount: uintptr(len(args)),
-	}
-	var out RunOutput
-	status := mgReplCallFunction(repl, ptrOf(&callArgs), ptrOf(&out))
-	if status != StatusOK {
-		return 0, TakeString(out.Print), TakeError(out.Error)
-	}
-	return out.Value, TakeString(out.Print), nil
-}
-
-// ReplFunctionNames returns Python function names defined in the REPL.
-func ReplFunctionNames(repl uintptr) ([]string, error) {
-	var handle, errHandle uintptr
-	status := mgReplFunctionNames(repl, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	defer ValueFree(handle)
-	return stringListFromValue(handle)
-}
-
-// ReplHasFunction reports whether the REPL contains a named Python function.
-func ReplHasFunction(repl uintptr, name string) bool {
-	namePtr, nameLen := stringArgs(name)
-	return mgReplHasFunction(repl, namePtr, nameLen) != 0
-}
-
-// ReplContinuationMode returns the parser continuation mode for interactive code.
-func ReplContinuationMode(code string) (uint32, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, err
-	}
-	codePtr, codeLen := stringArgs(code)
-	return mgReplContinuationMode(codePtr, codeLen), nil
-}
-
-// ProgramCompile compiles code into a Rust-side program handle.
-func ProgramCompile(code, scriptName string, inputNames []string) (uintptr, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, err
-	}
-	names := stringRefs(inputNames)
-	args := ProgramCompileArgs{
-		Code:       StringRef(code),
-		ScriptName: StringRef(scriptName),
-		InputNames: slicePointer(names),
-		InputCount: uintptr(len(names)),
-	}
-	var handle, errHandle uintptr
-	status := mgProgramCompile(ptrOf(&args), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ProgramFree releases a Rust-side program handle.
-func ProgramFree(handle uintptr) {
-	if handle != 0 {
-		mgProgramFree(handle)
-	}
-}
-
-var (
-	runRawOutputPool = sync.Pool{
-		New: func() any { return new(RunRawOutput) },
-	}
-	runJSONOutputPool = sync.Pool{
-		New: func() any { return new(RunJSONOutput) },
-	}
-	// Snapshot output structs must be heap-allocated (hence a pool) rather than a
-	// stack-local var: their address is smuggled to the Rust trampoline through a
-	// uintptr, which defeats escape analysis. A stack-local could then be moved
-	// by a stack growth mid-call — the trampoline does not keep the goroutine in
-	// syscall state — leaving Rust writing to a stale address and the Go-visible
-	// struct all zeros. Heap allocations do not move, so the write lands.
-	progressSnapshotPool = sync.Pool{
-		New: func() any { return new(ProgressSnapshot) },
-	}
-	progressSnapshotOutputPool = sync.Pool{
-		New: func() any { return new(ProgressSnapshotOutput) },
-	}
-)
-
-// ProgramStartRawSnapshot starts a program and returns the first progress
-// handle and its snapshot in a single FFI hop. Progress is 0 when the snapshot
-// is Complete. The caller owns the returned snapshot's buffers.
-func ProgramStartRawSnapshot(program uintptr, inputs []RawValue, limits *Limits) (uintptr, ProgressSnapshot, string, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, ProgressSnapshot{}, "", err
-	}
-	out := progressSnapshotOutputPool.Get().(*ProgressSnapshotOutput) //nolint:errcheck // pool only stores *ProgressSnapshotOutput
-	*out = ProgressSnapshotOutput{}
-	defer progressSnapshotOutputPool.Put(out)
-	status := syscall5(
-		mgProgramStartRawSnapshotAddr,
-		program,
-		sliceAddress(inputs),
-		uintptr(len(inputs)),
-		uintptr(ptrOf(limits)),
-		uintptr(ptrOf(out)),
-	)
-	// The trampoline passes these as bare uintptr, so the GC does not see them
-	// as live across the Rust call; pin them until it returns.
-	runtime.KeepAlive(inputs)
-	runtime.KeepAlive(limits)
-	runtime.KeepAlive(out)
-	printed := TakeString(out.Print)
-	if status != StatusOK {
-		return 0, ProgressSnapshot{}, printed, TakeError(out.Error)
-	}
-	return out.Progress, out.Snapshot, printed, nil
-}
-
-// ProgramRunRaw runs a program to completion using RawValue inputs and output.
-func ProgramRunRaw(program uintptr, inputs []RawValue, limits *Limits) (RawValue, string, error) {
-	if err := EnsureLoaded(); err != nil {
-		return RawValue{}, "", err
-	}
-	out := runRawOutputPool.Get().(*RunRawOutput) //nolint:errcheck // pool only stores *RunRawOutput
-	*out = RunRawOutput{}
-	defer runRawOutputPool.Put(out)
-	status := syscall5(
-		mgProgramRunRawAddr,
-		program,
-		sliceAddress(inputs),
-		uintptr(len(inputs)),
-		uintptr(ptrOf(limits)),
-		uintptr(ptrOf(out)),
-	)
-	runtime.KeepAlive(inputs)
-	runtime.KeepAlive(limits)
-	if status != StatusOK {
-		return RawValue{}, TakeString(out.Print), TakeError(out.Error)
-	}
-	value := out.Value
-	out.Value = RawValue{}
-	return value, TakeString(out.Print), nil
-}
-
-// ProgramRunHostRaw runs a program with a direct host-function callback.
-func ProgramRunHostRaw(program uintptr, inputs []RawValue, limits *Limits, names []Str, callback uintptr, userData uintptr) (RawValue, string, error) {
-	if err := EnsureLoaded(); err != nil {
-		return RawValue{}, "", err
-	}
-	out := runRawOutputPool.Get().(*RunRawOutput) //nolint:errcheck // pool only stores *RunRawOutput
-	*out = RunRawOutput{}
-	defer runRawOutputPool.Put(out)
-	status := syscall9(
-		mgProgramRunHostRawAddr,
-		program,
-		sliceAddress(inputs),
-		uintptr(len(inputs)),
-		uintptr(ptrOf(limits)),
-		sliceAddress(names),
-		uintptr(len(names)),
-		callback,
-		userData,
-		uintptr(ptrOf(out)),
-	)
-	runtime.KeepAlive(inputs)
-	runtime.KeepAlive(limits)
-	// names holds Str values whose Ptr fields point at Go strings; keeping the
-	// backing array alive transitively pins those strings across the call.
-	runtime.KeepAlive(names)
-	if status != StatusOK {
-		return RawValue{}, TakeString(out.Print), TakeError(out.Error)
-	}
-	value := out.Value
-	out.Value = RawValue{}
-	return value, TakeString(out.Print), nil
-}
-
-// resetFastOutput clears every header field that the Rust side writes back
-// without touching the 8 KiB Scratch payload. Zeroing the full struct each
-// call would memset all of Scratch even when no flat payload follows.
-func resetFastOutput(out *RunFastOutput) {
-	out.Format = 0
-	out.BytesInScratch = 0
-	out.Value = RawValue{}
-	out.Bytes = Bytes{}
-	out.Print = Bytes{}
-	out.Error = 0
-}
-
-// ProgramCompileRunFastRaw compiles a program, runs it once, and frees it in
-// a single FFI hop. The caller owns out and is responsible for releasing any
-// handles or buffers (Value, Bytes) it contains.
-func ProgramCompileRunFastRaw(args *CompileRunFastRawArgs, out *RunFastOutput) (string, error) {
-	if err := EnsureLoaded(); err != nil {
-		return "", err
-	}
-	resetFastOutput(out)
-	status := syscall2(
-		mgProgramCompileRunFastAddr,
-		uintptr(ptrOf(args)),
-		uintptr(ptrOf(out)),
-	)
-	// Keeping args alive transitively pins everything it references: the Code
-	// string, the InputNames/InputValues backing arrays, and Limits.
-	runtime.KeepAlive(args)
-	if status != StatusOK {
-		return TakeString(out.Print), TakeError(out.Error)
-	}
-	return TakeString(out.Print), nil
-}
-
-// ProgramRunFastRaw runs a program using Rust's fastest selected raw output
-// format. The caller owns out and is responsible for releasing any handles or
-// buffers (Value, Bytes) it contains.
-func ProgramRunFastRaw(program uintptr, inputs []RawValue, limits *Limits, out *RunFastOutput) (string, error) {
-	if err := EnsureLoaded(); err != nil {
-		return "", err
-	}
-	resetFastOutput(out)
-	status := syscall5(
-		mgProgramRunFastAddr,
-		program,
-		sliceAddress(inputs),
-		uintptr(len(inputs)),
-		uintptr(ptrOf(limits)),
-		uintptr(ptrOf(out)),
-	)
-	runtime.KeepAlive(inputs)
-	runtime.KeepAlive(limits)
-	if status != StatusOK {
-		return TakeString(out.Print), TakeError(out.Error)
-	}
-	return TakeString(out.Print), nil
-}
-
-// ProgramRunJSONRaw runs a program and returns its JSON bytes.
-func ProgramRunJSONRaw(program uintptr, inputs []RawValue, limits *Limits) ([]byte, string, error) {
-	if err := EnsureLoaded(); err != nil {
-		return nil, "", err
-	}
-	out := runJSONOutputPool.Get().(*RunJSONOutput) //nolint:errcheck // pool only stores *RunJSONOutput
-	*out = RunJSONOutput{}
-	defer runJSONOutputPool.Put(out)
-	status := syscall5(
-		mgProgramRunJSONAddr,
-		program,
-		sliceAddress(inputs),
-		uintptr(len(inputs)),
-		uintptr(ptrOf(limits)),
-		uintptr(ptrOf(out)),
-	)
-	runtime.KeepAlive(inputs)
-	runtime.KeepAlive(limits)
-	if status != StatusOK {
-		return nil, TakeString(out.Print), TakeError(out.Error)
-	}
-	return TakeBytes(out.Value), TakeString(out.Print), nil
-}
-
-// ProgramDump serializes a program handle.
-func ProgramDump(program uintptr) ([]byte, error) {
-	var buffer Bytes
-	var errHandle uintptr
-	status := mgProgramDump(program, ptrOf(&buffer), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	return TakeBytes(buffer), nil
-}
-
-// ProgramCode returns the source code stored in a program handle.
-func ProgramCode(program uintptr) (string, error) {
-	var buffer Bytes
-	var errHandle uintptr
-	status := mgProgramCode(program, ptrOf(&buffer), ptrOf(&errHandle))
-	if status != StatusOK {
-		return "", TakeError(errHandle)
-	}
-	return TakeString(buffer), nil
-}
-
-// ProgramScriptName returns the script name stored in a program handle.
-func ProgramScriptName(program uintptr) (string, error) {
-	var buffer Bytes
-	var errHandle uintptr
-	status := mgProgramScriptName(program, ptrOf(&buffer), ptrOf(&errHandle))
-	if status != StatusOK {
-		return "", TakeError(errHandle)
-	}
-	return TakeString(buffer), nil
-}
-
-// ProgramInputNames returns the ordered input names stored in a program handle.
-func ProgramInputNames(program uintptr) ([]string, error) {
-	var handle, errHandle uintptr
-	status := mgProgramInputNames(program, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	defer ValueFree(handle)
-	return stringListFromValue(handle)
-}
-
-// ProgramLoad restores a program handle from a snapshot created by ProgramDump.
-func ProgramLoad(snapshot []byte) (uintptr, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, err
-	}
-	snapshotPtr, snapshotLen := BytesRef(snapshot)
-	var programHandle, errHandle uintptr
-	status := mgProgramLoad(snapshotPtr, snapshotLen, ptrOf(&programHandle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return programHandle, nil
-}
-
-// ValueFree releases a Rust-side value handle.
-func ValueFree(handle uintptr) {
-	if handle != 0 {
-		mgValueFree(handle)
-	}
-}
-
-// ValueJSON serializes a value handle to JSON bytes.
-func ValueJSON(handle uintptr) ([]byte, error) {
-	var buffer Bytes
-	var errHandle uintptr
-	status := mgValueJSON(handle, ptrOf(&buffer), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	return TakeBytes(buffer), nil
-}
-
-// ValueNone creates a Python None value handle.
-func ValueNone() uintptr { return mgValueNone() }
-
-// ValueEllipsis creates a Python Ellipsis value handle.
-func ValueEllipsis() uintptr { return mgValueEllipsis() }
-
-// ValueBool creates a Python bool value handle.
-func ValueBool(v bool) uintptr { return mgValueBool(boolByte(v)) }
-
-// ValueInt creates a Python int value handle from an int64.
-func ValueInt(v int64) uintptr { return mgValueInt(v) }
-
-// ValueFloat creates a Python float value handle.
-func ValueFloat(v float64) uintptr { return mgValueFloat(v) }
-
-// ValueKind returns the RawValue kind discriminant for a value handle.
-func ValueKind(v uintptr) uint32 { return mgValueKind(v) }
-
-// ValueBoolGet extracts a bool payload from a value handle.
-func ValueBoolGet(v uintptr) bool { return mgValueBoolGet(v) != 0 }
-
-// ValueIntGet extracts an int64 payload from a value handle.
-func ValueIntGet(v uintptr) int64 { return mgValueIntGet(v) }
-
-// ValueFloatGet extracts a float64 payload from a value handle.
-func ValueFloatGet(v uintptr) float64 { return mgValueFloatGet(v) }
-
-// ValueLen returns the item count for sequence and mapping value handles.
-func ValueLen(v uintptr) uintptr { return mgValueLen(v) }
-
-// ValueItemsRaw copies sequence items into out as RawValue values.
-func ValueItemsRaw(v uintptr, out []RawValue) error {
-	if status := mgValueItemsRaw(v, slicePointer(out), uintptr(len(out))); status != StatusOK {
-		return errors.New("monty: value is not a sequence")
-	}
-	return nil
-}
-
-// ValuePairsRaw copies dict pairs into out as RawPair values.
-func ValuePairsRaw(v uintptr, out []RawPair) error {
-	if status := mgValuePairsRaw(v, slicePointer(out), uintptr(len(out))); status != StatusOK {
-		return errors.New("monty: value is not a dict")
-	}
-	return nil
-}
-
-// ValueBigInt creates a Python int value handle from a base-10 string.
-func ValueBigInt(v string) (uintptr, error) {
-	var handle, errHandle uintptr
-	valuePtr, valueLen := stringArgs(v)
-	status := mgValueBigInt(valuePtr, valueLen, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueString creates a Python str value handle.
-func ValueString(v string) (uintptr, error) {
-	var handle, errHandle uintptr
-	valuePtr, valueLen := stringArgs(v)
-	status := mgValueString(valuePtr, valueLen, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValuePath creates a Python pathlib-style path value handle.
-func ValuePath(v string) (uintptr, error) {
-	var handle, errHandle uintptr
-	valuePtr, valueLen := stringArgs(v)
-	status := mgValuePath(valuePtr, valueLen, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueBytes creates a Python bytes value handle.
-func ValueBytes(v []byte) (uintptr, error) {
-	valuePtr, valueLen := BytesRef(v)
-	var handle, errHandle uintptr
-	status := mgValueBytes(valuePtr, valueLen, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueListRaw creates a Python list handle from raw values.
-func ValueListRaw(values []RawValue) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueListRaw(slicePointer(values), uintptr(len(values)), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueTupleRaw creates a Python tuple handle from raw values.
-func ValueTupleRaw(values []RawValue) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueTupleRaw(slicePointer(values), uintptr(len(values)), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueNamedTupleRaw creates a Python namedtuple-like handle from raw values.
-func ValueNamedTupleRaw(typeName string, fieldNames []string, values []RawValue) (uintptr, error) {
-	if len(fieldNames) != len(values) {
-		return 0, errors.New("monty: named tuple field names and values have different lengths")
-	}
-	namePtr, nameLen := stringArgs(typeName)
-	names := stringRefs(fieldNames)
-	var handle, errHandle uintptr
-	status := mgValueNamedTupleRaw(namePtr, nameLen, slicePointer(names), slicePointer(values), uintptr(len(values)), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueSetRaw creates a Python set handle from raw values.
-func ValueSetRaw(values []RawValue) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueSetRaw(slicePointer(values), uintptr(len(values)), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueFrozenSetRaw creates a Python frozenset handle from raw values.
-func ValueFrozenSetRaw(values []RawValue) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueFrozenSetRaw(slicePointer(values), uintptr(len(values)), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueDictRaw creates a Python dict handle from raw key/value pairs.
-func ValueDictRaw(pairs []RawPair) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueDictRaw(slicePointer(pairs), uintptr(len(pairs)), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueDate creates a Python date handle.
-func ValueDate(value Date) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueDate(ptrOf(&value), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueDateTime creates a Python datetime handle.
-func ValueDateTime(value DateTime) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueDateTime(ptrOf(&value), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueTimeDelta creates a Python timedelta handle.
-func ValueTimeDelta(value TimeDelta) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueTimeDelta(ptrOf(&value), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueTimeZone creates a Python timezone handle.
-func ValueTimeZone(value TimeZone) (uintptr, error) {
-	var handle, errHandle uintptr
-	status := mgValueTimeZone(ptrOf(&value), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueDataclassRaw creates a Python dataclass-like handle from raw pairs.
-func ValueDataclassRaw(name string, typeID uint64, fieldNames []string, attrs []RawPair, frozen bool) (uintptr, error) {
-	names := stringRefs(fieldNames)
-	var handle, errHandle uintptr
-	args := DataclassRawArgs{
-		Name:       StringRef(name),
-		TypeID:     typeID,
-		FieldNames: slicePointer(names),
-		FieldCount: uintptr(len(names)),
-		Attrs:      slicePointer(attrs),
-		AttrCount:  uintptr(len(attrs)),
-		Frozen:     boolByte(frozen),
-	}
-	status := mgValueDataclassRaw(ptrOf(&args), ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueFunction creates a Python external-function marker handle.
-func ValueFunction(name, doc string) (uintptr, error) {
-	var handle, errHandle uintptr
-	namePtr, nameLen := stringArgs(name)
-	docPtr, docLen := stringArgs(doc)
-	status := mgValueFunction(namePtr, nameLen, docPtr, docLen, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueException creates a Python exception value handle.
-func ValueException(excType, message string) (uintptr, error) {
-	var handle, errHandle uintptr
-	excPtr, excLen := stringArgs(excType)
-	msgPtr, msgLen := stringArgs(message)
-	status := mgValueException(excPtr, excLen, msgPtr, msgLen, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return handle, nil
-}
-
-// ValueExceptionType returns the exception type name from a value handle.
-func ValueExceptionType(v uintptr) (string, error) {
-	var text Bytes
-	var errHandle uintptr
-	status := mgValueExceptionType(v, ptrOf(&text), ptrOf(&errHandle))
-	if status != StatusOK {
-		return "", TakeError(errHandle)
-	}
-	return TakeString(text), nil
-}
-
-// ValueExceptionMessage returns the exception message from a value handle.
-func ValueExceptionMessage(v uintptr) (string, error) {
-	var text Bytes
-	var errHandle uintptr
-	status := mgValueExceptionMessage(v, ptrOf(&text), ptrOf(&errHandle))
-	if status != StatusOK {
-		return "", TakeError(errHandle)
-	}
-	return TakeString(text), nil
-}
-
-// ValueText returns the textual payload or representation for a value handle.
-func ValueText(v uintptr) (string, error) {
-	var text Bytes
-	var errHandle uintptr
-	status := mgValueText(v, ptrOf(&text), ptrOf(&errHandle))
-	if status != StatusOK {
-		return "", TakeError(errHandle)
-	}
-	return TakeString(text), nil
-}
-
-// ValueBytesGet returns the byte payload from a bytes value handle.
-func ValueBytesGet(v uintptr) ([]byte, error) {
-	var bytes Bytes
-	var errHandle uintptr
-	status := mgValueBytesGet(v, ptrOf(&bytes), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	return TakeBytes(bytes), nil
-}
-
-// ValueDateGet returns the date payload from a value handle.
-func ValueDateGet(v uintptr) (Date, error) {
-	var value Date
-	var errHandle uintptr
-	status := mgValueDateGet(v, ptrOf(&value), ptrOf(&errHandle))
-	if status != StatusOK {
-		return Date{}, TakeError(errHandle)
-	}
-	return value, nil
-}
-
-// ValueDateTimeGet returns the datetime payload from a value handle.
-func ValueDateTimeGet(v uintptr) (DateTime, error) {
-	var value DateTime
-	var errHandle uintptr
-	status := mgValueDateTimeGet(v, ptrOf(&value), ptrOf(&errHandle))
-	if status != StatusOK {
-		return DateTime{}, TakeError(errHandle)
-	}
-	return value, nil
-}
-
-// ValueTimeDeltaGet returns the timedelta payload from a value handle.
-func ValueTimeDeltaGet(v uintptr) (TimeDelta, error) {
-	var value TimeDelta
-	var errHandle uintptr
-	status := mgValueTimeDeltaGet(v, ptrOf(&value), ptrOf(&errHandle))
-	if status != StatusOK {
-		return TimeDelta{}, TakeError(errHandle)
-	}
-	return value, nil
-}
-
-// ValueTimeZoneGet returns the timezone payload from a value handle.
-func ValueTimeZoneGet(v uintptr) (TimeZone, error) {
-	var value TimeZone
-	var errHandle uintptr
-	status := mgValueTimeZoneGet(v, ptrOf(&value), ptrOf(&errHandle))
-	if status != StatusOK {
-		return TimeZone{}, TakeError(errHandle)
-	}
-	return value, nil
-}
-
-// ValueNamedTupleTypeName returns the type name from a namedtuple value handle.
-func ValueNamedTupleTypeName(v uintptr) (string, error) {
-	var text Bytes
-	var errHandle uintptr
-	status := mgValueNamedTupleTypeName(v, ptrOf(&text), ptrOf(&errHandle))
-	if status != StatusOK {
-		return "", TakeError(errHandle)
-	}
-	return TakeString(text), nil
-}
-
-// ValueNamedTupleFieldNames returns field names from a namedtuple value handle.
-func ValueNamedTupleFieldNames(v uintptr) ([]string, error) {
-	var handle, errHandle uintptr
-	status := mgValueNamedTupleFieldNames(v, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	defer ValueFree(handle)
-	return stringListFromValue(handle)
-}
-
-// ValueDataclassName returns the class name from a dataclass value handle.
-func ValueDataclassName(v uintptr) (string, error) {
-	var text Bytes
-	var errHandle uintptr
-	status := mgValueDataclassName(v, ptrOf(&text), ptrOf(&errHandle))
-	if status != StatusOK {
-		return "", TakeError(errHandle)
-	}
-	return TakeString(text), nil
-}
-
-// ValueDataclassTypeID returns the type ID from a dataclass value handle.
-func ValueDataclassTypeID(v uintptr) uint64 { return mgValueDataclassTypeID(v) }
-
-// ValueDataclassFieldNames returns field names from a dataclass value handle.
-func ValueDataclassFieldNames(v uintptr) ([]string, error) {
-	var handle, errHandle uintptr
-	status := mgValueDataclassFieldNames(v, ptrOf(&handle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	defer ValueFree(handle)
-	return stringListFromValue(handle)
-}
-
-// ValueDataclassFrozen reports whether a dataclass value handle is frozen.
-func ValueDataclassFrozen(v uintptr) bool { return mgValueDataclassFrozen(v) != 0 }
-
-func stringListFromValue(handle uintptr) ([]string, error) {
-	count := int(ValueLen(handle))
-	if count == 0 {
-		return nil, nil
-	}
-	rawItems := make([]RawValue, count)
-	if err := ValueItemsRaw(handle, rawItems); err != nil {
+// decodeErrorDetails parses the flat buffer written by mg_error_details.
+func decodeErrorDetails(data string) (*Error, error) {
+	r := flatStringReader{data: data}
+	out := &Error{}
+	var err error
+	if out.Type, err = r.str(); err != nil {
 		return nil, err
 	}
-	names := make([]string, count)
-	for i := range rawItems {
-		if rawItems[i].Kind != KindString {
-			for j := i; j < len(rawItems); j++ {
-				RawValueFree(&rawItems[j])
-			}
-			return nil, fmt.Errorf("monty: field name %d is %d, not string", i, rawItems[i].Kind)
+	if out.Message, err = r.str(); err != nil {
+		return nil, err
+	}
+	if out.Display, err = r.str(); err != nil {
+		return nil, err
+	}
+	count, err := r.u32()
+	if err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		out.Traceback = make([]Frame, 0, count)
+	}
+	for range count {
+		var frame Frame
+		line, err := r.u32()
+		if err != nil {
+			return nil, err
 		}
-		names[i] = TakeString(Bytes{Ptr: rawItems[i].Ptr, Len: rawItems[i].Len})
-		rawItems[i].Ptr = nil
-		rawItems[i].Len = 0
+		column, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		endLine, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		endColumn, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		flags, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		frame.Line, frame.Column = int(line), int(column)
+		frame.EndLine, frame.EndColumn = int(endLine), int(endColumn)
+		frame.HasFunction = flags&frameHasFunction != 0
+		frame.HasSourceLine = flags&frameHasSource != 0
+		frame.HideCaret = flags&frameHideCaret != 0
+		frame.HideFrameName = flags&frameHideFrameName != 0
+		if frame.File, err = r.str(); err != nil {
+			return nil, err
+		}
+		if frame.HasFunction {
+			if frame.Function, err = r.str(); err != nil {
+				return nil, err
+			}
+		}
+		if frame.HasSourceLine {
+			if frame.SourceLine, err = r.str(); err != nil {
+				return nil, err
+			}
+		}
+		out.Traceback = append(out.Traceback, frame)
 	}
-	return names, nil
+	if !r.done() {
+		return nil, errors.New("monty: trailing bytes in error details")
+	}
+	return out, nil
 }
 
-// ProgressFree releases a Rust-side progress handle.
-func ProgressFree(handle uintptr) {
-	if handle != 0 {
-		mgProgressFree(handle)
-	}
+// flatStringReader decodes the little-endian length-prefixed encodings shared
+// by the error-details payload.
+type flatStringReader struct {
+	data string
+	pos  int
 }
 
-// ProgressSnapshotGet returns a zero-copy snapshot of a progress handle.
-func ProgressSnapshotGet(handle uintptr) (ProgressSnapshot, error) {
-	out := progressSnapshotPool.Get().(*ProgressSnapshot) //nolint:errcheck // pool only stores *ProgressSnapshot
-	*out = ProgressSnapshot{}
-	defer progressSnapshotPool.Put(out)
-	status := syscall2(
-		mgProgressSnapshotAddr,
-		handle,
-		uintptr(ptrOf(out)),
-	)
-	runtime.KeepAlive(out)
-	snapshot := *out
-	if status != StatusOK {
-		return snapshot, TakeError(snapshot.Error)
+func (r *flatStringReader) u8() (uint8, error) {
+	if r.pos+1 > len(r.data) {
+		return 0, errors.New("monty: truncated error details")
 	}
-	return snapshot, nil
+	v := r.data[r.pos]
+	r.pos++
+	return v, nil
 }
 
-// ProgressPendingLen returns the number of pending future call IDs.
-func ProgressPendingLen(handle uintptr) uintptr { return mgProgressPendingLen(handle) }
-
-// ProgressPendingID returns the pending future call ID at index i.
-func ProgressPendingID(handle uintptr, i uintptr) uint32 { return mgProgressPendingID(handle, i) }
-
-// ProgressResumePending resumes a function-call progress as a pending future.
-func ProgressResumePending(progress uintptr) (uintptr, string, error) {
-	var out ProgressOutput
-	status := mgProgressResumePending(progress, ptrOf(&out))
-	if status != StatusOK {
-		return 0, TakeString(out.Print), TakeError(out.Error)
+func (r *flatStringReader) u32() (uint32, error) {
+	if r.pos+4 > len(r.data) {
+		return 0, errors.New("monty: truncated error details")
 	}
-	return out.Progress, TakeString(out.Print), nil
+	v := binary.LittleEndian.Uint32([]byte(r.data[r.pos : r.pos+4]))
+	r.pos += 4
+	return v, nil
 }
 
-// ProgressResumeReturnRawSnapshot resumes a progress handle with a raw value and
-// returns the next progress handle and its snapshot in a single FFI hop.
-// Progress is 0 when the snapshot is Complete. The caller owns the returned
-// snapshot's buffers.
-func ProgressResumeReturnRawSnapshot(progress uintptr, value *RawValue) (uintptr, ProgressSnapshot, string, error) {
-	out := progressSnapshotOutputPool.Get().(*ProgressSnapshotOutput) //nolint:errcheck // pool only stores *ProgressSnapshotOutput
-	*out = ProgressSnapshotOutput{}
-	defer progressSnapshotOutputPool.Put(out)
-	status := syscall3(
-		mgProgressResumeReturnRawSnapshotAddr,
-		progress,
-		uintptr(ptrOf(value)),
-		uintptr(ptrOf(out)),
-	)
-	runtime.KeepAlive(value)
-	runtime.KeepAlive(out)
-	printed := TakeString(out.Print)
-	if status != StatusOK {
-		return 0, ProgressSnapshot{}, printed, TakeError(out.Error)
+func (r *flatStringReader) str() (string, error) {
+	size, err := r.u32()
+	if err != nil {
+		return "", err
 	}
-	return out.Progress, out.Snapshot, printed, nil
+	if r.pos+int(size) > len(r.data) {
+		return "", errors.New("monty: truncated error details string")
+	}
+	v := r.data[r.pos : r.pos+int(size)]
+	r.pos += int(size)
+	return v, nil
 }
 
-// ProgressResumeException resumes a progress handle by raising an exception.
-func ProgressResumeException(progress uintptr, excType, message string) (uintptr, string, error) {
-	var out ProgressOutput
-	excPtr, excLen := stringArgs(excType)
-	msgPtr, msgLen := stringArgs(message)
-	status := mgProgressResumeException(progress, excPtr, excLen, msgPtr, msgLen, ptrOf(&out))
-	if status != StatusOK {
-		return 0, TakeString(out.Print), TakeError(out.Error)
-	}
-	return out.Progress, TakeString(out.Print), nil
-}
-
-// ProgressResumeNameValueRawSnapshot resumes a name lookup with a raw value
-// and returns the next progress handle and its snapshot in a single FFI hop.
-// Progress is 0 when the snapshot is Complete. The caller owns the returned
-// snapshot's buffers.
-func ProgressResumeNameValueRawSnapshot(progress uintptr, value *RawValue) (uintptr, ProgressSnapshot, string, error) {
-	out := progressSnapshotOutputPool.Get().(*ProgressSnapshotOutput) //nolint:errcheck // pool only stores *ProgressSnapshotOutput
-	*out = ProgressSnapshotOutput{}
-	defer progressSnapshotOutputPool.Put(out)
-	status := syscall3(
-		mgProgressResumeNameValueRawSnapshotAddr,
-		progress,
-		uintptr(ptrOf(value)),
-		uintptr(ptrOf(out)),
-	)
-	runtime.KeepAlive(value)
-	runtime.KeepAlive(out)
-	printed := TakeString(out.Print)
-	if status != StatusOK {
-		return 0, ProgressSnapshot{}, printed, TakeError(out.Error)
-	}
-	return out.Progress, out.Snapshot, printed, nil
-}
-
-// ProgressResumeNameUndefinedSnapshot resumes a name lookup as undefined and
-// returns the next progress handle and its snapshot in a single FFI hop.
-// Progress is 0 when the snapshot is Complete. The caller owns the returned
-// snapshot's buffers.
-func ProgressResumeNameUndefinedSnapshot(progress uintptr) (uintptr, ProgressSnapshot, string, error) {
-	out := progressSnapshotOutputPool.Get().(*ProgressSnapshotOutput) //nolint:errcheck // pool only stores *ProgressSnapshotOutput
-	*out = ProgressSnapshotOutput{}
-	defer progressSnapshotOutputPool.Put(out)
-	status := syscall2(
-		mgProgressResumeNameUndefinedSnapshotAddr,
-		progress,
-		uintptr(ptrOf(out)),
-	)
-	runtime.KeepAlive(out)
-	printed := TakeString(out.Print)
-	if status != StatusOK {
-		return 0, ProgressSnapshot{}, printed, TakeError(out.Error)
-	}
-	return out.Progress, out.Snapshot, printed, nil
-}
-
-// ProgressResumeFutures resumes a progress handle with resolved future results.
-func ProgressResumeFutures(progress uintptr, results []FutureResult) (uintptr, string, error) {
-	var out ProgressOutput
-	status := mgProgressResumeFutures(progress, slicePointer(results), uintptr(len(results)), ptrOf(&out))
-	if status != StatusOK {
-		return 0, TakeString(out.Print), TakeError(out.Error)
-	}
-	return out.Progress, TakeString(out.Print), nil
-}
-
-// ProgressDump serializes a progress handle.
-func ProgressDump(progress uintptr) ([]byte, error) {
-	var buffer Bytes
-	var errHandle uintptr
-	status := mgProgressDump(progress, ptrOf(&buffer), ptrOf(&errHandle))
-	if status != StatusOK {
-		return nil, TakeError(errHandle)
-	}
-	return TakeBytes(buffer), nil
-}
-
-// ProgressLoad restores a progress handle from a snapshot created by ProgressDump.
-func ProgressLoad(snapshot []byte) (uintptr, error) {
-	if err := EnsureLoaded(); err != nil {
-		return 0, err
-	}
-	snapshotPtr, snapshotLen := BytesRef(snapshot)
-	var progressHandle, errHandle uintptr
-	status := mgProgressLoad(snapshotPtr, snapshotLen, ptrOf(&progressHandle), ptrOf(&errHandle))
-	if status != StatusOK {
-		return 0, TakeError(errHandle)
-	}
-	return progressHandle, nil
-}
+func (r *flatStringReader) done() bool { return r.pos == len(r.data) }
 
 func boolByte(v bool) uint8 {
 	if v {

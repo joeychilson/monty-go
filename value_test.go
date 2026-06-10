@@ -2,298 +2,177 @@ package monty
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"reflect"
+	"slices"
 	"testing"
 	"time"
 )
 
-func TestValueDefensiveCopies(t *testing.T) {
-	sourceBytes := []byte("abc")
-	bytesValue := Bytes(sourceBytes)
-	sourceBytes[0] = 'z'
-	if got := string(bytesValue.Bytes()); got != "abc" {
-		t.Fatalf("bytes = %q, want abc", got)
+func TestValueConstructorsAndAccessors(t *testing.T) {
+	cases := []struct {
+		value Value
+		kind  Kind
+		repr  string
+	}{
+		{None(), NoneKind, "None"},
+		{Ellipsis(), EllipsisKind, "Ellipsis"},
+		{Bool(true), BoolKind, "True"},
+		{Int(42), IntKind, "42"},
+		{Int64(-7), IntKind, "-7"},
+		{BigInt("123456789012345678901234567890"), BigIntKind, "123456789012345678901234567890"},
+		{Float(1.5), FloatKind, "1.5"},
+		{Str("hi"), StringKind, "hi"},
+		{Bytes([]byte{0x61}), BytesKind, `"a"`},
+		{List(Int(1), Int(2)), ListKind, "[1, 2]"},
+		{Tuple(Int(1), Str("a")), TupleKind, "(1, a)"},
+		{Set(Int(1)), SetKind, "{1}"},
+		{FrozenSet(), FrozenSetKind, "frozenset()"},
+		{Dict(KV("k", Int(1))), DictKind, "{k: 1}"},
+		{Path("/tmp/x").MontyValue(), PathKind, "/tmp/x"},
+		{Date{Year: 2026, Month: time.May, Day: 12}.MontyValue(), DateKind, "2026-05-12"},
+		{TimeDelta{Days: 1, Seconds: 2, Microseconds: 3}.MontyValue(), TimeDeltaKind, "1d 2s 3us"},
+		{Exception{Type: "ValueError", Message: "bad"}.MontyValue(), ExceptionKind, "ValueError: bad"},
 	}
-	copiedBytes := bytesValue.Bytes()
-	copiedBytes[1] = 'z'
-	if got := string(bytesValue.Bytes()); got != "abc" {
-		t.Fatalf("bytes after mutation = %q, want abc", got)
-	}
-
-	list := List(Int(1), Int(2))
-	items := list.Items()
-	items[0] = Int(99)
-	if got := list.Items()[0].Int(); got != 1 {
-		t.Fatalf("list item = %d, want 1", got)
-	}
-
-	dict := Dict(Pair{Key: Str("x"), Value: Int(1)})
-	pairs := dict.Pairs()
-	pairs[0].Value = Int(99)
-	if got := dict.Pairs()[0].Value.Int(); got != 1 {
-		t.Fatalf("dict value = %d, want 1", got)
-	}
-}
-
-func TestFromStruct(t *testing.T) {
-	type sample struct {
-		Count int    `monty:"count"`
-		Name  string `monty:"name"`
-	}
-
-	value, err := From(sample{Count: 2, Name: "ok"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if value.Kind() != DictKind {
-		t.Fatalf("kind = %s, want Dict", value.Kind())
-	}
-	if got := value.Pairs()[0].Key.Str(); got != "count" {
-		t.Fatalf("first key = %q, want count", got)
+	for _, tc := range cases {
+		if tc.value.Kind() != tc.kind {
+			t.Errorf("%s: kind = %s, want %s", tc.repr, tc.value.Kind(), tc.kind)
+		}
+		if got := tc.value.String(); got != tc.repr {
+			t.Errorf("String() = %q, want %q", got, tc.repr)
+		}
 	}
 }
 
-func TestStringDict(t *testing.T) {
-	dict := StringDict(map[string]Value{"x": Int(1)})
-	if dict.Kind() != DictKind {
-		t.Fatalf("kind = %s, want Dict", dict.Kind())
+func TestValueCollections(t *testing.T) {
+	dict := Dict(
+		KV("a", Int(1)),
+		KV("b", Str("two")),
+		Pair{Key: Tuple(Int(1), Int(2)), Value: Str("tuple-key")},
+	)
+	if dict.Len() != 3 {
+		t.Fatalf("Len = %d", dict.Len())
 	}
-	if got := dict.Pairs()[0].Key.Str(); got != "x" {
-		t.Fatalf("key = %q, want x", got)
+	if v, ok := dict.Get("b"); !ok || v.Str() != "two" {
+		t.Fatalf("Get(b) = %v %v", v, ok)
+	}
+	if v, ok := dict.Get([]any{1, 2}); ok {
+		t.Fatalf("Get(slice key) should not match a tuple key, got %v", v)
+	}
+	if _, ok := dict.Get("missing"); ok {
+		t.Fatal("Get(missing) reported ok")
+	}
+
+	list := List(Int(10), Int(20), Int(30))
+	if list.Index(1).Int() != 20 {
+		t.Fatalf("Index(1) = %v", list.Index(1))
+	}
+	if list.Index(5).Kind() != InvalidKind {
+		t.Fatal("Index out of range should be invalid")
+	}
+	var sum int
+	for v := range list.Elems() {
+		sum += v.Int()
+	}
+	if sum != 60 {
+		t.Fatalf("sum = %d", sum)
+	}
+
+	nt := NamedTuple{Type: "Point", Fields: []string{"x", "y"}, Values: []Value{Int(1), Int(2)}}.MontyValue()
+	if v, ok := nt.Attr("y"); !ok || v.Int() != 2 {
+		t.Fatalf("Attr(y) = %v %v", v, ok)
+	}
+	if nt.String() != "Point(x=1, y=2)" {
+		t.Fatalf("namedtuple repr = %q", nt.String())
 	}
 }
 
-func TestRichDateTimeValues(t *testing.T) {
-	program, err := Compile(`
-from datetime import date, datetime, timedelta, timezone
-(
-    date(2024, 5, 6),
-    datetime(2024, 5, 6, 7, 8, 9, 123456, tzinfo=timezone(timedelta(hours=-5), "CDT")),
-    timedelta(days=2, seconds=3, microseconds=4),
-    timezone(timedelta(hours=5, minutes=30), "IST"),
-)
-`)
-	if err != nil {
-		t.Fatal(err)
+func TestValueInterface(t *testing.T) {
+	value := Dict(
+		KV("n", Int(1)),
+		KV("items", List(Str("a"), Str("b"))),
+	)
+	native, ok := value.Interface().(map[any]any)
+	if !ok {
+		t.Fatalf("Interface() = %T", value.Interface())
 	}
-	defer program.Close()
-
-	value, err := program.Run(context.Background(), nil)
-	if err != nil {
-		t.Fatal(err)
+	if native["n"] != int64(1) {
+		t.Fatalf("n = %v", native["n"])
 	}
-	items := value.Items()
-	if got := items[0].Kind(); got != DateKind {
-		t.Fatalf("date kind = %s, want Date", got)
-	}
-	if got, want := items[0].Date(), (MontyDate{Year: 2024, Month: time.May, Day: 6}); got != want {
-		t.Fatalf("date = %+v, want %+v", got, want)
-	}
-	datetime := items[1].DateTime()
-	if items[1].Kind() != DateTimeKind || datetime.Year != 2024 || datetime.Microsecond != 123456 || !datetime.HasOffset || datetime.OffsetSeconds != -5*60*60 {
-		t.Fatalf("datetime = kind %s payload %+v", items[1].Kind(), datetime)
-	}
-	delta := items[2].TimeDelta()
-	if items[2].Kind() != TimeDeltaKind || delta != (MontyTimeDelta{Days: 2, Seconds: 3, Microseconds: 4}) {
-		t.Fatalf("timedelta = kind %s payload %+v", items[2].Kind(), delta)
-	}
-	zone := items[3].TimeZone()
-	if items[3].Kind() != TimeZoneKind || !zone.HasName || zone.Name != "IST" || zone.OffsetSeconds != 5*60*60+30*60 {
-		t.Fatalf("timezone = kind %s payload %+v", items[3].Kind(), zone)
+	items, ok := native["items"].([]any)
+	if !ok || len(items) != 2 || items[0] != "a" {
+		t.Fatalf("items = %v", native["items"])
 	}
 }
 
-// TestSetStringRepr guards §3.8: sets and frozensets must print with their own
-// Python-like repr rather than list brackets.
-func TestSetStringRepr(t *testing.T) {
-	if got := Set(Int(1)).String(); got != "{1}" {
-		t.Errorf("Set String() = %q, want {1}", got)
+func TestValueMarshalJSON(t *testing.T) {
+	payload := Dict(
+		KV("name", Str("x")),
+		KV("tuple", Tuple(Int(1), Int(2))),
+	)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := Set().String(); got != "set()" {
-		t.Errorf("empty Set String() = %q, want set()", got)
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
 	}
-	if got := FrozenSet(Int(1)).String(); got != "frozenset({1})" {
-		t.Errorf("FrozenSet String() = %q, want frozenset({1})", got)
+	if decoded["name"] != "x" {
+		t.Fatalf("name = %v", decoded["name"])
 	}
-	if got := FrozenSet().String(); got != "frozenset()" {
-		t.Errorf("empty FrozenSet String() = %q, want frozenset()", got)
-	}
-	if got := List(Int(1)).String(); got != "[1]" {
-		t.Errorf("List String() = %q, want [1]", got)
+	tagged, ok := decoded["tuple"].(map[string]any)
+	if !ok || tagged["$tuple"] == nil {
+		t.Fatalf("tuple = %v", decoded["tuple"])
 	}
 }
 
-// TestDateTimeStringNaiveVsAware guards §3.7: a naive Python datetime must not
-// print a "Z" suffix it never asserted, while an aware datetime keeps its
-// offset.
-func TestDateTimeStringNaiveVsAware(t *testing.T) {
-	program, err := Compile(`
-from datetime import datetime, timezone, timedelta
-(
-    datetime(2026, 1, 2, 10, 0, 0),
-    datetime(2026, 1, 2, 10, 0, 0, tzinfo=timezone(timedelta(hours=-5))),
-)
-`)
+func TestDateTimeRoundTrip(t *testing.T) {
+	aware := DateTime{
+		Year: 2026, Month: time.June, Day: 9,
+		Hour: 12, Minute: 30, Second: 15, Microsecond: 250,
+		TZ: &TimeZone{Offset: -7 * time.Hour, Name: "PDT"},
+	}
+	value, err := Eval(context.Background(), "dt", map[string]any{"dt": aware})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer program.Close()
+	got := value.DateTime()
+	if got.TZ == nil || got.TZ.Offset != -7*time.Hour || got.TZ.Name != "PDT" {
+		t.Fatalf("TZ = %+v", got.TZ)
+	}
+	if got.Hour != 12 || got.Microsecond != 250 {
+		t.Fatalf("got %+v", got)
+	}
 
-	value, err := program.Run(context.Background(), nil)
+	naive := DateTime{Year: 2026, Month: time.June, Day: 9}
+	value, err = Eval(context.Background(), "dt", map[string]any{"dt": naive})
 	if err != nil {
 		t.Fatal(err)
 	}
-	items := value.Items()
-
-	naive := items[0]
-	if naive.DateTime().HasOffset {
-		t.Fatal("first datetime should be naive")
-	}
-	if got := naive.String(); got != "2026-01-02T10:00:00" {
-		t.Fatalf("naive datetime String() = %q, want no timezone suffix", got)
-	}
-
-	aware := items[1]
-	if !aware.DateTime().HasOffset {
-		t.Fatal("second datetime should be aware")
-	}
-	if got := aware.String(); got != "2026-01-02T10:00:00-05:00" {
-		t.Fatalf("aware datetime String() = %q, want -05:00 suffix", got)
+	if value.DateTime().TZ != nil {
+		t.Fatalf("naive datetime came back aware: %+v", value.DateTime())
 	}
 }
 
-func TestRichNamedTupleAndDataclassValues(t *testing.T) {
-	program, err := Compile(`point`, WithInputs("point"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer program.Close()
-
-	value, err := program.Run(context.Background(), Inputs{
-		"point": NamedTuple("Point", []string{"x", "y"}, Int(1), Int(2)),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	named := value.NamedTuple()
-	if value.Kind() != NamedTupleKind || named.TypeName != "Point" || !reflect.DeepEqual(named.FieldNames, []string{"x", "y"}) {
-		t.Fatalf("namedtuple = kind %s payload %+v", value.Kind(), named)
-	}
-	if got := named.Values[1].Int(); got != 2 {
-		t.Fatalf("namedtuple y = %d, want 2", got)
-	}
-
-	dataclassProgram, err := Compile(`user`, WithInputs("user"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer dataclassProgram.Close()
-	dataclassValue, err := dataclassProgram.Run(context.Background(), Inputs{
-		"user": Dataclass("User", 42, []string{"id", "name"}, []Pair{
-			{Key: Str("id"), Value: Int(7)},
-			{Key: Str("name"), Value: Str("Ada")},
-		}, true),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	dataclass := dataclassValue.Dataclass()
-	if dataclassValue.Kind() != DataclassKind || dataclass.Name != "User" || dataclass.TypeID != 42 || !dataclass.Frozen || !reflect.DeepEqual(dataclass.FieldNames, []string{"id", "name"}) {
-		t.Fatalf("dataclass = kind %s payload %+v", dataclassValue.Kind(), dataclass)
-	}
-	if got := dataclass.Attrs[1].Value.Str(); got != "Ada" {
-		t.Fatalf("dataclass name = %q, want Ada", got)
-	}
-}
-
-func TestRichValuesAsInputs(t *testing.T) {
-	program, err := Compile(`
-(
-    point.x + point.y,
-    event.year,
-    delta.total_seconds(),
-    zone,
-    tags == {1, 2},
-)
-`, WithInputs("point", "event", "delta", "zone", "tags"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer program.Close()
-
-	result, err := program.Run(context.Background(), Inputs{
-		"point": NamedTuple("Point", []string{"x", "y"}, Int(3), Int(4)),
-		"event": DateTime(MontyDateTime{
-			Year:         2026,
-			Month:        time.May,
-			Day:          12,
-			Hour:         9,
-			HasOffset:    true,
-			TimezoneName: "UTC",
-		}),
-		"delta": TimeDeltaValue(MontyTimeDeltaFromDuration(90 * time.Second)),
-		"zone":  TimeZone(2*60*60, "EET"),
-		"tags":  Set(Int(1), Int(2)),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	items := result.Items()
-	if got := []int{items[0].Int(), items[1].Int(), int(items[2].Float64())}; !reflect.DeepEqual(got, []int{7, 2026, 90}) {
-		t.Fatalf("numeric results = %v", got)
-	}
-	if zone := items[3].TimeZone(); items[3].Kind() != TimeZoneKind || zone.OffsetSeconds != 7200 || zone.Name != "EET" {
-		t.Fatalf("timezone result = kind %s payload %+v", items[3].Kind(), zone)
-	}
-	if !items[4].Bool() {
-		t.Fatal("set input did not compare equal")
-	}
-}
-
-func TestNestedEmptyRawInputs(t *testing.T) {
-	program, err := Compile(`(nested[0], nested[1])`, WithInputs("nested"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer program.Close()
-
-	result, err := program.Run(context.Background(), Inputs{
-		"nested": List(List(), Dict()),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	items := result.Items()
-	if got := len(items[0].Items()); items[0].Kind() != ListKind || got != 0 {
-		t.Fatalf("nested list = kind %s len %d, want empty list", items[0].Kind(), got)
-	}
-	if got := len(items[1].Pairs()); items[1].Kind() != DictKind || got != 0 {
-		t.Fatalf("nested dict = kind %s len %d, want empty dict", items[1].Kind(), got)
-	}
-}
-
-// TestFlatDecodeLargeResultStrings exercises the flat-decode copy path (§4.3):
-// a result larger than flatStringCopyThreshold must decode strings correctly
+// TestFlatDecodeLargeResultStrings exercises the flat-decode copy path: a
+// result larger than flatStringCopyThreshold must decode strings correctly
 // whether they are copied (large buffer) or borrowed (small buffer).
 func TestFlatDecodeLargeResultStrings(t *testing.T) {
-	// Builds a list of ~200 distinct 64-char strings, well over 4 KiB encoded.
 	code := `[f"item-{i:060d}" for i in range(200)]`
-	value, err := CompileAndRun(context.Background(), code, nil)
+	value, err := Eval(context.Background(), code, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	items := value.Items()
-	if len(items) != 200 {
-		t.Fatalf("len = %d, want 200", len(items))
+	if value.Len() != 200 {
+		t.Fatalf("len = %d, want 200", value.Len())
 	}
 	want := fmt.Sprintf("item-%060d", 7)
-	if got := items[7].Str(); got != want {
+	if got := value.Index(7).Str(); got != want {
 		t.Fatalf("items[7] = %q, want %q", got, want)
 	}
 
-	// A small result still decodes correctly via the borrow path.
-	small, err := CompileAndRun(context.Background(), `"hello"`, nil)
+	small, err := Eval(context.Background(), `"hello"`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,141 +182,73 @@ func TestFlatDecodeLargeResultStrings(t *testing.T) {
 }
 
 // TestNestedRawDecodeRoundTrip exercises the recursive raw-value decode paths
-// (decodeRawSequence/decodeRawDict and their pointer-based per-item consumption)
-// on a deeply nested, mixed-container result. It guards the §3.5 refactor that
-// made each item consume and zero its own slot so a parent free never
-// double-walks an already-consumed child: every container here is freed exactly
-// once on the success path, which -race / the GC-hammer tests would flag if the
-// ownership bookkeeping were wrong.
+// on a deeply nested, mixed-container result: every container must be freed
+// exactly once on the success path.
 func TestNestedRawDecodeRoundTrip(t *testing.T) {
 	code := `[
     {"name": "a", "tags": ["x", "y"], "meta": {"n": 1, "vals": [1, 2, 3]}},
     {"name": "b", "tags": [], "meta": {"n": 2, "vals": [(4, 5), (6, 7)]}},
 ]`
-	value, err := CompileAndRun(context.Background(), code, nil)
+	prog, err := Compile(code)
 	if err != nil {
 		t.Fatal(err)
 	}
-	items := value.Items()
-	if value.Kind() != ListKind || len(items) != 2 {
-		t.Fatalf("top-level = kind %s len %d, want list of 2", value.Kind(), len(items))
-	}
-
-	first := items[0]
-	if first.Kind() != DictKind {
-		t.Fatalf("items[0] kind = %s, want dict", first.Kind())
-	}
-	got, err := As[map[string]any](first)
+	defer prog.Close()
+	// Start drives the raw snapshot decode path (vs the flat fast format).
+	run, err := prog.Start(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got["name"] != "a" {
-		t.Fatalf("items[0][name] = %v, want a", got["name"])
-	}
-
-	// The second element nests tuples inside a list inside a dict — multiple
-	// recursion levels through decodeRawSequence/decodeRawDict.
-	second := items[1].Pairs()
-	var vals Value
-	for _, pair := range second {
-		if pair.Key.Str() == "meta" {
-			for _, metaPair := range pair.Value.Pairs() {
-				if metaPair.Key.Str() == "vals" {
-					vals = metaPair.Value
-				}
-			}
-		}
-	}
-	if vals.Kind() != ListKind || len(vals.Items()) != 2 {
-		t.Fatalf("nested vals = kind %s len %d, want list of 2 tuples", vals.Kind(), len(vals.Items()))
-	}
-	tuple := vals.Items()[0]
-	if tuple.Kind() != TupleKind || len(tuple.Items()) != 2 || tuple.Items()[0].Int() != 4 {
-		t.Fatalf("nested tuple = %s, want (4, 5)", tuple)
-	}
-}
-
-func TestAsSlicesAndMaps(t *testing.T) {
-	ints, err := As[[]int](List(Int(1), Int(2), Int(3)))
+	defer run.Close()
+	value, err := run.Result()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(ints, []int{1, 2, 3}) {
-		t.Fatalf("slice = %v", ints)
+	if value.Kind() != ListKind || value.Len() != 2 {
+		t.Fatalf("top-level = kind %s len %d", value.Kind(), value.Len())
 	}
-	values, err := As[map[string]int](StringDict(map[string]Value{"x": Int(1), "y": Int(2)}))
+	first, err := As[map[string]any](value.Index(0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(values, map[string]int{"x": 1, "y": 2}) {
-		t.Fatalf("map = %v", values)
+	if first["name"] != "a" {
+		t.Fatalf("items[0][name] = %v", first["name"])
 	}
-}
-
-// TestInterfaceUnhashableDictKey guards against a panic when a Python dict has
-// keys whose Go representation is not comparable (tuples become []any,
-// namedtuples/dataclasses become structs holding slices). Interface() must fall
-// back to a string key form instead of panicking on map insertion.
-func TestInterfaceUnhashableDictKey(t *testing.T) {
-	cases := []struct {
-		name string
-		key  Value
-	}{
-		{"tuple", Tuple(Int(1), Int(2))},
-		{"nested-tuple", Tuple(Tuple(Int(1)), Int(2))},
-		{"namedtuple", NamedTuple("Point", []string{"x", "y"}, Int(1), Int(2))},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			defer func() {
-				if r := recover(); r != nil {
-					t.Fatalf("Interface() panicked on %s key: %v", tc.name, r)
-				}
-			}()
-			d := Dict(Pair{Key: tc.key, Value: Str("v")})
-			out, ok := d.Interface().(map[any]any)
-			if !ok {
-				t.Fatalf("Interface() = %T, want map[any]any", d.Interface())
-			}
-			if len(out) != 1 {
-				t.Fatalf("map has %d entries, want 1", len(out))
-			}
-			if got := out[tc.key.String()]; got != "v" {
-				t.Fatalf("map[%q] = %v, want %q", tc.key.String(), got, "v")
-			}
-		})
-	}
-}
-
-// TestInterfaceHashableDictKeyPreserved confirms comparable keys (including
-// exceptions, whose Go representation has no slices) keep their native form.
-func TestInterfaceHashableDictKeyPreserved(t *testing.T) {
-	d := Dict(
-		Pair{Key: Int(1), Value: Str("a")},
-		Pair{Key: Str("b"), Value: Int(2)},
-	)
-	out, ok := d.Interface().(map[any]any)
+	meta, ok := value.Index(1).Get("meta")
 	if !ok {
-		t.Fatalf("Interface() = %T, want map[any]any", d.Interface())
+		t.Fatal("missing meta")
 	}
-	if out[int64(1)] != "a" {
-		t.Fatalf("map[1] = %v, want a", out[int64(1)])
+	vals, ok := meta.Get("vals")
+	if !ok || vals.Len() != 2 {
+		t.Fatalf("vals = %v", vals)
 	}
-	if out["b"] != int64(2) {
-		t.Fatalf("map[b] = %v, want 2", out["b"])
+	tuple := vals.Index(0)
+	if tuple.Kind() != TupleKind || tuple.Index(0).Int() != 4 {
+		t.Fatalf("nested tuple = %s", tuple)
 	}
 }
 
-// TestAsMapUnhashableKeyErrors confirms As reports a clear error instead of
-// panicking when a dict key cannot be a Go map key.
-func TestAsMapUnhashableKeyErrors(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("As[map[any]any] panicked: %v", r)
+func TestValueEqualSemantics(t *testing.T) {
+	dict := Dict(
+		Pair{Key: Int(1), Value: Str("int")},
+		Pair{Key: Tuple(Int(1), Int(2)), Value: Str("tuple")},
+	)
+	if v, ok := dict.Get(1); !ok || v.Str() != "int" {
+		t.Fatalf("Get(1) = %v %v", v, ok)
+	}
+	if v, ok := dict.Get(Tuple(Int(1), Int(2))); !ok || v.Str() != "tuple" {
+		t.Fatalf("Get(tuple) = %v %v", v, ok)
+	}
+	if v, ok := dict.Get(1.0); !ok || v.Str() != "int" {
+		t.Fatalf("Get(1.0) should match int key like Python, got %v %v", v, ok)
+	}
+}
+
+func TestKindStrings(t *testing.T) {
+	kinds := []Kind{InvalidKind, NoneKind, IntKind, DictKind, DataclassKind, CycleKind}
+	for _, kind := range kinds {
+		if kind.String() == "" || slices.Contains([]string{"Kind(0)"}, kind.String()) {
+			t.Errorf("Kind %d has bad String %q", kind, kind.String())
 		}
-	}()
-	d := Dict(Pair{Key: Tuple(Int(1), Int(2)), Value: Str("x")})
-	if _, err := As[map[any]any](d); err == nil {
-		t.Fatal("As[map[any]any] succeeded on unhashable key, want error")
 	}
 }

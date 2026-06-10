@@ -70,12 +70,12 @@ total
 var (
 	benchmarkCtx = context.Background()
 
-	benchmarkArithmeticInputs = Inputs{
+	benchmarkArithmeticInputs = map[string]Value{
 		"x": Int(3),
 		"y": Int(4),
 	}
 
-	benchmarkOrderInputs = Inputs{
+	benchmarkOrderInputs = map[string]Value{
 		"items": List(
 			benchmarkOrderItem("sku-001", "books", 2, 1299),
 			benchmarkOrderItem("sku-002", "kitchen", 5, 499),
@@ -87,16 +87,16 @@ var (
 		"tax_basis_points": Int(825),
 	}
 
-	benchmarkStringInputs = Inputs{
+	benchmarkStringInputs = map[string]Value{
 		"message": Str("Invoice-8841, PAID; customer: ACME_Corp / region: NORTH"),
 	}
 
-	benchmarkRecordsInputs = Inputs{
+	benchmarkRecordsInputs = map[string]Value{
 		"count": Int(100),
 		"seed":  Int(17),
 	}
 
-	benchmarkHostInputs = Inputs{
+	benchmarkHostInputs = map[string]Value{
 		"numbers": benchmarkIntList(16),
 	}
 
@@ -122,7 +122,7 @@ func BenchmarkCompareArithmeticRun(b *testing.B) {
 func BenchmarkCompareArithmeticCompileRun(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
-		result, err := CompileAndRunAs[int](benchmarkCtx, benchmarkArithmeticCode, benchmarkArithmeticInputs)
+		result, err := EvalAs[int](benchmarkCtx, benchmarkArithmeticCode, benchmarkArithmeticInputs)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -153,7 +153,7 @@ func BenchmarkCompareOrderSummaryRun(b *testing.B) {
 func BenchmarkCompareOrderSummaryCompileRun(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
-		result, err := CompileAndRun(benchmarkCtx, benchmarkOrderSummaryCode, benchmarkOrderInputs)
+		result, err := Eval(benchmarkCtx, benchmarkOrderSummaryCode, benchmarkOrderInputs)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -207,18 +207,18 @@ func BenchmarkCompareRecordsResult100(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if result.kind != ListKind || len(result.items) != 100 {
-			b.Fatalf("unexpected result: %s len=%d", result.Kind(), len(result.items))
+		if result.Kind() != ListKind || result.Len() != 100 {
+			b.Fatalf("unexpected result: %s len=%d", result.Kind(), result.Len())
 		}
-		benchmarkExpectDictInt(b, result.items[99], "score", 680)
+		benchmarkExpectDictInt(b, result.Index(99), "score", 680)
 	}
 }
 
 func BenchmarkCompareHostFunctionBatch(b *testing.B) {
-	score := NewFunction("score", func(value int) (int, error) {
+	score := MustFunction("score", func(value int) (int, error) {
 		return value*value + 7, nil
 	})
-	program := benchmarkCompile(b, benchmarkHostFunctionCode, WithInputs("numbers"), WithFunction(score))
+	program := benchmarkCompile(b, benchmarkHostFunctionCode, WithInputs("numbers"), WithFunctions(score))
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -239,14 +239,14 @@ type benchmarkVector struct {
 }
 
 func BenchmarkCompareHostFunctionStructKwargs(b *testing.B) {
-	measure := NewFunction("measure", func(value benchmarkVector) (int, error) {
+	measure := MustFunction("measure", func(value benchmarkVector) (int, error) {
 		return value.X*value.X + value.Y*value.Y, nil
 	})
 	program := benchmarkCompile(
 		b,
 		`measure(x=x, y=y)`,
 		WithInputs("x", "y"),
-		WithFunction(measure),
+		WithFunctions(measure),
 	)
 
 	b.ReportAllocs()
@@ -257,6 +257,26 @@ func BenchmarkCompareHostFunctionStructKwargs(b *testing.B) {
 			b.Fatal(err)
 		}
 		if result != 25 {
+			b.Fatal(result)
+		}
+	}
+}
+
+// BenchmarkCompareHostFunctionStrings covers the general (non-int) host
+// dispatch, which the redesign moved into the single-hop callback path.
+func BenchmarkCompareHostFunctionStrings(b *testing.B) {
+	tag := MustFunction("tag", func(s string) string { return "<" + s + ">" })
+	program := benchmarkCompile(b, `tag(word)`, WithInputs("word"), WithFunctions(tag))
+
+	inputs := map[string]Value{"word": Str("monty")}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		result, err := RunAs[string](benchmarkCtx, program, inputs)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if result != "<monty>" {
 			b.Fatal(result)
 		}
 	}
@@ -274,15 +294,11 @@ func benchmarkCompile(b *testing.B, code string, opts ...CompileOption) *Program
 
 func benchmarkOrderItem(sku, category string, quantity, priceCents int) Value {
 	return Dict(
-		benchmarkPair("sku", Str(sku)),
-		benchmarkPair("category", Str(category)),
-		benchmarkPair("quantity", Int(quantity)),
-		benchmarkPair("price_cents", Int(priceCents)),
+		KV("sku", Str(sku)),
+		KV("category", Str(category)),
+		KV("quantity", Int(quantity)),
+		KV("price_cents", Int(priceCents)),
 	)
-}
-
-func benchmarkPair(key string, value Value) Pair {
-	return Pair{Key: Str(key), Value: value}
 }
 
 func benchmarkIntList(n int) Value {
@@ -295,24 +311,11 @@ func benchmarkIntList(n int) Value {
 
 func benchmarkExpectDictInt(b *testing.B, value Value, key string, want int) {
 	b.Helper()
-	got, ok := benchmarkDictInt(value, key)
-	if !ok {
+	got, ok := value.Get(key)
+	if !ok || got.Kind() != IntKind {
 		b.Fatalf("missing int key %q in %s", key, value.Kind())
 	}
-	if got != want {
-		b.Fatalf("%s=%d, want %d", key, got, want)
+	if got.Int() != want {
+		b.Fatalf("%s=%d, want %d", key, got.Int(), want)
 	}
-}
-
-func benchmarkDictInt(value Value, key string) (int, bool) {
-	if value.kind != DictKind {
-		return 0, false
-	}
-	for pairIndex := range value.pairs {
-		pair := &value.pairs[pairIndex]
-		if pair.Key.kind == StringKind && pair.Key.text == key && pair.Value.kind == IntKind {
-			return pair.Value.Int(), true
-		}
-	}
-	return 0, false
 }

@@ -1,272 +1,211 @@
+//! C ABI for the Go binding of Monty, Pydantic's sandboxed Python interpreter.
+//!
+//! Conventions shared by every entry point:
+//! - Functions return `STATUS_OK` (0) or `STATUS_ERR` (1). On error the
+//!   trailing `out_error: *mut *mut MgError` (or the `error` field of the
+//!   output struct) receives an owned `MgError` that the caller must release
+//!   with `mg_error_free`. Resume entry points may instead return
+//!   `STATUS_ERR_RETAINED` (2): the resume payload was rejected before the
+//!   progress handle was consumed, so the caller still owns the live handle.
+//! - Heap handles (`MgProgram`, `MgValue`, `MgProgress`, `MgRepl`, `MgMount`,
+//!   `MgDiagnostics`, `MgCancelToken`) are created with `Box::into_raw` and
+//!   released exactly once by the matching `mg_*_free` (or consumed by a call
+//!   documented to do so).
+//! - `MgBytes` outputs are Rust-owned allocations released by `mg_bytes_free`,
+//!   except when documented to point into a caller-owned scratch buffer.
+//! - The ABI is versioned: Go checks `mg_abi_version()` at load time.
+
 #![allow(clippy::missing_safety_doc)]
 
+mod error;
+mod mount;
+mod print;
+mod program;
+mod progress;
+mod repl;
+mod tracker;
+mod typecheck;
+mod value;
+
 use std::{
-    borrow::Cow,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice, str,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use monty::fs::{Mount as MontyMount, MountMode as MontyMountMode, MountTable};
+use monty::fs::Mount as MontyMount;
 use monty::{
-    DictPairs, ExcType, ExtFunctionResult, FunctionCall, JsonMontyObject, LimitedTracker,
-    MontyDate, MontyDateTime, MontyException, MontyObject, MontyRepl, MontyRun, MontyTimeDelta,
-    MontyTimeZone, NameLookup, NameLookupResult, NoLimitTracker, OsCall, OsFunction, PrintWriter,
-    ReplContinuationMode, ResourceLimits, ResourceTracker, RunProgress,
-    detect_repl_continuation_mode,
+    DictPairs, ExcType, MontyDate, MontyDateTime, MontyException, MontyObject, MontyRepl, MontyRun,
+    MontyTimeDelta, MontyTimeZone, NoLimitTracker, ReplProgress, ResourceLimits, RunProgress,
 };
-use monty_type_checking::{SourceFile, type_check};
+use monty_type_checking::TypeCheckingDiagnostics;
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
-const STATUS_OK: i32 = 0;
-const STATUS_ERR: i32 = 1;
+pub(crate) use crate::print::PrintBuf;
+pub(crate) use crate::tracker::GoTracker;
 
-const FAST_FORMAT_RAW: u32 = 0;
-const FAST_FORMAT_FLAT: u32 = 1;
+/// Incremented whenever any `#[repr(C)]` layout or entry-point contract
+/// changes. The Go loader refuses to use a library with a mismatched version.
+pub const MG_ABI_VERSION: u32 = 3;
 
-const PROGRESS_FUNCTION_CALL: u32 = 1;
-const PROGRESS_OS_CALL: u32 = 2;
-const PROGRESS_RESOLVE_FUTURES: u32 = 3;
-const PROGRESS_NAME_LOOKUP: u32 = 4;
-const PROGRESS_COMPLETE: u32 = 5;
+#[unsafe(no_mangle)]
+pub const extern "C" fn mg_abi_version() -> u32 {
+    MG_ABI_VERSION
+}
 
-const FUTURE_RESULT_RETURN: u32 = 0;
-const FUTURE_RESULT_ERROR: u32 = 1;
-const FUTURE_RESULT_NOT_FOUND: u32 = 2;
+pub(crate) const STATUS_OK: i32 = 0;
+pub(crate) const STATUS_ERR: i32 = 1;
+/// The call failed before consuming the progress handle passed to it; the
+/// caller still owns the handle and the paused state is retryable.
+pub(crate) const STATUS_ERR_RETAINED: i32 = 2;
 
-const HOST_CALLBACK_RETURN: i32 = 0;
-const HOST_CALLBACK_EXCEPTION: i32 = 1;
+pub(crate) const FAST_FORMAT_RAW: u32 = 0;
+pub(crate) const FAST_FORMAT_FLAT: u32 = 1;
 
-const KIND_INVALID: u32 = 0;
-const KIND_ELLIPSIS: u32 = 1;
-const KIND_NONE: u32 = 2;
-const KIND_BOOL: u32 = 3;
-const KIND_INT: u32 = 4;
-const KIND_BIG_INT: u32 = 5;
-const KIND_FLOAT: u32 = 6;
-const KIND_STRING: u32 = 7;
-const KIND_BYTES: u32 = 8;
-const KIND_LIST: u32 = 9;
-const KIND_TUPLE: u32 = 10;
-const KIND_NAMED_TUPLE: u32 = 11;
-const KIND_DICT: u32 = 12;
-const KIND_SET: u32 = 13;
-const KIND_FROZEN_SET: u32 = 14;
-const KIND_DATE: u32 = 15;
-const KIND_DATETIME: u32 = 16;
-const KIND_TIME_DELTA: u32 = 17;
-const KIND_TIME_ZONE: u32 = 18;
-const KIND_EXCEPTION: u32 = 19;
-const KIND_TYPE: u32 = 20;
-const KIND_BUILTIN_FUNCTION: u32 = 21;
-const KIND_PATH: u32 = 22;
-const KIND_DATACLASS: u32 = 23;
-const KIND_FUNCTION: u32 = 24;
-const KIND_REPR: u32 = 25;
-const KIND_CYCLE: u32 = 26;
-const KIND_OWNED_HANDLE: u32 = u32::MAX;
+pub(crate) const PROGRESS_FUNCTION_CALL: u32 = 1;
+pub(crate) const PROGRESS_OS_CALL: u32 = 2;
+pub(crate) const PROGRESS_RESOLVE_FUTURES: u32 = 3;
+pub(crate) const PROGRESS_NAME_LOOKUP: u32 = 4;
+pub(crate) const PROGRESS_COMPLETE: u32 = 5;
 
+pub(crate) const FUTURE_RESULT_RETURN: u32 = 0;
+pub(crate) const FUTURE_RESULT_ERROR: u32 = 1;
+pub(crate) const FUTURE_RESULT_NOT_FOUND: u32 = 2;
+
+/// Host callback verdicts.
+pub(crate) const HOST_CALLBACK_RETURN: i32 = 0;
+pub(crate) const HOST_CALLBACK_EXCEPTION: i32 = 1;
+pub(crate) const HOST_CALLBACK_NOT_HANDLED: i32 = 2;
+
+/// Host callback request kinds.
+pub(crate) const HOST_CALL_FUNCTION: u32 = 1;
+pub(crate) const HOST_CALL_OS: u32 = 2;
+
+/// Print encoding in output structs: `print_flags == PRINT_PLAIN` means the
+/// `print` buffer is raw stdout text; `PRINT_TAGGED` means it is a sequence of
+/// `[u8 stream][u32 le len][len bytes]` chunks in emit order (stream 0 =
+/// stdout, 1 = stderr).
+pub(crate) const PRINT_PLAIN: u32 = 0;
+pub(crate) const PRINT_TAGGED: u32 = 1;
+
+pub(crate) const KIND_INVALID: u32 = 0;
+pub(crate) const KIND_ELLIPSIS: u32 = 1;
+pub(crate) const KIND_NONE: u32 = 2;
+pub(crate) const KIND_BOOL: u32 = 3;
+pub(crate) const KIND_INT: u32 = 4;
+pub(crate) const KIND_BIG_INT: u32 = 5;
+pub(crate) const KIND_FLOAT: u32 = 6;
+pub(crate) const KIND_STRING: u32 = 7;
+pub(crate) const KIND_BYTES: u32 = 8;
+pub(crate) const KIND_LIST: u32 = 9;
+pub(crate) const KIND_TUPLE: u32 = 10;
+pub(crate) const KIND_NAMED_TUPLE: u32 = 11;
+pub(crate) const KIND_DICT: u32 = 12;
+pub(crate) const KIND_SET: u32 = 13;
+pub(crate) const KIND_FROZEN_SET: u32 = 14;
+pub(crate) const KIND_DATE: u32 = 15;
+pub(crate) const KIND_DATETIME: u32 = 16;
+pub(crate) const KIND_TIME_DELTA: u32 = 17;
+pub(crate) const KIND_TIME_ZONE: u32 = 18;
+pub(crate) const KIND_EXCEPTION: u32 = 19;
+pub(crate) const KIND_TYPE: u32 = 20;
+pub(crate) const KIND_BUILTIN_FUNCTION: u32 = 21;
+pub(crate) const KIND_PATH: u32 = 22;
+pub(crate) const KIND_DATACLASS: u32 = 23;
+pub(crate) const KIND_FUNCTION: u32 = 24;
+pub(crate) const KIND_REPR: u32 = 25;
+pub(crate) const KIND_CYCLE: u32 = 26;
+pub(crate) const KIND_OWNED_HANDLE: u32 = u32::MAX;
+
+// ---------------------------------------------------------------------------
+// C ABI structs
+// ---------------------------------------------------------------------------
+
+/// Borrowed string reference (Go-owned memory, valid for the call only).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MgStr {
-    ptr: *const u8,
-    len: usize,
+    pub(crate) ptr: *const u8,
+    pub(crate) len: usize,
 }
 
+impl MgStr {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            ptr: ptr::null(),
+            len: 0,
+        }
+    }
+}
+
+/// Rust-owned byte buffer handed to the caller; release with `mg_bytes_free`.
 #[repr(C)]
 pub struct MgBytes {
-    ptr: *mut u8,
-    len: usize,
+    pub(crate) ptr: *mut u8,
+    pub(crate) len: usize,
 }
 
+impl MgBytes {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            ptr: ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
+
+/// Resource limits plus an optional cancellation token.
+///
+/// `cancel_token` (nullable) attaches a cancellation flag to the execution's
+/// resource tracker: `mg_cancel_token_cancel` aborts the run at the next
+/// statement boundary.
 #[repr(C)]
 pub struct MgLimits {
-    max_allocations_set: u8,
-    max_allocations: usize,
-    max_duration_nanos_set: u8,
-    max_duration_nanos: u64,
-    max_memory_set: u8,
-    max_memory: usize,
-    gc_interval_set: u8,
-    gc_interval: usize,
-    max_recursion_depth_set: u8,
-    max_recursion_depth: usize,
-    disable_recursion_limit: u8,
+    pub(crate) max_allocations_set: u8,
+    pub(crate) max_allocations: usize,
+    pub(crate) max_duration_nanos_set: u8,
+    pub(crate) max_duration_nanos: u64,
+    pub(crate) max_memory_set: u8,
+    pub(crate) max_memory: usize,
+    pub(crate) gc_interval_set: u8,
+    pub(crate) gc_interval: usize,
+    pub(crate) max_recursion_depth_set: u8,
+    pub(crate) max_recursion_depth: usize,
+    pub(crate) disable_recursion_limit: u8,
+    pub(crate) cancel_token: *mut MgCancelToken,
 }
 
 #[repr(C)]
 pub struct MgProgramCompileArgs {
-    code: MgStr,
-    script_name: MgStr,
-    input_names: *const MgStr,
-    input_count: usize,
+    pub(crate) code: MgStr,
+    pub(crate) script_name: MgStr,
+    pub(crate) input_names: *const MgStr,
+    pub(crate) input_count: usize,
 }
 
 #[repr(C)]
 pub struct MgCompileRunFastRawArgs {
-    code: MgStr,
-    script_name: MgStr,
-    input_names: *const MgStr,
-    input_count: usize,
-    input_values: *mut MgRawValue,
-    input_value_count: usize,
-    limits: *const MgLimits,
+    pub(crate) code: MgStr,
+    pub(crate) script_name: MgStr,
+    pub(crate) input_names: *const MgStr,
+    pub(crate) input_count: usize,
+    pub(crate) input_values: *mut MgRawValue,
+    pub(crate) input_value_count: usize,
+    pub(crate) limits: *const MgLimits,
 }
 
-#[repr(C)]
-pub struct MgMountNewArgs {
-    virtual_path: MgStr,
-    host_path: MgStr,
-    mode: u32,
-    has_write_bytes_limit: u8,
-    _pad: [u8; 3],
-    write_bytes_limit: u64,
-}
-
-#[repr(C)]
-pub struct MgMountCallArgs {
-    mounts: *const *mut MgMount,
-    mount_count: usize,
-    function: MgStr,
-    args: *const *const MgValue,
-    arg_count: usize,
-    kwarg_keys: *const *const MgValue,
-    kwarg_values: *const *const MgValue,
-    kwarg_count: usize,
-}
-
-#[repr(C)]
-pub struct MgReplNewArgs {
-    script_name: MgStr,
-    limits: *const MgLimits,
-}
-
-#[repr(C)]
-pub struct MgReplFeedRunArgs {
-    code: MgStr,
-    input_names: *const MgStr,
-    input_values: *const *const MgValue,
-    input_count: usize,
-}
-
-#[repr(C)]
-pub struct MgReplCallArgs {
-    name: MgStr,
-    args: *const *const MgValue,
-    arg_count: usize,
-}
-
-#[repr(C)]
-pub struct MgFutureResult {
-    call_id: u32,
-    kind: u32,
-    value: MgRawValue,
-    exc_type: MgStr,
-    message: MgStr,
-}
-
-#[repr(C)]
-pub struct MgRawValue {
-    kind: u32,
-    bool_value: u8,
-    _pad: [u8; 3],
-    int_value: i64,
-    float_value: f64,
-    ptr: *mut u8,
-    len: usize,
-    handle: *mut MgValue,
-}
-
-#[repr(C)]
-pub struct MgRunOutput {
-    value: *mut MgValue,
-    print: MgBytes,
-    error: *mut MgError,
-}
-
-#[repr(C)]
-pub struct MgStartOutput {
-    progress: *mut MgProgress,
-    print: MgBytes,
-    error: *mut MgError,
-}
-
-#[repr(C)]
-pub struct MgRunRawOutput {
-    value: MgRawValue,
-    print: MgBytes,
-    error: *mut MgError,
-}
-
-#[repr(C)]
-pub struct MgRunJsonOutput {
-    value: MgBytes,
-    print: MgBytes,
-    error: *mut MgError,
-}
-
-/// Inline scratch capacity used for flat-format result bytes. Sized to cover
-/// every value produced by the benchmark suite (records-of-100 lands around
-/// 3 KiB) so the Go caller never needs a second cgocall to free a heap buffer.
-const FAST_SCRATCH_CAP: usize = 8192;
-
-#[repr(C)]
-pub struct MgRunFastOutput {
-    format: u32,
-    /// Set to 1 when `bytes.ptr` points into `scratch` (Go-owned, no free
-    /// required); 0 when `bytes` points at a Rust-owned heap allocation that
-    /// must be released with `mg_bytes_free`.
-    bytes_in_scratch: u32,
-    value: MgRawValue,
-    bytes: MgBytes,
-    print: MgBytes,
-    error: *mut MgError,
-    /// Caller-owned scratch buffer. Filled by the Rust side when a flat-encoded
-    /// result fits; otherwise the Rust side allocates `bytes` separately and
-    /// leaves `scratch` untouched.
-    scratch: [u8; FAST_SCRATCH_CAP],
-}
-
-#[repr(C)]
-pub struct MgProgressOutput {
-    progress: *mut MgProgress,
-    print: MgBytes,
-    error: *mut MgError,
-}
-
-#[repr(C)]
-pub struct MgProgressSnapshot {
-    kind: u32,
-    name: MgBytes,
-    args: MgRawValue,
-    kwargs: MgRawValue,
-    value: MgRawValue,
-    call_id: u32,
-    method_call: u8,
-    _pad: [u8; 3],
-    error: *mut MgError,
-}
-
-#[repr(C)]
-pub struct MgProgressSnapshotOutput {
-    progress: *mut MgProgress,
-    snapshot: MgProgressSnapshot,
-    print: MgBytes,
-    error: *mut MgError,
-}
-
-#[repr(C)]
-pub struct MgHostFunctionOutput {
-    value: MgRawValue,
-    exc_type: MgStr,
-    message: MgStr,
-}
-
-type MgHostFunctionCallback = Option<
+/// Unified host-dispatch callback.
+///
+/// `kind` is `HOST_CALL_FUNCTION` for external function calls and
+/// `HOST_CALL_OS` for OS calls. Return values are `HOST_CALLBACK_RETURN`,
+/// `HOST_CALLBACK_EXCEPTION`, or `HOST_CALLBACK_NOT_HANDLED` (OS calls only:
+/// fall back to Monty's default unhandled behavior).
+pub type MgHostCallCallback = Option<
     unsafe extern "C" fn(
         user_data: usize,
+        kind: u32,
         name_ptr: *const u8,
         name_len: usize,
         args: *const MgRawValue,
@@ -275,112 +214,333 @@ type MgHostFunctionCallback = Option<
     ) -> i32,
 >;
 
+/// Streaming print callback: receives each flushed output fragment during
+/// execution. `stream` is 0 for stdout, 1 for stderr.
+pub type MgPrintCallback =
+    Option<unsafe extern "C" fn(user_data: usize, stream: u8, ptr: *const u8, len: usize)>;
+
+/// Arguments for single-hop host-dispatch program runs.
+#[repr(C)]
+pub struct MgRunHostArgs {
+    pub(crate) inputs: *mut MgRawValue,
+    pub(crate) input_count: usize,
+    pub(crate) limits: *const MgLimits,
+    pub(crate) host_names: *const MgStr,
+    pub(crate) host_name_count: usize,
+    pub(crate) mounts: *const *mut MgMount,
+    pub(crate) mount_count: usize,
+    pub(crate) callback: MgHostCallCallback,
+    pub(crate) callback_data: usize,
+    pub(crate) print: MgPrintCallback,
+    pub(crate) print_data: usize,
+}
+
+#[repr(C)]
+pub struct MgMountNewArgs {
+    pub(crate) virtual_path: MgStr,
+    pub(crate) host_path: MgStr,
+    pub(crate) mode: u32,
+    pub(crate) has_write_bytes_limit: u8,
+    pub(crate) _pad: [u8; 3],
+    pub(crate) write_bytes_limit: u64,
+}
+
+#[repr(C)]
+pub struct MgMountCallArgs {
+    pub(crate) mounts: *const *mut MgMount,
+    pub(crate) mount_count: usize,
+    pub(crate) function: MgStr,
+    pub(crate) args: *mut MgRawValue,
+    pub(crate) arg_count: usize,
+    pub(crate) kwargs: *mut MgRawPair,
+    pub(crate) kwarg_count: usize,
+}
+
 #[repr(C)]
 pub struct MgMountOutput {
-    value: *mut MgValue,
-    error: *mut MgError,
-    handled: u8,
+    pub(crate) value: MgRawValue,
+    pub(crate) error: *mut MgError,
+    pub(crate) handled: u8,
+}
+
+#[repr(C)]
+pub struct MgReplNewArgs {
+    pub(crate) script_name: MgStr,
+    pub(crate) limits: *const MgLimits,
+}
+
+/// Arguments shared by `mg_repl_feed_run_raw` and `mg_repl_feed_start`.
+///
+/// `max_duration_nanos` (when `has_max_duration` is set) resets the REPL
+/// tracker's time budget for this snippet; it requires a REPL constructed with
+/// limits. `cancel_token` attaches per-snippet cancellation the same way.
+/// `host_names`/`mounts`/`callback` are honored by `mg_repl_feed_run_raw` only
+/// and must be empty/null for `mg_repl_feed_start`.
+#[repr(C)]
+pub struct MgReplFeedArgs {
+    pub(crate) code: MgStr,
+    pub(crate) input_names: *const MgStr,
+    pub(crate) input_values: *mut MgRawValue,
+    pub(crate) input_count: usize,
+    pub(crate) has_max_duration: u8,
+    pub(crate) _pad: [u8; 7],
+    pub(crate) max_duration_nanos: u64,
+    pub(crate) cancel_token: *mut MgCancelToken,
+    pub(crate) host_names: *const MgStr,
+    pub(crate) host_name_count: usize,
+    pub(crate) mounts: *const *mut MgMount,
+    pub(crate) mount_count: usize,
+    pub(crate) callback: MgHostCallCallback,
+    pub(crate) callback_data: usize,
+    pub(crate) print: MgPrintCallback,
+    pub(crate) print_data: usize,
+}
+
+#[repr(C)]
+pub struct MgReplCallArgs {
+    pub(crate) name: MgStr,
+    pub(crate) args: *mut MgRawValue,
+    pub(crate) arg_count: usize,
+}
+
+#[repr(C)]
+pub struct MgTypeCheckArgs {
+    pub(crate) code: MgStr,
+    pub(crate) script_name: MgStr,
+    pub(crate) stubs: MgStr,
+    pub(crate) stubs_name: MgStr,
+}
+
+#[repr(C)]
+pub struct MgFutureResult {
+    pub(crate) call_id: u32,
+    pub(crate) kind: u32,
+    pub(crate) value: MgRawValue,
+    pub(crate) exc_type: MgStr,
+    pub(crate) message: MgStr,
+}
+
+/// A Python value crossing the FFI boundary without a heap handle when possible.
+///
+/// Scalars are inline; strings/bytes point at borrowed or Rust-owned
+/// buffers; containers point at recursive `MgRawValue`/`MgRawPair` arrays;
+/// everything else is an owned `MgValue` handle (`kind == KIND_OWNED_HANDLE`
+/// for Go-owned input handles, or `handle != null` for Rust-produced output).
+#[repr(C)]
+pub struct MgRawValue {
+    pub(crate) kind: u32,
+    pub(crate) bool_value: u8,
+    pub(crate) _pad: [u8; 3],
+    pub(crate) int_value: i64,
+    pub(crate) float_value: f64,
+    pub(crate) ptr: *mut u8,
+    pub(crate) len: usize,
+    pub(crate) handle: *mut MgValue,
 }
 
 #[repr(C)]
 pub struct MgRawPair {
-    key: MgRawValue,
-    value: MgRawValue,
+    pub(crate) key: MgRawValue,
+    pub(crate) value: MgRawValue,
+}
+
+/// Inline scratch capacity used for flat-format result bytes. Sized to cover
+/// every value produced by the benchmark suite (records-of-100 lands around
+/// 3 KiB) so the Go caller never needs a second cgocall to free a heap buffer.
+pub(crate) const FAST_SCRATCH_CAP: usize = 8192;
+
+#[repr(C)]
+pub struct MgRunFastOutput {
+    pub(crate) format: u32,
+    /// Set to 1 when `bytes.ptr` points into `scratch` (Go-owned, no free
+    /// required); 0 when `bytes` points at a Rust-owned heap allocation that
+    /// must be released with `mg_bytes_free`.
+    pub(crate) bytes_in_scratch: u32,
+    /// `PRINT_PLAIN` or `PRINT_TAGGED`; see the constants for the encoding.
+    pub(crate) print_flags: u32,
+    pub(crate) _pad: u32,
+    pub(crate) value: MgRawValue,
+    pub(crate) bytes: MgBytes,
+    pub(crate) print: MgBytes,
+    pub(crate) error: *mut MgError,
+    /// Caller-owned scratch buffer. Filled by the Rust side when a flat-encoded
+    /// result fits; otherwise the Rust side allocates `bytes` separately and
+    /// leaves `scratch` untouched.
+    pub(crate) scratch: [u8; FAST_SCRATCH_CAP],
+}
+
+#[repr(C)]
+pub struct MgRunJsonOutput {
+    pub(crate) value: MgBytes,
+    pub(crate) print: MgBytes,
+    pub(crate) print_flags: u32,
+    pub(crate) _pad: u32,
+    pub(crate) error: *mut MgError,
+}
+
+#[repr(C)]
+pub struct MgProgressSnapshot {
+    pub(crate) kind: u32,
+    pub(crate) call_id: u32,
+    pub(crate) method_call: u8,
+    pub(crate) _pad: [u8; 7],
+    pub(crate) name: MgBytes,
+    pub(crate) args: MgRawValue,
+    pub(crate) kwargs: MgRawValue,
+    pub(crate) value: MgRawValue,
+}
+
+/// Result of starting or resuming a suspendable execution.
+///
+/// `progress` is null when the run completed or failed. `repl` is non-null
+/// when a REPL-variant execution handed its session back: at `Complete`, or
+/// alongside `error` when a Python exception preserved the session
+/// (`ReplStartError`). The caller owns both handles.
+#[repr(C)]
+pub struct MgProgressSnapshotOutput {
+    pub(crate) progress: *mut MgProgress,
+    pub(crate) repl: *mut MgRepl,
+    pub(crate) error: *mut MgError,
+    pub(crate) print: MgBytes,
+    pub(crate) print_flags: u32,
+    pub(crate) _pad: u32,
+    pub(crate) snapshot: MgProgressSnapshot,
+}
+
+#[repr(C)]
+pub struct MgHostFunctionOutput {
+    pub(crate) value: MgRawValue,
+    pub(crate) exc_type: MgStr,
+    pub(crate) message: MgStr,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MgDate {
-    year: i32,
-    month: u8,
-    day: u8,
-    _pad: [u8; 2],
+    pub(crate) year: i32,
+    pub(crate) month: u8,
+    pub(crate) day: u8,
+    pub(crate) _pad: [u8; 2],
 }
 
 #[repr(C)]
 pub struct MgDateTime {
-    timezone_name: MgBytes,
-    year: i32,
-    microsecond: u32,
-    offset_seconds: i32,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
-    has_offset: u8,
-    has_timezone_name: u8,
-    _pad: u8,
+    pub(crate) timezone_name: MgBytes,
+    pub(crate) year: i32,
+    pub(crate) microsecond: u32,
+    pub(crate) offset_seconds: i32,
+    pub(crate) month: u8,
+    pub(crate) day: u8,
+    pub(crate) hour: u8,
+    pub(crate) minute: u8,
+    pub(crate) second: u8,
+    pub(crate) has_offset: u8,
+    pub(crate) has_timezone_name: u8,
+    pub(crate) _pad: u8,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MgTimeDelta {
-    days: i32,
-    seconds: i32,
-    microseconds: i32,
+    pub(crate) days: i32,
+    pub(crate) seconds: i32,
+    pub(crate) microseconds: i32,
 }
 
 #[repr(C)]
 pub struct MgTimeZone {
-    name: MgBytes,
-    offset_seconds: i32,
-    has_name: u8,
-    _pad: [u8; 3],
+    pub(crate) name: MgBytes,
+    pub(crate) offset_seconds: i32,
+    pub(crate) has_name: u8,
+    pub(crate) _pad: [u8; 3],
 }
 
 #[repr(C)]
 pub struct MgDataclassRawArgs {
-    name: MgStr,
-    type_id: u64,
-    field_names: *const MgStr,
-    field_count: usize,
-    attrs: *mut MgRawPair,
-    attr_count: usize,
-    frozen: u8,
-    _pad: [u8; 7],
+    pub(crate) name: MgStr,
+    pub(crate) type_id: u64,
+    pub(crate) field_names: *const MgStr,
+    pub(crate) field_count: usize,
+    pub(crate) attrs: *mut MgRawPair,
+    pub(crate) attr_count: usize,
+    pub(crate) frozen: u8,
+    pub(crate) _pad: [u8; 7],
 }
 
+// ---------------------------------------------------------------------------
+// Handle types
+// ---------------------------------------------------------------------------
+
 pub struct MgProgram {
-    runner: MontyRun,
-    script_name: String,
-    input_names: Vec<String>,
+    pub(crate) runner: MontyRun,
+    pub(crate) script_name: String,
+    pub(crate) input_names: Vec<String>,
 }
 
 pub struct MgValue {
-    object: MontyObject,
+    pub(crate) object: MontyObject,
 }
 
+/// FFI error handed to the Go side.
+///
+/// The precomputed strings cover the common path; `exc` retains the full
+/// Monty exception so tracebacks stay available without re-running. Boxed to
+/// keep `Result<_, MgError>` small on every fallible internal path.
+#[derive(Debug)]
 pub struct MgError {
-    exc_type: String,
-    message: String,
-    display: String,
+    pub(crate) exc_type: String,
+    pub(crate) message: String,
+    pub(crate) display: String,
+    pub(crate) exc: Option<Box<MontyException>>,
 }
 
 pub struct MgMount {
-    slot: Arc<Mutex<Option<MontyMount>>>,
+    pub(crate) slot: Arc<Mutex<Option<MontyMount>>>,
 }
 
+/// Structured type-check diagnostics. The inner value moves out and back
+/// during rendering because the upstream builder methods consume `self`.
+pub struct MgDiagnostics {
+    pub(crate) inner: Mutex<Option<TypeCheckingDiagnostics>>,
+}
+
+/// Thread-safe cancellation flag shared with one or more resource trackers.
+pub struct MgCancelToken(pub(crate) Arc<std::sync::atomic::AtomicBool>);
+
+/// Suspendable execution state: program or REPL, with or without limits.
+///
+/// Postcard variant indices are part of the snapshot format.
 #[derive(Serialize, Deserialize)]
 pub enum MgProgress {
     NoLimit(RunProgress<NoLimitTracker>),
-    Limited(RunProgress<LimitedTracker>),
+    Limited(RunProgress<GoTracker>),
+    ReplNoLimit(ReplProgress<NoLimitTracker>),
+    ReplLimited(ReplProgress<GoTracker>),
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum MgRepl {
+pub(crate) enum ReplInner {
     NoLimit(MontyRepl<NoLimitTracker>),
-    Limited(MontyRepl<LimitedTracker>),
+    Limited(MontyRepl<GoTracker>),
 }
+
+/// A REPL session slot. `feed_start` consumes the session (it moves into the
+/// returned progress); the slot is left empty so later use of a consumed
+/// handle fails loudly instead of corrupting memory.
+pub struct MgRepl(pub(crate) Option<ReplInner>);
 
 #[derive(Serialize, Deserialize)]
-struct StoredProgram {
-    runner: MontyRun,
-    script_name: String,
-    input_names: Vec<String>,
+pub(crate) struct StoredProgram {
+    pub(crate) runner: MontyRun,
+    pub(crate) script_name: String,
+    pub(crate) input_names: Vec<String>,
 }
 
-fn ffi_error(exc_type: impl Into<String>, message: impl Into<String>) -> MgError {
+// ---------------------------------------------------------------------------
+// Error helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn ffi_error(exc_type: impl Into<String>, message: impl Into<String>) -> MgError {
     let exc_type = exc_type.into();
     let message = message.into();
     MgError {
@@ -391,25 +551,27 @@ fn ffi_error(exc_type: impl Into<String>, message: impl Into<String>) -> MgError
         },
         exc_type,
         message,
+        exc: None,
     }
 }
 
-fn from_monty_error(exc: &MontyException) -> MgError {
+pub(crate) fn from_monty_error(exc: MontyException) -> MgError {
     MgError {
         exc_type: exc.exc_type().to_string(),
         message: exc.message().unwrap_or_default().to_owned(),
         display: exc.to_string(),
+        exc: Some(Box::new(exc)),
     }
 }
 
-fn set_error(out_error: *mut *mut MgError, error: MgError) {
+pub(crate) fn set_error(out_error: *mut *mut MgError, error: MgError) {
     if !out_error.is_null() {
         // SAFETY: out_error is provided by the caller and checked for null above.
         unsafe { *out_error = Box::into_raw(Box::new(error)) };
     }
 }
 
-fn guard(out_error: *mut *mut MgError, f: impl FnOnce() -> Result<(), MgError>) -> i32 {
+pub(crate) fn guard(out_error: *mut *mut MgError, f: impl FnOnce() -> Result<(), MgError>) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(())) => STATUS_OK,
         Ok(Err(error)) => {
@@ -426,31 +588,11 @@ fn guard(out_error: *mut *mut MgError, f: impl FnOnce() -> Result<(), MgError>) 
     }
 }
 
-fn progress_output_error(out: *mut MgProgressOutput) -> *mut *mut MgError {
-    if out.is_null() {
-        return ptr::null_mut();
-    }
-    // SAFETY: out is non-null and points to a caller-provided output struct.
-    unsafe { ptr::addr_of_mut!((*out).error) }
-}
+// ---------------------------------------------------------------------------
+// Input/output helpers
+// ---------------------------------------------------------------------------
 
-fn write_progress_output(
-    out: *mut MgProgressOutput,
-    progress: MgProgress,
-    stdout: String,
-) -> Result<(), MgError> {
-    if out.is_null() {
-        return Err(ffi_error("TypeError", "progress output pointer is null"));
-    }
-    // SAFETY: out is checked for null above.
-    unsafe {
-        write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
-        (*out).progress = Box::into_raw(Box::new(progress));
-    }
-    Ok(())
-}
-
-fn as_str(input: MgStr) -> Result<&'static str, MgError> {
+pub(crate) fn as_str(input: MgStr) -> Result<&'static str, MgError> {
     if input.ptr.is_null() {
         if input.len == 0 {
             return Ok("");
@@ -462,11 +604,11 @@ fn as_str(input: MgStr) -> Result<&'static str, MgError> {
     str::from_utf8(bytes).map_err(|err| ffi_error("UnicodeDecodeError", err.to_string()))
 }
 
-fn str_arg(ptr: *const u8, len: usize) -> Result<&'static str, MgError> {
+pub(crate) fn str_arg(ptr: *const u8, len: usize) -> Result<&'static str, MgError> {
     as_str(MgStr { ptr, len })
 }
 
-fn as_bytes<'a>(ptr: *const u8, len: usize) -> Result<&'a [u8], MgError> {
+pub(crate) fn as_bytes<'a>(ptr: *const u8, len: usize) -> Result<&'a [u8], MgError> {
     if ptr.is_null() {
         if len == 0 {
             return Ok(&[]);
@@ -480,18 +622,13 @@ fn as_bytes<'a>(ptr: *const u8, len: usize) -> Result<&'a [u8], MgError> {
     Ok(unsafe { slice::from_raw_parts(ptr, len) })
 }
 
-fn write_bytes(out: *mut MgBytes, bytes: &[u8]) -> Result<(), MgError> {
+pub(crate) fn write_bytes(out: *mut MgBytes, bytes: &[u8]) -> Result<(), MgError> {
     if out.is_null() {
         return Err(ffi_error("TypeError", "output bytes pointer is null"));
     }
     if bytes.is_empty() {
         // SAFETY: out is checked for null above and receives an empty buffer.
-        unsafe {
-            *out = MgBytes {
-                ptr: ptr::null_mut(),
-                len: 0,
-            }
-        };
+        unsafe { *out = MgBytes::empty() };
         return Ok(());
     }
     let owned = bytes.to_vec().into_boxed_slice();
@@ -503,18 +640,13 @@ fn write_bytes(out: *mut MgBytes, bytes: &[u8]) -> Result<(), MgError> {
     Ok(())
 }
 
-fn write_owned_bytes(out: *mut MgBytes, mut bytes: Vec<u8>) -> Result<(), MgError> {
+pub(crate) fn write_owned_bytes(out: *mut MgBytes, mut bytes: Vec<u8>) -> Result<(), MgError> {
     if out.is_null() {
         return Err(ffi_error("TypeError", "output bytes pointer is null"));
     }
     if bytes.is_empty() {
         // SAFETY: out is checked for null above and receives an empty buffer.
-        unsafe {
-            *out = MgBytes {
-                ptr: ptr::null_mut(),
-                len: 0,
-            }
-        };
+        unsafe { *out = MgBytes::empty() };
         return Ok(());
     }
     bytes.shrink_to_fit();
@@ -527,15 +659,15 @@ fn write_owned_bytes(out: *mut MgBytes, mut bytes: Vec<u8>) -> Result<(), MgErro
     Ok(())
 }
 
-fn write_string(out: *mut MgBytes, value: &str) -> Result<(), MgError> {
+pub(crate) fn write_string(out: *mut MgBytes, value: &str) -> Result<(), MgError> {
     write_bytes(out, value.as_bytes())
 }
 
-fn write_owned_string(out: *mut MgBytes, value: String) -> Result<(), MgError> {
+pub(crate) fn write_owned_string(out: *mut MgBytes, value: String) -> Result<(), MgError> {
     write_owned_bytes(out, value.into_bytes())
 }
 
-fn read_value(value: *const MgValue) -> Result<MontyObject, MgError> {
+pub(crate) fn read_value(value: *const MgValue) -> Result<MontyObject, MgError> {
     if value.is_null() {
         return Err(ffi_error("TypeError", "value handle is null"));
     }
@@ -543,56 +675,7 @@ fn read_value(value: *const MgValue) -> Result<MontyObject, MgError> {
     Ok(unsafe { (*value).object.clone() })
 }
 
-fn read_values(ptr: *const *const MgValue, len: usize) -> Result<Vec<MontyObject>, MgError> {
-    if ptr.is_null() {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        return Err(ffi_error(
-            "TypeError",
-            "non-empty value array has null pointer",
-        ));
-    }
-    // SAFETY: caller promises ptr points to len value handles.
-    let handles = unsafe { slice::from_raw_parts(ptr, len) };
-    handles.iter().map(|handle| read_value(*handle)).collect()
-}
-
-fn read_value_pairs(
-    keys: *const *const MgValue,
-    values: *const *const MgValue,
-    len: usize,
-) -> Result<Vec<(MontyObject, MontyObject)>, MgError> {
-    if keys.is_null() || values.is_null() {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        return Err(ffi_error(
-            "TypeError",
-            "non-empty value pair array has null pointer",
-        ));
-    }
-    // SAFETY: caller promises keys and values point to len value handles.
-    let keys = unsafe { slice::from_raw_parts(keys, len) };
-    // SAFETY: caller promises keys and values point to len value handles.
-    let values = unsafe { slice::from_raw_parts(values, len) };
-    keys.iter()
-        .zip(values)
-        .map(|(key, value)| Ok((read_value(*key)?, read_value(*value)?)))
-        .collect()
-}
-
-fn read_named_values(
-    names: *const MgStr,
-    values: *const *const MgValue,
-    len: usize,
-) -> Result<Vec<(String, MontyObject)>, MgError> {
-    let names = read_string_list(names, len)?;
-    let values = read_values(values, len)?;
-    Ok(names.into_iter().zip(values).collect())
-}
-
-fn read_string_list(ptr: *const MgStr, len: usize) -> Result<Vec<String>, MgError> {
+pub(crate) fn read_string_list(ptr: *const MgStr, len: usize) -> Result<Vec<String>, MgError> {
     if ptr.is_null() {
         if len == 0 {
             return Ok(Vec::new());
@@ -611,7 +694,10 @@ fn read_string_list(ptr: *const MgStr, len: usize) -> Result<Vec<String>, MgErro
 
 /// Borrowed variant of `read_string_list` for strings that only need to live
 /// for the duration of the FFI call — avoids one allocation per entry.
-fn read_borrowed_str_list(ptr: *const MgStr, len: usize) -> Result<Vec<&'static str>, MgError> {
+pub(crate) fn read_borrowed_str_list(
+    ptr: *const MgStr,
+    len: usize,
+) -> Result<Vec<&'static str>, MgError> {
     if ptr.is_null() {
         if len == 0 {
             return Ok(Vec::new());
@@ -628,7 +714,7 @@ fn read_borrowed_str_list(ptr: *const MgStr, len: usize) -> Result<Vec<&'static 
         .collect()
 }
 
-fn string_list_value(values: &[String]) -> *mut MgValue {
+pub(crate) fn string_list_value(values: &[String]) -> *mut MgValue {
     let items = values
         .iter()
         .map(|value| MontyObject::String(value.clone()))
@@ -638,7 +724,7 @@ fn string_list_value(values: &[String]) -> *mut MgValue {
     }))
 }
 
-const fn monty_date_from_raw(raw: MgDate) -> MontyDate {
+pub(crate) const fn monty_date_from_raw(raw: MgDate) -> MontyDate {
     MontyDate {
         year: raw.year,
         month: raw.month,
@@ -646,7 +732,7 @@ const fn monty_date_from_raw(raw: MgDate) -> MontyDate {
     }
 }
 
-fn monty_datetime_from_raw(raw: &MgDateTime) -> Result<MontyDateTime, MgError> {
+pub(crate) fn monty_datetime_from_raw(raw: &MgDateTime) -> Result<MontyDateTime, MgError> {
     let timezone_name = if raw.has_timezone_name != 0 {
         Some(str_arg(raw.timezone_name.ptr.cast_const(), raw.timezone_name.len)?.to_owned())
     } else {
@@ -665,7 +751,7 @@ fn monty_datetime_from_raw(raw: &MgDateTime) -> Result<MontyDateTime, MgError> {
     })
 }
 
-const fn monty_timedelta_from_raw(raw: MgTimeDelta) -> MontyTimeDelta {
+pub(crate) const fn monty_timedelta_from_raw(raw: MgTimeDelta) -> MontyTimeDelta {
     MontyTimeDelta {
         days: raw.days,
         seconds: raw.seconds,
@@ -673,7 +759,7 @@ const fn monty_timedelta_from_raw(raw: MgTimeDelta) -> MontyTimeDelta {
     }
 }
 
-fn monty_timezone_from_raw(raw: &MgTimeZone) -> Result<MontyTimeZone, MgError> {
+pub(crate) fn monty_timezone_from_raw(raw: &MgTimeZone) -> Result<MontyTimeZone, MgError> {
     let name = if raw.has_name != 0 {
         Some(str_arg(raw.name.ptr.cast_const(), raw.name.len)?.to_owned())
     } else {
@@ -685,7 +771,11 @@ fn monty_timezone_from_raw(raw: &MgTimeZone) -> Result<MontyTimeZone, MgError> {
     })
 }
 
-const fn raw_value(kind: u32) -> MgRawValue {
+// ---------------------------------------------------------------------------
+// Raw value encode/decode
+// ---------------------------------------------------------------------------
+
+pub(crate) const fn raw_value(kind: u32) -> MgRawValue {
     MgRawValue {
         kind,
         bool_value: 0,
@@ -698,7 +788,7 @@ const fn raw_value(kind: u32) -> MgRawValue {
     }
 }
 
-fn raw_bytes(kind: u32, bytes: &[u8]) -> MgRawValue {
+pub(crate) fn raw_bytes(kind: u32, bytes: &[u8]) -> MgRawValue {
     let mut raw = raw_value(kind);
     if bytes.is_empty() {
         return raw;
@@ -711,34 +801,37 @@ fn raw_bytes(kind: u32, bytes: &[u8]) -> MgRawValue {
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-const unsafe fn raw_value_slice_mut<'a>(ptr: *mut u8, len: usize) -> &'a mut [MgRawValue] {
+pub(crate) const unsafe fn raw_value_slice_mut<'a>(
+    ptr: *mut u8,
+    len: usize,
+) -> &'a mut [MgRawValue] {
     // SAFETY: callers only pass pointers that were originally allocated as
     // MgRawValue arrays by this crate or received from Go's matching ABI type.
     unsafe { slice::from_raw_parts_mut(ptr.cast::<MgRawValue>(), len) }
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-const unsafe fn raw_pair_slice_mut<'a>(ptr: *mut u8, len: usize) -> &'a mut [MgRawPair] {
+pub(crate) const unsafe fn raw_pair_slice_mut<'a>(ptr: *mut u8, len: usize) -> &'a mut [MgRawPair] {
     // SAFETY: callers only pass pointers that were originally allocated as
     // MgRawPair arrays by this crate or received from Go's matching ABI type.
     unsafe { slice::from_raw_parts_mut(ptr.cast::<MgRawPair>(), len) }
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-unsafe fn raw_value_box_from_raw(ptr: *mut u8, len: usize) -> Box<[MgRawValue]> {
+pub(crate) unsafe fn raw_value_box_from_raw(ptr: *mut u8, len: usize) -> Box<[MgRawValue]> {
     // SAFETY: ptr/len must come from raw_sequence, which allocated a boxed
     // MgRawValue slice and stored its data pointer in MgRawValue.ptr.
     unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr.cast::<MgRawValue>(), len)) }
 }
 
 #[allow(clippy::cast_ptr_alignment)]
-unsafe fn raw_pair_box_from_raw(ptr: *mut u8, len: usize) -> Box<[MgRawPair]> {
+pub(crate) unsafe fn raw_pair_box_from_raw(ptr: *mut u8, len: usize) -> Box<[MgRawPair]> {
     // SAFETY: ptr/len must come from raw_dict, which allocated a boxed
     // MgRawPair slice and stored its data pointer in MgRawValue.ptr.
     unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr.cast::<MgRawPair>(), len)) }
 }
 
-fn raw_sequence(kind: u32, values: Vec<MontyObject>) -> Result<MgRawValue, MgError> {
+pub(crate) fn raw_sequence(kind: u32, values: Vec<MontyObject>) -> Result<MgRawValue, MgError> {
     let mut raw = raw_value(kind);
     if values.is_empty() {
         return Ok(raw);
@@ -761,7 +854,7 @@ fn raw_sequence(kind: u32, values: Vec<MontyObject>) -> Result<MgRawValue, MgErr
     Ok(raw)
 }
 
-fn raw_dict(kind: u32, pairs: DictPairs) -> Result<MgRawValue, MgError> {
+pub(crate) fn raw_dict(kind: u32, pairs: DictPairs) -> Result<MgRawValue, MgError> {
     let mut raw = raw_value(kind);
     if pairs.is_empty() {
         return Ok(raw);
@@ -794,46 +887,38 @@ fn raw_dict(kind: u32, pairs: DictPairs) -> Result<MgRawValue, MgError> {
     Ok(raw)
 }
 
-fn push_flat_u8(out: &mut Vec<u8>, value: u8) {
-    out.push(value);
-}
+// ---------------------------------------------------------------------------
+// Flat encoding (compound results without per-node allocations)
+// ---------------------------------------------------------------------------
 
-fn push_flat_u32(out: &mut Vec<u8>, value: usize) -> Result<(), MgError> {
+pub(crate) fn push_flat_u32(out: &mut Vec<u8>, value: usize) -> Result<(), MgError> {
     let value = u32::try_from(value)
         .map_err(|_| ffi_error("OverflowError", "flat value length exceeds u32"))?;
     out.extend_from_slice(&value.to_le_bytes());
     Ok(())
 }
 
-fn push_flat_i64(out: &mut Vec<u8>, value: i64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_flat_f64(out: &mut Vec<u8>, value: f64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_flat_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), MgError> {
+pub(crate) fn push_flat_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), MgError> {
     push_flat_u32(out, bytes.len())?;
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-fn write_flat_value(out: &mut Vec<u8>, object: &MontyObject) -> Result<(), MgError> {
+pub(crate) fn write_flat_value(out: &mut Vec<u8>, object: &MontyObject) -> Result<(), MgError> {
     out.extend_from_slice(&object_kind(object).to_le_bytes());
     match object {
         MontyObject::Ellipsis | MontyObject::None => Ok(()),
         MontyObject::Bool(value) => {
-            push_flat_u8(out, u8::from(*value));
+            out.push(u8::from(*value));
             Ok(())
         }
         MontyObject::Int(value) => {
-            push_flat_i64(out, *value);
+            out.extend_from_slice(&value.to_le_bytes());
             Ok(())
         }
         MontyObject::BigInt(value) => push_flat_bytes(out, value.to_string().as_bytes()),
         MontyObject::Float(value) => {
-            push_flat_f64(out, *value);
+            out.extend_from_slice(&value.to_le_bytes());
             Ok(())
         }
         MontyObject::String(value) => push_flat_bytes(out, value.as_bytes()),
@@ -863,7 +948,7 @@ fn write_flat_value(out: &mut Vec<u8>, object: &MontyObject) -> Result<(), MgErr
     }
 }
 
-const fn object_kind(object: &MontyObject) -> u32 {
+pub(crate) const fn object_kind(object: &MontyObject) -> u32 {
     match object {
         MontyObject::Ellipsis => KIND_ELLIPSIS,
         MontyObject::None => KIND_NONE,
@@ -894,7 +979,7 @@ const fn object_kind(object: &MontyObject) -> u32 {
     }
 }
 
-fn read_raw_value(value: &mut MgRawValue) -> Result<MontyObject, MgError> {
+pub(crate) fn read_raw_value(value: &mut MgRawValue) -> Result<MontyObject, MgError> {
     match value.kind {
         KIND_ELLIPSIS => Ok(MontyObject::Ellipsis),
         KIND_NONE => Ok(MontyObject::None),
@@ -941,7 +1026,7 @@ fn read_raw_value(value: &mut MgRawValue) -> Result<MontyObject, MgError> {
     }
 }
 
-fn take_owned_raw_handle(value: &mut MgRawValue) -> Result<MontyObject, MgError> {
+pub(crate) fn take_owned_raw_handle(value: &mut MgRawValue) -> Result<MontyObject, MgError> {
     if value.handle.is_null() {
         return Err(ffi_error("TypeError", "owned raw value handle is null"));
     }
@@ -954,7 +1039,7 @@ fn take_owned_raw_handle(value: &mut MgRawValue) -> Result<MontyObject, MgError>
     Ok(boxed.object)
 }
 
-fn free_owned_raw_handle(value: &mut MgRawValue) {
+pub(crate) fn free_owned_raw_handle(value: &mut MgRawValue) {
     match value.kind {
         KIND_OWNED_HANDLE if !value.handle.is_null() => {
             // SAFETY: owned raw handles are allocated with Box::into_raw in this crate.
@@ -979,13 +1064,16 @@ fn free_owned_raw_handle(value: &mut MgRawValue) {
     }
 }
 
-fn free_owned_raw_values(values: &mut [MgRawValue]) {
+pub(crate) fn free_owned_raw_values(values: &mut [MgRawValue]) {
     for value in values {
         free_owned_raw_handle(value);
     }
 }
 
-fn read_raw_values(ptr: *mut MgRawValue, len: usize) -> Result<Vec<MontyObject>, MgError> {
+pub(crate) fn read_raw_values(
+    ptr: *mut MgRawValue,
+    len: usize,
+) -> Result<Vec<MontyObject>, MgError> {
     if ptr.is_null() {
         if len == 0 {
             return Ok(Vec::new());
@@ -1000,7 +1088,10 @@ fn read_raw_values(ptr: *mut MgRawValue, len: usize) -> Result<Vec<MontyObject>,
     read_raw_value_slice(values)
 }
 
-fn read_raw_values_from_bytes(ptr: *mut u8, len: usize) -> Result<Vec<MontyObject>, MgError> {
+pub(crate) fn read_raw_values_from_bytes(
+    ptr: *mut u8,
+    len: usize,
+) -> Result<Vec<MontyObject>, MgError> {
     if ptr.is_null() {
         if len == 0 {
             return Ok(Vec::new());
@@ -1015,7 +1106,7 @@ fn read_raw_values_from_bytes(ptr: *mut u8, len: usize) -> Result<Vec<MontyObjec
     read_raw_value_slice(values)
 }
 
-fn read_raw_value_slice(values: &mut [MgRawValue]) -> Result<Vec<MontyObject>, MgError> {
+pub(crate) fn read_raw_value_slice(values: &mut [MgRawValue]) -> Result<Vec<MontyObject>, MgError> {
     let mut objects = Vec::with_capacity(values.len());
     for i in 0..values.len() {
         match read_raw_value(&mut values[i]) {
@@ -1029,7 +1120,8 @@ fn read_raw_value_slice(values: &mut [MgRawValue]) -> Result<Vec<MontyObject>, M
     Ok(objects)
 }
 
-fn text_for_raw(object: &MontyObject) -> Cow<'_, str> {
+pub(crate) fn text_for_raw(object: &MontyObject) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     match object {
         MontyObject::String(value)
         | MontyObject::Path(value)
@@ -1047,7 +1139,7 @@ fn text_for_raw(object: &MontyObject) -> Cow<'_, str> {
     }
 }
 
-fn write_raw_value(out: *mut MgRawValue, object: MontyObject) -> Result<(), MgError> {
+pub(crate) fn write_raw_value(out: *mut MgRawValue, object: MontyObject) -> Result<(), MgError> {
     if out.is_null() {
         return Err(ffi_error("TypeError", "raw value output pointer is null"));
     }
@@ -1098,7 +1190,10 @@ fn write_raw_value(out: *mut MgRawValue, object: MontyObject) -> Result<(), MgEr
     Ok(())
 }
 
-fn write_value_handle(out: *mut *mut MgValue, object: MontyObject) -> Result<(), MgError> {
+pub(crate) fn write_value_handle(
+    out: *mut *mut MgValue,
+    object: MontyObject,
+) -> Result<(), MgError> {
     if out.is_null() {
         return Err(ffi_error("TypeError", "value output pointer is null"));
     }
@@ -1109,7 +1204,7 @@ fn write_value_handle(out: *mut *mut MgValue, object: MontyObject) -> Result<(),
     Ok(())
 }
 
-fn check_raw_output<T>(
+pub(crate) fn check_raw_output<T>(
     out: *mut T,
     len: usize,
     expected: usize,
@@ -1130,7 +1225,7 @@ fn check_raw_output<T>(
     Ok(())
 }
 
-fn write_raw_values(
+pub(crate) fn write_raw_values(
     out: *mut MgRawValue,
     len: usize,
     values: &[MontyObject],
@@ -1144,7 +1239,7 @@ fn write_raw_values(
     Ok(())
 }
 
-fn write_raw_pair(
+pub(crate) fn write_raw_pair(
     out: *mut MgRawPair,
     key: &MontyObject,
     value: &MontyObject,
@@ -1160,7 +1255,7 @@ fn write_raw_pair(
     Ok(())
 }
 
-fn write_dict_pairs_raw(
+pub(crate) fn write_dict_pairs_raw(
     out: *mut MgRawPair,
     len: usize,
     pairs: &DictPairs,
@@ -1174,14 +1269,14 @@ fn write_dict_pairs_raw(
     Ok(())
 }
 
-fn free_owned_raw_pairs(pairs: &mut [MgRawPair]) {
+pub(crate) fn free_owned_raw_pairs(pairs: &mut [MgRawPair]) {
     for pair in pairs {
         free_owned_raw_handle(&mut pair.key);
         free_owned_raw_handle(&mut pair.value);
     }
 }
 
-fn read_raw_pairs(
+pub(crate) fn read_raw_pairs(
     ptr: *mut MgRawPair,
     len: usize,
 ) -> Result<Vec<(MontyObject, MontyObject)>, MgError> {
@@ -1199,7 +1294,7 @@ fn read_raw_pairs(
     read_raw_pair_slice(pairs)
 }
 
-fn read_raw_pairs_from_bytes(
+pub(crate) fn read_raw_pairs_from_bytes(
     ptr: *mut u8,
     len: usize,
 ) -> Result<Vec<(MontyObject, MontyObject)>, MgError> {
@@ -1217,7 +1312,7 @@ fn read_raw_pairs_from_bytes(
     read_raw_pair_slice(pairs)
 }
 
-fn read_raw_pair_slice(
+pub(crate) fn read_raw_pair_slice(
     pairs: &mut [MgRawPair],
 ) -> Result<Vec<(MontyObject, MontyObject)>, MgError> {
     let mut objects = Vec::with_capacity(pairs.len());
@@ -1242,530 +1337,37 @@ fn read_raw_pair_slice(
     Ok(objects)
 }
 
-fn exception_from_raw(exc_type: MgStr, message: MgStr) -> Result<MontyException, MgError> {
-    let exc_type = as_str(exc_type)?
-        .parse::<ExcType>()
-        .map_err(|_| ffi_error("ValueError", "unknown exception type"))?;
-    let message = as_str(message)?;
-    Ok(MontyException::new(
-        exc_type,
-        (!message.is_empty()).then(|| message.to_owned()),
-    ))
-}
-
-fn read_future_results(
-    ptr: *mut MgFutureResult,
-    len: usize,
-) -> Result<Vec<(u32, ExtFunctionResult)>, MgError> {
-    if ptr.is_null() {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        return Err(ffi_error(
-            "TypeError",
-            "non-empty future-result array has null pointer",
-        ));
+/// Parses an exception type name plus message. Types Monty does not know
+/// (user-defined Go exception names) degrade to `RuntimeError` with the
+/// original type folded into the message, so a host error stays catchable
+/// inside Python instead of aborting the run.
+pub(crate) fn parse_exc_type(type_str: &str, message: &str) -> (ExcType, Option<String>) {
+    if let Ok(exc_type) = type_str.parse::<ExcType>() {
+        return (exc_type, (!message.is_empty()).then(|| message.to_owned()));
     }
-    // SAFETY: caller promises ptr points to len future result entries.
-    let results = unsafe { slice::from_raw_parts_mut(ptr, len) };
-    let mut values = Vec::with_capacity(len);
-    for i in 0..len {
-        let value = match results[i].kind {
-            FUTURE_RESULT_RETURN => match read_raw_value(&mut results[i].value) {
-                Ok(value) => ExtFunctionResult::Return(value),
-                Err(error) => {
-                    free_owned_raw_handle(&mut results[i].value);
-                    for result in &mut results[i + 1..] {
-                        free_owned_raw_handle(&mut result.value);
-                    }
-                    return Err(error);
-                }
-            },
-            FUTURE_RESULT_ERROR => {
-                match exception_from_raw(results[i].exc_type, results[i].message) {
-                    Ok(error) => ExtFunctionResult::Error(error),
-                    Err(error) => {
-                        for result in &mut results[i + 1..] {
-                            free_owned_raw_handle(&mut result.value);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            FUTURE_RESULT_NOT_FOUND => match as_str(results[i].message) {
-                Ok(name) => ExtFunctionResult::NotFound(name.to_owned()),
-                Err(error) => {
-                    for result in &mut results[i + 1..] {
-                        free_owned_raw_handle(&mut result.value);
-                    }
-                    return Err(error);
-                }
-            },
-            _ => {
-                free_owned_raw_handle(&mut results[i].value);
-                for result in &mut results[i + 1..] {
-                    free_owned_raw_handle(&mut result.value);
-                }
-                return Err(ffi_error(
-                    "ValueError",
-                    format!("unknown future result kind {}", results[i].kind),
-                ));
-            }
-        };
-        values.push((results[i].call_id, value));
-    }
-    Ok(values)
-}
-
-fn limits_from_raw(raw: *const MgLimits) -> Option<ResourceLimits> {
-    if raw.is_null() {
-        return None;
-    }
-    // SAFETY: raw is checked for null above and copied immediately.
-    let raw = unsafe { &*raw };
-    let max_recursion_depth = if raw.disable_recursion_limit != 0 {
-        None
-    } else if raw.max_recursion_depth_set != 0 {
-        Some(raw.max_recursion_depth)
-    } else {
-        Some(monty::DEFAULT_MAX_RECURSION_DEPTH)
+    let message = match (type_str.is_empty(), message.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(message.to_owned()),
+        (false, true) => Some(type_str.to_owned()),
+        (false, false) => Some(format!("{type_str}: {message}")),
     };
-
-    Some(ResourceLimits {
-        max_allocations: (raw.max_allocations_set != 0).then_some(raw.max_allocations),
-        max_duration: (raw.max_duration_nanos_set != 0)
-            .then_some(Duration::from_nanos(raw.max_duration_nanos)),
-        max_memory: (raw.max_memory_set != 0).then_some(raw.max_memory),
-        gc_interval: (raw.gc_interval_set != 0).then_some(raw.gc_interval),
-        max_recursion_depth,
-    })
+    (ExcType::RuntimeError, message)
 }
 
-fn start_with_print(
-    runner: &MontyRun,
-    inputs: Vec<MontyObject>,
-    limits: Option<ResourceLimits>,
-) -> Result<(MgProgress, String), MgError> {
-    let mut stdout = String::new();
-    let writer = PrintWriter::CollectString(&mut stdout);
-    let progress = if let Some(limits) = limits {
-        runner
-            .clone()
-            .start(inputs, LimitedTracker::new(limits), writer)
-            .map(MgProgress::Limited)
-    } else {
-        runner
-            .clone()
-            .start(inputs, NoLimitTracker, writer)
-            .map(MgProgress::NoLimit)
-    }
-    .map_err(|exc| from_monty_error(&exc))?;
-    Ok((progress, stdout))
+pub(crate) fn exception_from_raw(
+    exc_type: MgStr,
+    message: MgStr,
+) -> Result<MontyException, MgError> {
+    let (exc_type, message) = parse_exc_type(as_str(exc_type)?, as_str(message)?);
+    Ok(MontyException::new(exc_type, message))
 }
 
-fn run_with_print(
-    runner: &MontyRun,
-    inputs: Vec<MontyObject>,
-    limits: Option<ResourceLimits>,
-) -> Result<(MontyObject, String), MgError> {
-    let mut stdout = String::new();
-    let writer = PrintWriter::CollectString(&mut stdout);
-    let value = if let Some(limits) = limits {
-        runner.run(inputs, LimitedTracker::new(limits), writer)
-    } else {
-        runner.run(inputs, NoLimitTracker, writer)
-    }
-    .map_err(|exc| from_monty_error(&exc))?;
-    Ok((value, stdout))
-}
-
-fn run_with_host_callback(
-    runner: &MontyRun,
-    inputs: Vec<MontyObject>,
-    limits: Option<ResourceLimits>,
-    host_names: &[&str],
-    callback: MgHostFunctionCallback,
-    user_data: usize,
-) -> Result<(MontyObject, String), MgError> {
-    let callback =
-        callback.ok_or_else(|| ffi_error("TypeError", "host function callback is null"))?;
-    let (progress, mut stdout) = start_with_print(runner, inputs, limits)?;
-    let value = match progress {
-        MgProgress::NoLimit(progress) => {
-            run_host_progress_loop(progress, host_names, callback, user_data, &mut stdout)?
-        }
-        MgProgress::Limited(progress) => {
-            run_host_progress_loop(progress, host_names, callback, user_data, &mut stdout)?
-        }
-    };
-    Ok((value, stdout))
-}
-
-fn run_host_progress_loop<T: ResourceTracker>(
-    mut progress: RunProgress<T>,
-    host_names: &[&str],
-    callback: unsafe extern "C" fn(
-        usize,
-        *const u8,
-        usize,
-        *const MgRawValue,
-        *const MgRawValue,
-        *mut MgHostFunctionOutput,
-    ) -> i32,
-    user_data: usize,
-    stdout: &mut String,
-) -> Result<MontyObject, MgError> {
-    loop {
-        progress = match progress {
-            RunProgress::Complete(value) => return Ok(value),
-            RunProgress::NameLookup(lookup) => {
-                let result = if host_names.iter().any(|name| *name == lookup.name) {
-                    NameLookupResult::Value(MontyObject::Function {
-                        name: lookup.name.clone(),
-                        docstring: None,
-                    })
-                } else {
-                    NameLookupResult::Undefined
-                };
-                let writer = PrintWriter::CollectString(stdout);
-                lookup
-                    .resume(result, writer)
-                    .map_err(|exc| from_monty_error(&exc))?
-            }
-            RunProgress::FunctionCall(call) => {
-                let result = call_host_function_callback(&call, callback, user_data)?;
-                let writer = PrintWriter::CollectString(stdout);
-                call.resume(result, writer)
-                    .map_err(|exc| from_monty_error(&exc))?
-            }
-            RunProgress::OsCall(_) => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "host callback run path does not support OS calls",
-                ));
-            }
-            RunProgress::ResolveFutures(_) => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "host callback run path does not support pending futures",
-                ));
-            }
-        };
-    }
-}
-
-fn call_host_function_callback<T: ResourceTracker>(
-    call: &FunctionCall<T>,
-    callback: unsafe extern "C" fn(
-        usize,
-        *const u8,
-        usize,
-        *const MgRawValue,
-        *const MgRawValue,
-        *mut MgHostFunctionOutput,
-    ) -> i32,
-    user_data: usize,
-) -> Result<ExtFunctionResult, MgError> {
-    // Fast path: when every positional and keyword value is a scalar, encode
-    // borrowed views over the call's own storage — no MontyObject clones and
-    // no owned raw trees to free afterwards.
-    if let Some((mut arg_items, mut kwarg_pairs)) = borrowed_call_views(call) {
-        let mut args = raw_value(KIND_LIST);
-        if !arg_items.is_empty() {
-            args.ptr = arg_items.as_mut_ptr().cast();
-            args.len = arg_items.len();
-        }
-        let mut kwargs = raw_value(KIND_DICT);
-        if !kwarg_pairs.is_empty() {
-            kwargs.ptr = kwarg_pairs.as_mut_ptr().cast();
-            kwargs.len = kwarg_pairs.len();
-        }
-        return invoke_host_function_callback(call, callback, user_data, &args, &kwargs);
-    }
-    let mut args = raw_sequence(KIND_LIST, call.args.clone())?;
-    let mut kwargs = raw_dict(KIND_DICT, call.kwargs.clone().into())?;
-    let result = invoke_host_function_callback(call, callback, user_data, &args, &kwargs);
-    free_raw_value(&mut args);
-    free_raw_value(&mut kwargs);
-    result
-}
-
-/// Borrowed raw views of every positional and keyword argument, or `None` when
-/// any value is a non-scalar that needs the owned (cloning) encoding instead.
-fn borrowed_call_views<T: ResourceTracker>(
-    call: &FunctionCall<T>,
-) -> Option<(Vec<MgRawValue>, Vec<MgRawPair>)> {
-    let mut args = Vec::with_capacity(call.args.len());
-    for arg in &call.args {
-        args.push(borrowed_raw_value(arg)?);
-    }
-    let mut kwargs = Vec::with_capacity(call.kwargs.len());
-    for pair in &call.kwargs {
-        kwargs.push(borrowed_raw_pair(pair)?);
-    }
-    Some((args, kwargs))
-}
-
-fn invoke_host_function_callback<T: ResourceTracker>(
-    call: &FunctionCall<T>,
-    callback: unsafe extern "C" fn(
-        usize,
-        *const u8,
-        usize,
-        *const MgRawValue,
-        *const MgRawValue,
-        *mut MgHostFunctionOutput,
-    ) -> i32,
-    user_data: usize,
-    args: &MgRawValue,
-    kwargs: &MgRawValue,
-) -> Result<ExtFunctionResult, MgError> {
-    let mut out = MgHostFunctionOutput {
-        value: raw_value(KIND_INVALID),
-        exc_type: MgStr {
-            ptr: ptr::null(),
-            len: 0,
-        },
-        message: MgStr {
-            ptr: ptr::null(),
-            len: 0,
-        },
-    };
-    // SAFETY: callback is provided by Go for this FFI call, and all pointers
-    // passed here reference stack values or call-owned Monty strings.
-    let status = unsafe {
-        callback(
-            user_data,
-            call.function_name.as_ptr(),
-            call.function_name.len(),
-            ptr::from_ref(args),
-            ptr::from_ref(kwargs),
-            ptr::addr_of_mut!(out),
-        )
-    };
-    match status {
-        HOST_CALLBACK_RETURN => read_raw_value(&mut out.value).map(ExtFunctionResult::Return),
-        HOST_CALLBACK_EXCEPTION => {
-            exception_from_raw(out.exc_type, out.message).map(ExtFunctionResult::Error)
-        }
-        _ => Err(ffi_error("RuntimeError", "host function callback failed")),
-    }
-}
-
-fn borrowed_raw_value(object: &MontyObject) -> Option<MgRawValue> {
-    match object {
-        MontyObject::Ellipsis => Some(raw_value(KIND_ELLIPSIS)),
-        MontyObject::None => Some(raw_value(KIND_NONE)),
-        MontyObject::Bool(value) => {
-            let mut raw = raw_value(KIND_BOOL);
-            raw.bool_value = u8::from(*value);
-            Some(raw)
-        }
-        MontyObject::Int(value) => {
-            let mut raw = raw_value(KIND_INT);
-            raw.int_value = *value;
-            Some(raw)
-        }
-        MontyObject::Float(value) => {
-            let mut raw = raw_value(KIND_FLOAT);
-            raw.float_value = *value;
-            Some(raw)
-        }
-        MontyObject::String(value) => {
-            let mut raw = raw_value(KIND_STRING);
-            if !value.is_empty() {
-                raw.ptr = value.as_ptr().cast_mut();
-                raw.len = value.len();
-            }
-            Some(raw)
-        }
-        MontyObject::Bytes(value) => {
-            let mut raw = raw_value(KIND_BYTES);
-            if !value.is_empty() {
-                raw.ptr = value.as_ptr().cast_mut();
-                raw.len = value.len();
-            }
-            Some(raw)
-        }
-        _ => None,
-    }
-}
-
-fn borrowed_raw_pair(pair: &(MontyObject, MontyObject)) -> Option<MgRawPair> {
-    Some(MgRawPair {
-        key: borrowed_raw_value(&pair.0)?,
-        value: borrowed_raw_value(&pair.1)?,
-    })
-}
-
-fn resume_progress(
-    progress: MgProgress,
-    result: ExtFunctionResult,
-) -> Result<(MgProgress, String), MgError> {
-    let mut stdout = String::new();
-    let writer = PrintWriter::CollectString(&mut stdout);
-    let next = match progress {
-        MgProgress::NoLimit(progress) => match progress {
-            RunProgress::FunctionCall(call) => call.resume(result, writer),
-            RunProgress::OsCall(call) => call.resume(result, writer),
-            _ => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "progress state cannot be resumed with an external result",
-                ));
-            }
-        }
-        .map(MgProgress::NoLimit),
-        MgProgress::Limited(progress) => match progress {
-            RunProgress::FunctionCall(call) => call.resume(result, writer),
-            RunProgress::OsCall(call) => call.resume(result, writer),
-            _ => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "progress state cannot be resumed with an external result",
-                ));
-            }
-        }
-        .map(MgProgress::Limited),
-    }
-    .map_err(|exc| from_monty_error(&exc))?;
-    Ok((next, stdout))
-}
-
-fn resume_pending(progress: MgProgress) -> Result<(MgProgress, String), MgError> {
-    let mut stdout = String::new();
-    let writer = PrintWriter::CollectString(&mut stdout);
-    let next = match progress {
-        MgProgress::NoLimit(progress) => match progress {
-            RunProgress::FunctionCall(call) => call.resume_pending(writer),
-            _ => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "progress state is not a function call",
-                ));
-            }
-        }
-        .map(MgProgress::NoLimit),
-        MgProgress::Limited(progress) => match progress {
-            RunProgress::FunctionCall(call) => call.resume_pending(writer),
-            _ => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "progress state is not a function call",
-                ));
-            }
-        }
-        .map(MgProgress::Limited),
-    }
-    .map_err(|exc| from_monty_error(&exc))?;
-    Ok((next, stdout))
-}
-
-fn resume_name(
-    progress: MgProgress,
-    result: NameLookupResult,
-) -> Result<(MgProgress, String), MgError> {
-    let mut stdout = String::new();
-    let writer = PrintWriter::CollectString(&mut stdout);
-    let next = match progress {
-        MgProgress::NoLimit(progress) => match progress {
-            RunProgress::NameLookup(lookup) => lookup.resume(result, writer),
-            _ => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "progress state is not a name lookup",
-                ));
-            }
-        }
-        .map(MgProgress::NoLimit),
-        MgProgress::Limited(progress) => match progress {
-            RunProgress::NameLookup(lookup) => lookup.resume(result, writer),
-            _ => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "progress state is not a name lookup",
-                ));
-            }
-        }
-        .map(MgProgress::Limited),
-    }
-    .map_err(|exc| from_monty_error(&exc))?;
-    Ok((next, stdout))
-}
-
-fn resume_futures(
-    progress: MgProgress,
-    results: Vec<(u32, ExtFunctionResult)>,
-) -> Result<(MgProgress, String), MgError> {
-    let mut stdout = String::new();
-    let writer = PrintWriter::CollectString(&mut stdout);
-    let next = match progress {
-        MgProgress::NoLimit(progress) => match progress {
-            RunProgress::ResolveFutures(state) => state.resume(results, writer),
-            _ => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "progress state is not waiting on futures",
-                ));
-            }
-        }
-        .map(MgProgress::NoLimit),
-        MgProgress::Limited(progress) => match progress {
-            RunProgress::ResolveFutures(state) => state.resume(results, writer),
-            _ => {
-                return Err(ffi_error(
-                    "RuntimeError",
-                    "progress state is not waiting on futures",
-                ));
-            }
-        }
-        .map(MgProgress::Limited),
-    }
-    .map_err(|exc| from_monty_error(&exc))?;
-    Ok((next, stdout))
-}
-
-const fn progress_kind(progress: &MgProgress) -> u32 {
-    match progress {
-        MgProgress::NoLimit(progress) => match progress {
-            RunProgress::FunctionCall(_) => PROGRESS_FUNCTION_CALL,
-            RunProgress::OsCall(_) => PROGRESS_OS_CALL,
-            RunProgress::ResolveFutures(_) => PROGRESS_RESOLVE_FUTURES,
-            RunProgress::NameLookup(_) => PROGRESS_NAME_LOOKUP,
-            RunProgress::Complete(_) => PROGRESS_COMPLETE,
-        },
-        MgProgress::Limited(progress) => match progress {
-            RunProgress::FunctionCall(_) => PROGRESS_FUNCTION_CALL,
-            RunProgress::OsCall(_) => PROGRESS_OS_CALL,
-            RunProgress::ResolveFutures(_) => PROGRESS_RESOLVE_FUTURES,
-            RunProgress::NameLookup(_) => PROGRESS_NAME_LOOKUP,
-            RunProgress::Complete(_) => PROGRESS_COMPLETE,
-        },
-    }
-}
-
-fn with_resolve_futures<R>(progress: *const MgProgress, f: impl FnOnce(&[u32]) -> R) -> Option<R> {
-    if progress.is_null() {
-        return None;
-    }
-    // SAFETY: handle validity is owned by the Go side contract.
-    match unsafe { &*progress } {
-        MgProgress::NoLimit(RunProgress::ResolveFutures(state)) => {
-            Some(f(state.pending_call_ids()))
-        }
-        MgProgress::Limited(RunProgress::ResolveFutures(state)) => {
-            Some(f(state.pending_call_ids()))
-        }
-        _ => None,
-    }
-}
-
-fn free_raw_pair(pair: &mut MgRawPair) {
+pub(crate) fn free_raw_pair(pair: &mut MgRawPair) {
     free_raw_value(&mut pair.key);
     free_raw_value(&mut pair.value);
 }
 
-fn free_raw_value(value: &mut MgRawValue) {
+pub(crate) fn free_raw_value(value: &mut MgRawValue) {
     match value.kind {
         KIND_LIST | KIND_TUPLE | KIND_SET | KIND_FROZEN_SET if !value.ptr.is_null() => {
             // SAFETY: recursive raw output arrays are allocated by raw_sequence.
@@ -1798,6 +1400,84 @@ fn free_raw_value(value: &mut MgRawValue) {
     *value = raw_value(KIND_INVALID);
 }
 
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+pub(crate) struct LimitSpec {
+    pub(crate) limits: Option<ResourceLimits>,
+    pub(crate) cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Reads `MgLimits` into a `LimitSpec`. A non-null cancel token forces a
+/// tracked (`GoTracker`) execution even when no numeric limits are set.
+pub(crate) fn limits_from_raw(raw: *const MgLimits) -> LimitSpec {
+    if raw.is_null() {
+        return LimitSpec {
+            limits: None,
+            cancel: None,
+        };
+    }
+    // SAFETY: raw is checked for null above and copied immediately.
+    let raw = unsafe { &*raw };
+    let cancel = if raw.cancel_token.is_null() {
+        None
+    } else {
+        // SAFETY: cancel token handles are allocated with Box::into_raw in this crate.
+        Some(unsafe { (*raw.cancel_token).0.clone() })
+    };
+    let any_limit = raw.max_allocations_set != 0
+        || raw.max_duration_nanos_set != 0
+        || raw.max_memory_set != 0
+        || raw.gc_interval_set != 0
+        || raw.max_recursion_depth_set != 0
+        || raw.disable_recursion_limit != 0;
+    if !any_limit && cancel.is_none() {
+        return LimitSpec {
+            limits: None,
+            cancel: None,
+        };
+    }
+    let max_recursion_depth = if raw.disable_recursion_limit != 0 {
+        None
+    } else if raw.max_recursion_depth_set != 0 {
+        Some(raw.max_recursion_depth)
+    } else {
+        Some(monty::DEFAULT_MAX_RECURSION_DEPTH)
+    };
+    LimitSpec {
+        limits: Some(ResourceLimits {
+            max_allocations: (raw.max_allocations_set != 0).then_some(raw.max_allocations),
+            max_duration: (raw.max_duration_nanos_set != 0)
+                .then_some(Duration::from_nanos(raw.max_duration_nanos)),
+            max_memory: (raw.max_memory_set != 0).then_some(raw.max_memory),
+            gc_interval: (raw.gc_interval_set != 0).then_some(raw.gc_interval),
+            max_recursion_depth,
+        }),
+        cancel,
+    }
+}
+
+impl LimitSpec {
+    /// Whether execution needs the tracked (`GoTracker`) path.
+    pub(crate) const fn tracked(&self) -> bool {
+        self.limits.is_some() || self.cancel.is_some()
+    }
+
+    pub(crate) fn tracker(self) -> GoTracker {
+        // ResourceLimits::new (not ::default) keeps the CPython-style default
+        // recursion limit when no explicit limits were set.
+        fn unrestricted() -> ResourceLimits {
+            ResourceLimits::new()
+        }
+        GoTracker::new(self.limits.unwrap_or_else(unrestricted), self.cancel)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared buffer/handle release entry points
+// ---------------------------------------------------------------------------
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mg_bytes_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
@@ -1816,2207 +1496,53 @@ pub unsafe extern "C" fn mg_raw_value_free(value: *mut MgRawValue) {
     free_raw_value(value);
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_error_free(error: *mut MgError) {
-    if !error.is_null() {
-        // SAFETY: error handles are allocated with Box::into_raw in this crate.
-        unsafe { drop(Box::from_raw(error)) };
-    }
-}
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_error_type(error: *const MgError, out: *mut MgBytes) -> i32 {
-    guard(ptr::null_mut(), || {
-        if error.is_null() {
-            return Err(ffi_error("TypeError", "error handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        write_string(out, unsafe { &(*error).exc_type })
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_error_message(error: *const MgError, out: *mut MgBytes) -> i32 {
-    guard(ptr::null_mut(), || {
-        if error.is_null() {
-            return Err(ffi_error("TypeError", "error handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        write_string(out, unsafe { &(*error).message })
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_error_display(error: *const MgError, out: *mut MgBytes) -> i32 {
-    guard(ptr::null_mut(), || {
-        if error.is_null() {
-            return Err(ffi_error("TypeError", "error handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        write_string(out, unsafe { &(*error).display })
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_type_check(
-    code_ptr: *const u8,
-    code_len: usize,
-    script_name_ptr: *const u8,
-    script_name_len: usize,
-    stubs_ptr: *const u8,
-    stubs_len: usize,
-    stubs_name_ptr: *const u8,
-    stubs_name_len: usize,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        let code = str_arg(code_ptr, code_len)?;
-        let script_name = str_arg(script_name_ptr, script_name_len)?;
-        let stubs = str_arg(stubs_ptr, stubs_len)?;
-        let stubs_name = str_arg(stubs_name_ptr, stubs_name_len)?;
-        let stubs_file = (!stubs.is_empty()).then(|| SourceFile::new(stubs, stubs_name));
-        match type_check(&SourceFile::new(code, script_name), stubs_file.as_ref()) {
-            Ok(None) => Ok(()),
-            Ok(Some(diagnostics)) => Err(ffi_error("MontyTypingError", diagnostics.to_string())),
-            Err(message) => Err(ffi_error("RuntimeError", message)),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_mount_new(
-    args: *const MgMountNewArgs,
-    out_mount: *mut *mut MgMount,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if args.is_null() {
-            return Err(ffi_error("TypeError", "mount args pointer is null"));
-        }
-        if out_mount.is_null() {
-            return Err(ffi_error("TypeError", "mount output pointer is null"));
-        }
-        // SAFETY: args is checked for null above and only read during this call.
-        let args = unsafe { &*args };
-        let virtual_path = as_str(args.virtual_path)?;
-        let host_path = as_str(args.host_path)?;
-        let mode = match args.mode {
-            0 => MontyMountMode::ReadOnly,
-            1 => MontyMountMode::ReadWrite,
-            2 => MontyMountMode::from_mode_str("overlay")
-                .map_err(|err| ffi_error("ValueError", err))?,
-            _ => {
-                return Err(ffi_error(
-                    "ValueError",
-                    "mount mode must be read-only, read-write, or overlay",
-                ));
-            }
-        };
-        let limit = (args.has_write_bytes_limit != 0).then_some(args.write_bytes_limit);
-        let mount = MontyMount::new(virtual_path, host_path, mode, limit)
-            .map_err(|err| from_monty_error(&err.into_exception()))?;
-        // SAFETY: out_mount is checked for null above.
-        unsafe {
-            *out_mount = Box::into_raw(Box::new(MgMount {
-                slot: Arc::new(Mutex::new(Some(mount))),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_mount_free(mount: *mut MgMount) {
-    if !mount.is_null() {
-        // SAFETY: mount handles are allocated with Box::into_raw in this crate.
-        unsafe { drop(Box::from_raw(mount)) };
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_mount_handle_os_call(
-    args: *const MgMountCallArgs,
-    out: *mut MgMountOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if args.is_null() {
-            return Err(ffi_error("TypeError", "mount call args pointer is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "mount output pointer is null"));
-        }
-        // SAFETY: args is checked for null above and only read during this call.
-        let args = unsafe { &*args };
-        if args.mounts.is_null() && args.mount_count != 0 {
-            return Err(ffi_error(
-                "TypeError",
-                "non-empty mount array has null pointer",
-            ));
-        }
-        // SAFETY: out is checked for null above.
-        unsafe {
-            (*out).handled = 0;
-            (*out).value = ptr::null_mut();
-            (*out).error = ptr::null_mut();
-        }
-
-        let function = as_str(args.function)?
-            .parse::<OsFunction>()
-            .map_err(|_| ffi_error("ValueError", "unknown OS function"))?;
-        let call_args = read_values(args.args, args.arg_count)?;
-        let kwargs = read_value_pairs(args.kwarg_keys, args.kwarg_values, args.kwarg_count)?;
-
-        let mount_handles = if args.mount_count == 0 {
-            &[][..]
-        } else {
-            // SAFETY: caller promises mounts points to mount_count handles.
-            unsafe { slice::from_raw_parts(args.mounts, args.mount_count) }
-        };
-        let mut slots = Vec::with_capacity(mount_handles.len());
-        for mount in mount_handles {
-            if mount.is_null() {
-                return Err(ffi_error("TypeError", "mount handle is null"));
-            }
-            // SAFETY: mount handle validity is owned by the Go side contract.
-            slots.push(unsafe { (*(*mount)).slot.clone() });
-        }
-
-        let mut table =
-            MountTable::take_shared_mounts(&slots).map_err(|err| ffi_error("RuntimeError", err))?;
-        let result = table.handle_os_call(function, &call_args, &kwargs);
-        table.put_back_shared_mounts(&slots);
-
-        match result {
-            None => Ok(()),
-            Some(Ok(object)) => {
-                // SAFETY: out is checked for null above.
-                unsafe {
-                    (*out).handled = 1;
-                    (*out).value = Box::into_raw(Box::new(MgValue { object }));
-                }
-                Ok(())
-            }
-            Some(Err(err)) => Err(from_monty_error(&err.into_exception())),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_new(
-    args: *const MgReplNewArgs,
-    out_repl: *mut *mut MgRepl,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if args.is_null() {
-            return Err(ffi_error("TypeError", "REPL args pointer is null"));
-        }
-        if out_repl.is_null() {
-            return Err(ffi_error("TypeError", "REPL output pointer is null"));
-        }
-        // SAFETY: args is checked for null above and only read during this call.
-        let args = unsafe { &*args };
-        let script_name = as_str(args.script_name)?;
-        let repl = limits_from_raw(args.limits).map_or_else(
-            || MgRepl::NoLimit(MontyRepl::new(script_name, NoLimitTracker)),
-            |limits| MgRepl::Limited(MontyRepl::new(script_name, LimitedTracker::new(limits))),
+    /// Layout constants mirrored by `internal/ffi/layout_test.go` on the Go
+    /// side. Both suites fail when a struct changes on only one side.
+    #[test]
+    fn abi_struct_layouts() {
+        assert_eq!(size_of::<MgStr>(), 16);
+        assert_eq!(size_of::<MgBytes>(), 16);
+        assert_eq!(size_of::<MgRawValue>(), 48);
+        assert_eq!(offset_of!(MgRawValue, int_value), 8);
+        assert_eq!(offset_of!(MgRawValue, float_value), 16);
+        assert_eq!(offset_of!(MgRawValue, ptr), 24);
+        assert_eq!(offset_of!(MgRawValue, len), 32);
+        assert_eq!(offset_of!(MgRawValue, handle), 40);
+        assert_eq!(size_of::<MgRawPair>(), 96);
+        assert_eq!(size_of::<MgLimits>(), 96);
+        assert_eq!(offset_of!(MgLimits, cancel_token), 88);
+        assert_eq!(size_of::<MgRunFastOutput>(), 104 + FAST_SCRATCH_CAP);
+        assert_eq!(offset_of!(MgRunFastOutput, value), 16);
+        assert_eq!(offset_of!(MgRunFastOutput, bytes), 64);
+        assert_eq!(offset_of!(MgRunFastOutput, print), 80);
+        assert_eq!(offset_of!(MgRunFastOutput, error), 96);
+        assert_eq!(offset_of!(MgRunFastOutput, scratch), 104);
+        assert_eq!(size_of::<MgProgressSnapshot>(), 16 + 16 + 48 * 3);
+        assert_eq!(offset_of!(MgProgressSnapshot, name), 16);
+        assert_eq!(
+            size_of::<MgProgressSnapshotOutput>(),
+            48 + size_of::<MgProgressSnapshot>()
         );
-        // SAFETY: out_repl is checked for null above.
-        unsafe { *out_repl = Box::into_raw(Box::new(repl)) };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_free(repl: *mut MgRepl) {
-    if !repl.is_null() {
-        // SAFETY: repl handles are allocated with Box::into_raw in this crate.
-        unsafe { drop(Box::from_raw(repl)) };
+        assert_eq!(offset_of!(MgProgressSnapshotOutput, repl), 8);
+        assert_eq!(offset_of!(MgProgressSnapshotOutput, print), 24);
+        assert_eq!(offset_of!(MgProgressSnapshotOutput, print_flags), 40);
+        assert_eq!(offset_of!(MgProgressSnapshotOutput, snapshot), 48);
+        assert_eq!(size_of::<MgRunJsonOutput>(), 48);
+        assert_eq!(size_of::<MgHostFunctionOutput>(), 48 + 32);
+        assert_eq!(size_of::<MgFutureResult>(), 8 + 48 + 32);
+        assert_eq!(size_of::<MgRunHostArgs>(), 88);
+        assert_eq!(size_of::<MgReplFeedArgs>(), 128);
+        assert_eq!(offset_of!(MgReplFeedArgs, max_duration_nanos), 48);
+        assert_eq!(offset_of!(MgReplFeedArgs, host_names), 64);
+        assert_eq!(size_of::<MgMountOutput>(), 64);
+        assert_eq!(size_of::<MgDate>(), 8);
+        assert_eq!(size_of::<MgDateTime>(), 36 + 4);
+        assert_eq!(size_of::<MgTimeDelta>(), 12);
+        assert_eq!(size_of::<MgTimeZone>(), 24);
     }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_dump(
-    repl: *const MgRepl,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if repl.is_null() {
-            return Err(ffi_error("TypeError", "REPL handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let bytes = postcard::to_allocvec(unsafe { &*repl })
-            .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        write_owned_bytes(out, bytes)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_load(
-    ptr: *const u8,
-    len: usize,
-    out_repl: *mut *mut MgRepl,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out_repl.is_null() {
-            return Err(ffi_error("TypeError", "REPL output pointer is null"));
-        }
-        let bytes = as_bytes(ptr, len)?;
-        let repl: MgRepl = postcard::from_bytes(bytes)
-            .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        // SAFETY: out_repl is checked for null above.
-        unsafe { *out_repl = Box::into_raw(Box::new(repl)) };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_feed_run(
-    repl: *mut MgRepl,
-    args: *const MgReplFeedRunArgs,
-    out: *mut MgRunOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if repl.is_null() {
-            return Err(ffi_error("TypeError", "REPL handle is null"));
-        }
-        if args.is_null() {
-            return Err(ffi_error("TypeError", "REPL feed args pointer is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        // SAFETY: args is checked for null above and only read during this call.
-        let args = unsafe { &*args };
-        let code = as_str(args.code)?;
-        let inputs = read_named_values(args.input_names, args.input_values, args.input_count)?;
-        let mut stdout = String::new();
-        let writer = PrintWriter::CollectString(&mut stdout);
-        // SAFETY: handle validity is owned by the Go side contract.
-        let value = match unsafe { &mut *repl } {
-            MgRepl::NoLimit(repl) => repl.feed_run(code, inputs, writer),
-            MgRepl::Limited(repl) => repl.feed_run(code, inputs, writer),
-        }
-        .map_err(|exc| from_monty_error(&exc))?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
-            (*out).value = Box::into_raw(Box::new(MgValue { object: value }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_call_function(
-    repl: *mut MgRepl,
-    args: *const MgReplCallArgs,
-    out: *mut MgRunOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if repl.is_null() {
-            return Err(ffi_error("TypeError", "REPL handle is null"));
-        }
-        if args.is_null() {
-            return Err(ffi_error("TypeError", "REPL call args pointer is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        // SAFETY: args is checked for null above and only read during this call.
-        let args = unsafe { &*args };
-        let name = as_str(args.name)?;
-        let args = read_values(args.args, args.arg_count)?;
-        let mut stdout = String::new();
-        let writer = PrintWriter::CollectString(&mut stdout);
-        // SAFETY: handle validity is owned by the Go side contract.
-        let value = match unsafe { &mut *repl } {
-            MgRepl::NoLimit(repl) => repl.call_function(name, args, writer),
-            MgRepl::Limited(repl) => repl.call_function(name, args, writer),
-        }
-        .map_err(|exc| from_monty_error(&exc))?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
-            (*out).value = Box::into_raw(Box::new(MgValue { object: value }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_function_names(
-    repl: *const MgRepl,
-    out_names: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if repl.is_null() {
-            return Err(ffi_error("TypeError", "REPL handle is null"));
-        }
-        if out_names.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "function names output pointer is null",
-            ));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let names: Vec<String> = match unsafe { &*repl } {
-            MgRepl::NoLimit(repl) => repl
-                .function_names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            MgRepl::Limited(repl) => repl
-                .function_names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-        };
-        // SAFETY: out_names is checked for null above.
-        unsafe { *out_names = string_list_value(&names) };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_has_function(
-    repl: *const MgRepl,
-    name_ptr: *const u8,
-    name_len: usize,
-) -> u8 {
-    if repl.is_null() {
-        return 0;
-    }
-    let Ok(name) = str_arg(name_ptr, name_len) else {
-        return 0;
-    };
-    // SAFETY: handle validity is owned by the Go side contract.
-    let has_function = match unsafe { &*repl } {
-        MgRepl::NoLimit(repl) => repl.has_function(name),
-        MgRepl::Limited(repl) => repl.has_function(name),
-    };
-    u8::from(has_function)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_repl_continuation_mode(ptr: *const u8, len: usize) -> u32 {
-    let Ok(source) = str_arg(ptr, len) else {
-        return 0;
-    };
-    match detect_repl_continuation_mode(source) {
-        ReplContinuationMode::Complete => 0,
-        ReplContinuationMode::IncompleteImplicit => 1,
-        ReplContinuationMode::IncompleteBlock => 2,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_compile(
-    args: *const MgProgramCompileArgs,
-    out_program: *mut *mut MgProgram,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if args.is_null() {
-            return Err(ffi_error("TypeError", "compile args pointer is null"));
-        }
-        if out_program.is_null() {
-            return Err(ffi_error("TypeError", "program output pointer is null"));
-        }
-        // SAFETY: args is checked for null above and only read during this call.
-        let args = unsafe { &*args };
-        let code = as_str(args.code)?.to_owned();
-        let script_name = as_str(args.script_name)?.to_owned();
-        let names = read_string_list(args.input_names, args.input_count)?;
-        let runner = MontyRun::new(code, &script_name, names.clone())
-            .map_err(|exc| from_monty_error(&exc))?;
-        let program = MgProgram {
-            runner,
-            script_name,
-            input_names: names,
-        };
-        // SAFETY: out_program is checked for null above.
-        unsafe { *out_program = Box::into_raw(Box::new(program)) };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_free(program: *mut MgProgram) {
-    if !program.is_null() {
-        // SAFETY: program handles are allocated with Box::into_raw in this crate.
-        unsafe { drop(Box::from_raw(program)) };
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_dump(
-    program: *const MgProgram,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let program = unsafe { &*program };
-        let stored = StoredProgram {
-            runner: program.runner.clone(),
-            script_name: program.script_name.clone(),
-            input_names: program.input_names.clone(),
-        };
-        let bytes = postcard::to_allocvec(&stored)
-            .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        write_owned_bytes(out, bytes)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_code(
-    program: *const MgProgram,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        write_string(out, unsafe { (*program).runner.code() })
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_script_name(
-    program: *const MgProgram,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        write_string(out, unsafe { &(*program).script_name })
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_input_names(
-    program: *const MgProgram,
-    out_names: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        if out_names.is_null() {
-            return Err(ffi_error("TypeError", "input names output pointer is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let names = unsafe { &(*program).input_names };
-        // SAFETY: out_names is checked for null above.
-        unsafe { *out_names = string_list_value(names) };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_load(
-    ptr: *const u8,
-    len: usize,
-    out_program: *mut *mut MgProgram,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out_program.is_null() {
-            return Err(ffi_error("TypeError", "program output pointer is null"));
-        }
-        let bytes = as_bytes(ptr, len)?;
-        let stored: StoredProgram = postcard::from_bytes(bytes)
-            .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        let program = MgProgram {
-            runner: stored.runner,
-            script_name: stored.script_name,
-            input_names: stored.input_names,
-        };
-        // SAFETY: out_program is checked for null above.
-        unsafe { *out_program = Box::into_raw(Box::new(program)) };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_start_raw(
-    program: *const MgProgram,
-    inputs: *mut MgRawValue,
-    input_count: usize,
-    limits: *const MgLimits,
-    out: *mut MgStartOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "progress output pointer is null"));
-        }
-        let input_values = read_raw_values(inputs, input_count)?;
-        // SAFETY: handle validity is owned by the Go side contract.
-        let (progress, stdout) = start_with_print(
-            unsafe { &(*program).runner },
-            input_values,
-            limits_from_raw(limits),
-        )?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
-            (*out).progress = Box::into_raw(Box::new(progress));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_start_raw_snapshot(
-    program: *const MgProgram,
-    inputs: *mut MgRawValue,
-    input_count: usize,
-    limits: *const MgLimits,
-    out: *mut MgProgressSnapshotOutput,
-) -> i32 {
-    guard(progress_snapshot_output_error(out), || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress snapshot output pointer is null",
-            ));
-        }
-        let input_values = read_raw_values(inputs, input_count)?;
-        // SAFETY: handle validity is owned by the Go side contract.
-        let (progress, stdout) = start_with_print(
-            unsafe { &(*program).runner },
-            input_values,
-            limits_from_raw(limits),
-        )?;
-        // SAFETY: out is checked for null above.
-        unsafe { write_progress_snapshot_output(out, progress, stdout) }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_run_raw(
-    program: *const MgProgram,
-    inputs: *mut MgRawValue,
-    input_count: usize,
-    limits: *const MgLimits,
-    out: *mut MgRunRawOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "raw value output pointer is null"));
-        }
-        let input_values = read_raw_values(inputs, input_count)?;
-        // SAFETY: handle validity is owned by the Go side contract.
-        let (value, stdout) = run_with_print(
-            unsafe { &(*program).runner },
-            input_values,
-            limits_from_raw(limits),
-        )?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
-            write_raw_value(ptr::addr_of_mut!((*out).value), value)
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_run_host_raw(
-    program: *const MgProgram,
-    inputs: *mut MgRawValue,
-    input_count: usize,
-    limits: *const MgLimits,
-    host_names: *const MgStr,
-    host_name_count: usize,
-    callback: MgHostFunctionCallback,
-    user_data: usize,
-    out: *mut MgRunRawOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "raw value output pointer is null"));
-        }
-        let input_values = read_raw_values(inputs, input_count)?;
-        let names = read_borrowed_str_list(host_names, host_name_count)?;
-        // SAFETY: handle validity is owned by the Go side contract.
-        let (value, stdout) = run_with_host_callback(
-            unsafe { &(*program).runner },
-            input_values,
-            limits_from_raw(limits),
-            &names,
-            callback,
-            user_data,
-        )?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
-            write_raw_value(ptr::addr_of_mut!((*out).value), value)
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_run_fast_raw(
-    program: *const MgProgram,
-    inputs: *mut MgRawValue,
-    input_count: usize,
-    limits: *const MgLimits,
-    out: *mut MgRunFastOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "fast value output pointer is null"));
-        }
-        let input_values = read_raw_values(inputs, input_count)?;
-        // SAFETY: handle validity is owned by the Go side contract.
-        let (value, stdout) = run_with_print(
-            unsafe { &(*program).runner },
-            input_values,
-            limits_from_raw(limits),
-        )?;
-        // SAFETY: out is checked for null above.
-        unsafe { write_fast_output(out, value, stdout) }
-    })
-}
-
-/// Compile a program, run it once, and free it — all in a single FFI call.
-///
-/// Saves two cgocall hops compared to separate compile/run/free calls and
-/// avoids allocating a long-lived `MgProgram` on the Go side. The result is
-/// written into `out` using the same format as `mg_program_run_fast_raw`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_compile_run_fast_raw(
-    args: *const MgCompileRunFastRawArgs,
-    out: *mut MgRunFastOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if args.is_null() {
-            return Err(ffi_error("TypeError", "compile-run args pointer is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "fast value output pointer is null"));
-        }
-        // SAFETY: args was checked for null and is only read during this call.
-        let args = unsafe { &*args };
-        let code = as_str(args.code)?.to_owned();
-        let script_name = as_str(args.script_name)?;
-        let names = read_string_list(args.input_names, args.input_count)?;
-        // The program never outlives this call, so no MgProgram (and no clone
-        // of names or script_name) is materialized.
-        let runner =
-            MontyRun::new(code, script_name, names).map_err(|exc| from_monty_error(&exc))?;
-        let input_values = read_raw_values(args.input_values, args.input_value_count)?;
-        let (value, stdout) = run_with_print(&runner, input_values, limits_from_raw(args.limits))?;
-        // SAFETY: out was checked for null above.
-        unsafe { write_fast_output(out, value, stdout) }
-    })
-}
-
-/// Populate an `MgRunFastOutput` with the result of a run. Scalar values are
-/// returned via `FAST_FORMAT_RAW` (no bytes allocation) so the Go side can
-/// decode without freeing a Rust-owned buffer. Compound values fall through
-/// to the flat byte stream when it can be produced, and to the owned-handle
-/// `MgRawValue` otherwise.
-///
-/// # Safety
-/// `out` must point to a writable `MgRunFastOutput`.
-unsafe fn write_fast_output(
-    out: *mut MgRunFastOutput,
-    value: MontyObject,
-    stdout: String,
-) -> Result<(), MgError> {
-    // SAFETY: out is non-null by this function's safety contract and is only
-    // written during this call.
-    unsafe {
-        (*out).format = FAST_FORMAT_RAW;
-        (*out).bytes_in_scratch = 0;
-        (*out).value = raw_value(KIND_INVALID);
-        (*out).bytes = MgBytes {
-            ptr: ptr::null_mut(),
-            len: 0,
-        };
-        write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
-    }
-    if let Some(raw) = fast_scalar_raw(&value) {
-        // SAFETY: out is non-null by contract.
-        unsafe { (*out).value = raw };
-        return Ok(());
-    }
-    // Pre-size to the scratch capacity: one allocation covers every payload
-    // that will land in scratch, instead of a doubling realloc chain.
-    let mut bytes = Vec::with_capacity(FAST_SCRATCH_CAP);
-    match write_flat_value(&mut bytes, &value) {
-        Ok(()) => {
-            // SAFETY: out is non-null by contract; scratch ownership is handled
-            // by write_flat_output below.
-            unsafe {
-                (*out).format = FAST_FORMAT_FLAT;
-                write_flat_output(out, bytes)
-            }
-        }
-        // SAFETY: out is non-null by contract.
-        Err(_) => unsafe { write_raw_value(ptr::addr_of_mut!((*out).value), value) },
-    }
-}
-
-/// Hand the flat byte stream back to the caller. Small payloads are copied
-/// into the inline `scratch` so the Go side does not need a `mg_bytes_free`
-/// cgocall; larger payloads are leaked through `write_owned_bytes` as before.
-///
-/// # Safety
-/// `out` must point to a writable `MgRunFastOutput`.
-unsafe fn write_flat_output(out: *mut MgRunFastOutput, bytes: Vec<u8>) -> Result<(), MgError> {
-    let len = bytes.len();
-    if len <= FAST_SCRATCH_CAP {
-        // SAFETY: out is non-null and scratch is a fixed-size array.
-        unsafe {
-            let scratch = ptr::addr_of_mut!((*out).scratch).cast::<u8>();
-            ptr::copy_nonoverlapping(bytes.as_ptr(), scratch, len);
-            (*out).bytes = MgBytes { ptr: scratch, len };
-            (*out).bytes_in_scratch = 1;
-        }
-        return Ok(());
-    }
-    // SAFETY: out is non-null; bytes ownership transfers to the caller.
-    unsafe { write_owned_bytes(ptr::addr_of_mut!((*out).bytes), bytes) }
-}
-
-/// Encode scalar results directly into an `MgRawValue` so the Go side can read
-/// them without touching a heap-allocated bytes buffer. Returns `None` for
-/// values that need either flat encoding or a Rust-owned handle.
-fn fast_scalar_raw(object: &MontyObject) -> Option<MgRawValue> {
-    match object {
-        MontyObject::Ellipsis => Some(raw_value(KIND_ELLIPSIS)),
-        MontyObject::None => Some(raw_value(KIND_NONE)),
-        MontyObject::Bool(value) => {
-            let mut raw = raw_value(KIND_BOOL);
-            raw.bool_value = u8::from(*value);
-            Some(raw)
-        }
-        MontyObject::Int(value) => {
-            let mut raw = raw_value(KIND_INT);
-            raw.int_value = *value;
-            Some(raw)
-        }
-        MontyObject::Float(value) => {
-            let mut raw = raw_value(KIND_FLOAT);
-            raw.float_value = *value;
-            Some(raw)
-        }
-        _ => None,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_program_run_json_raw(
-    program: *const MgProgram,
-    inputs: *mut MgRawValue,
-    input_count: usize,
-    limits: *const MgLimits,
-    out: *mut MgRunJsonOutput,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if program.is_null() {
-            return Err(ffi_error("TypeError", "program handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "json output pointer is null"));
-        }
-        let input_values = read_raw_values(inputs, input_count)?;
-        // SAFETY: handle validity is owned by the Go side contract.
-        let (value, stdout) = run_with_print(
-            unsafe { &(*program).runner },
-            input_values,
-            limits_from_raw(limits),
-        )?;
-        let json = serde_json::to_vec(&JsonMontyObject(&value))
-            .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            write_owned_bytes(ptr::addr_of_mut!((*out).value), json)?;
-            write_owned_string(ptr::addr_of_mut!((*out).print), stdout)
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_free(value: *mut MgValue) {
-    if !value.is_null() {
-        // SAFETY: value handles are allocated with Box::into_raw in this crate.
-        unsafe { drop(Box::from_raw(value)) };
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_json(
-    value: *const MgValue,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let bytes = serde_json::to_vec(&JsonMontyObject(unsafe { &(*value).object }))
-            .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        write_owned_bytes(out, bytes)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_ellipsis() -> *mut MgValue {
-    Box::into_raw(Box::new(MgValue {
-        object: MontyObject::Ellipsis,
-    }))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_none() -> *mut MgValue {
-    Box::into_raw(Box::new(MgValue {
-        object: MontyObject::None,
-    }))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_bool(value: u8) -> *mut MgValue {
-    Box::into_raw(Box::new(MgValue {
-        object: MontyObject::Bool(value != 0),
-    }))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_int(value: i64) -> *mut MgValue {
-    Box::into_raw(Box::new(MgValue {
-        object: MontyObject::Int(value),
-    }))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_big_int(
-    value_ptr: *const u8,
-    value_len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        let value = str_arg(value_ptr, value_len)?;
-        let integer = value
-            .parse::<BigInt>()
-            .map_err(|err| ffi_error("ValueError", err.to_string()))?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::BigInt(integer),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_float(value: f64) -> *mut MgValue {
-    Box::into_raw(Box::new(MgValue {
-        object: MontyObject::Float(value),
-    }))
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_string(
-    value_ptr: *const u8,
-    value_len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        let value = str_arg(value_ptr, value_len)?.to_owned();
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::String(value),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_path(
-    value_ptr: *const u8,
-    value_len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        let value = str_arg(value_ptr, value_len)?.to_owned();
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::Path(value),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_bytes(
-    ptr: *const u8,
-    len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        let bytes = as_bytes(ptr, len)?.to_vec();
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::Bytes(bytes),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_list_raw(
-    values: *mut MgRawValue,
-    len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        let values = read_raw_values(values, len)?;
-        write_value_handle(out, MontyObject::List(values))
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_tuple_raw(
-    values: *mut MgRawValue,
-    len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        let values = read_raw_values(values, len)?;
-        write_value_handle(out, MontyObject::Tuple(values))
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_named_tuple_raw(
-    type_name_ptr: *const u8,
-    type_name_len: usize,
-    field_names: *const MgStr,
-    values: *mut MgRawValue,
-    len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        let type_name = str_arg(type_name_ptr, type_name_len)?.to_owned();
-        let field_names = read_string_list(field_names, len)?;
-        let values = read_raw_values(values, len)?;
-        write_value_handle(
-            out,
-            MontyObject::NamedTuple {
-                type_name,
-                field_names,
-                values,
-            },
-        )
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_set_raw(
-    values: *mut MgRawValue,
-    len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        let values = read_raw_values(values, len)?;
-        write_value_handle(out, MontyObject::Set(values))
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_frozen_set_raw(
-    values: *mut MgRawValue,
-    len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        let values = read_raw_values(values, len)?;
-        write_value_handle(out, MontyObject::FrozenSet(values))
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_dict_raw(
-    pairs: *mut MgRawPair,
-    len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        let pairs = read_raw_pairs(pairs, len)?;
-        write_value_handle(out, MontyObject::Dict(DictPairs::from(pairs)))
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_date(
-    value: *const MgDate,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "date pointer is null"));
-        }
-        // SAFETY: value is checked for null above and only read during this call.
-        let value = unsafe { *value };
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::Date(monty_date_from_raw(value)),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_datetime(
-    value: *const MgDateTime,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "datetime pointer is null"));
-        }
-        // SAFETY: value is checked for null above and only read during this call.
-        let value = monty_datetime_from_raw(unsafe { &*value })?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::DateTime(value),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_timedelta(
-    value: *const MgTimeDelta,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "timedelta pointer is null"));
-        }
-        // SAFETY: value is checked for null above and only read during this call.
-        let value = unsafe { *value };
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::TimeDelta(monty_timedelta_from_raw(value)),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_timezone(
-    value: *const MgTimeZone,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "timezone pointer is null"));
-        }
-        // SAFETY: value is checked for null above and only read during this call.
-        let value = monty_timezone_from_raw(unsafe { &*value })?;
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::TimeZone(value),
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_dataclass_raw(
-    args: *mut MgDataclassRawArgs,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if args.is_null() {
-            return Err(ffi_error("TypeError", "dataclass args pointer is null"));
-        }
-        // SAFETY: args is checked for null above and only read during this call.
-        let args = unsafe { &mut *args };
-        let name = as_str(args.name)?.to_owned();
-        let field_names = read_string_list(args.field_names, args.field_count)?;
-        let attrs = DictPairs::from(read_raw_pairs(args.attrs, args.attr_count)?);
-        write_value_handle(
-            out,
-            MontyObject::Dataclass {
-                name,
-                type_id: args.type_id,
-                field_names,
-                attrs,
-                frozen: args.frozen != 0,
-            },
-        )
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_function(
-    name_ptr: *const u8,
-    name_len: usize,
-    doc_ptr: *const u8,
-    doc_len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        let name = str_arg(name_ptr, name_len)?.to_owned();
-        let doc = str_arg(doc_ptr, doc_len)?;
-        let docstring = (!doc.is_empty()).then(|| doc.to_owned());
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::Function { name, docstring },
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_exception(
-    exc_type_ptr: *const u8,
-    exc_type_len: usize,
-    message_ptr: *const u8,
-    message_len: usize,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        let exc_type = str_arg(exc_type_ptr, exc_type_len)?
-            .parse::<ExcType>()
-            .map_err(|_| ffi_error("ValueError", "unknown exception type"))?;
-        let message = str_arg(message_ptr, message_len)?;
-        let arg = (!message.is_empty()).then(|| message.to_owned());
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = Box::into_raw(Box::new(MgValue {
-                object: MontyObject::Exception { exc_type, arg },
-            }));
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_exception_type(
-    value: *const MgValue,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        match unsafe { &(*value).object } {
-            MontyObject::Exception { exc_type, .. } => write_string(out, &exc_type.to_string()),
-            _ => Err(ffi_error("TypeError", "value is not an exception")),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_exception_message(
-    value: *const MgValue,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        match unsafe { &(*value).object } {
-            MontyObject::Exception { arg, .. } => write_string(out, arg.as_deref().unwrap_or("")),
-            _ => Err(ffi_error("TypeError", "value is not an exception")),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub const unsafe extern "C" fn mg_value_kind(value: *const MgValue) -> u32 {
-    if value.is_null() {
-        return KIND_INVALID;
-    }
-    // SAFETY: handle validity is owned by the Go side contract.
-    object_kind(unsafe { &(*value).object })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_bool_get(value: *const MgValue) -> u8 {
-    if value.is_null() {
-        return 0;
-    }
-    // SAFETY: handle validity is owned by the Go side contract.
-    match unsafe { &(*value).object } {
-        MontyObject::Bool(value) => u8::from(*value),
-        _ => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-#[allow(clippy::missing_const_for_fn)]
-pub unsafe extern "C" fn mg_value_int_get(value: *const MgValue) -> i64 {
-    if value.is_null() {
-        return 0;
-    }
-    // SAFETY: handle validity is owned by the Go side contract.
-    match unsafe { &(*value).object } {
-        MontyObject::Int(value) => *value,
-        _ => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-#[allow(clippy::missing_const_for_fn)]
-pub unsafe extern "C" fn mg_value_float_get(value: *const MgValue) -> f64 {
-    if value.is_null() {
-        return 0.0;
-    }
-    // SAFETY: handle validity is owned by the Go side contract.
-    match unsafe { &(*value).object } {
-        MontyObject::Float(value) => *value,
-        _ => 0.0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_text(
-    value: *const MgValue,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let object = unsafe { &(*value).object };
-        let text = text_for_raw(object);
-        write_string(out, &text)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_bytes_get(
-    value: *const MgValue,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        match unsafe { &(*value).object } {
-            MontyObject::Bytes(bytes) => write_bytes(out, bytes),
-            _ => Err(ffi_error("TypeError", "value is not bytes")),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_date_get(
-    value: *const MgValue,
-    out: *mut MgDate,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "date output pointer is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let object = unsafe { &(*value).object };
-        let MontyObject::Date(date) = object else {
-            return Err(ffi_error("TypeError", "value is not date"));
-        };
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = MgDate {
-                year: date.year,
-                month: date.month,
-                day: date.day,
-                _pad: [0; 2],
-            };
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_datetime_get(
-    value: *const MgValue,
-    out: *mut MgDateTime,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "datetime output pointer is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let object = unsafe { &(*value).object };
-        let MontyObject::DateTime(datetime) = object else {
-            return Err(ffi_error("TypeError", "value is not datetime"));
-        };
-        let mut raw = MgDateTime {
-            timezone_name: MgBytes {
-                ptr: ptr::null_mut(),
-                len: 0,
-            },
-            year: datetime.year,
-            microsecond: datetime.microsecond,
-            offset_seconds: datetime.offset_seconds.unwrap_or_default(),
-            month: datetime.month,
-            day: datetime.day,
-            hour: datetime.hour,
-            minute: datetime.minute,
-            second: datetime.second,
-            has_offset: u8::from(datetime.offset_seconds.is_some()),
-            has_timezone_name: u8::from(datetime.timezone_name.is_some()),
-            _pad: 0,
-        };
-        if let Some(name) = &datetime.timezone_name {
-            write_string(ptr::addr_of_mut!(raw.timezone_name), name)?;
-        }
-        // SAFETY: out is checked for null above.
-        unsafe { *out = raw };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_timedelta_get(
-    value: *const MgValue,
-    out: *mut MgTimeDelta,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "timedelta output pointer is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let object = unsafe { &(*value).object };
-        let MontyObject::TimeDelta(delta) = object else {
-            return Err(ffi_error("TypeError", "value is not timedelta"));
-        };
-        // SAFETY: out is checked for null above.
-        unsafe {
-            *out = MgTimeDelta {
-                days: delta.days,
-                seconds: delta.seconds,
-                microseconds: delta.microseconds,
-            };
-        }
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_timezone_get(
-    value: *const MgValue,
-    out: *mut MgTimeZone,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "timezone output pointer is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let object = unsafe { &(*value).object };
-        let MontyObject::TimeZone(timezone) = object else {
-            return Err(ffi_error("TypeError", "value is not timezone"));
-        };
-        let mut raw = MgTimeZone {
-            name: MgBytes {
-                ptr: ptr::null_mut(),
-                len: 0,
-            },
-            offset_seconds: timezone.offset_seconds,
-            has_name: u8::from(timezone.name.is_some()),
-            _pad: [0; 3],
-        };
-        if let Some(name) = &timezone.name {
-            write_string(ptr::addr_of_mut!(raw.name), name)?;
-        }
-        // SAFETY: out is checked for null above.
-        unsafe { *out = raw };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_named_tuple_type_name(
-    value: *const MgValue,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        match unsafe { &(*value).object } {
-            MontyObject::NamedTuple { type_name, .. } => write_string(out, type_name),
-            _ => Err(ffi_error("TypeError", "value is not named tuple")),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_named_tuple_field_names(
-    value: *const MgValue,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let object = unsafe { &(*value).object };
-        let MontyObject::NamedTuple {
-            field_names: names, ..
-        } = object
-        else {
-            return Err(ffi_error("TypeError", "value is not named tuple"));
-        };
-        // SAFETY: out is checked for null above.
-        unsafe { *out = string_list_value(names) };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_dataclass_name(
-    value: *const MgValue,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        match unsafe { &(*value).object } {
-            MontyObject::Dataclass { name, .. } => write_string(out, name),
-            _ => Err(ffi_error("TypeError", "value is not dataclass")),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub const unsafe extern "C" fn mg_value_dataclass_type_id(value: *const MgValue) -> u64 {
-    if value.is_null() {
-        return 0;
-    }
-    // SAFETY: handle validity is owned by the Go side contract.
-    match unsafe { &(*value).object } {
-        MontyObject::Dataclass { type_id, .. } => *type_id,
-        _ => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_dataclass_field_names(
-    value: *const MgValue,
-    out: *mut *mut MgValue,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error("TypeError", "value output pointer is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let object = unsafe { &(*value).object };
-        let MontyObject::Dataclass {
-            field_names: names, ..
-        } = object
-        else {
-            return Err(ffi_error("TypeError", "value is not dataclass"));
-        };
-        // SAFETY: out is checked for null above.
-        unsafe { *out = string_list_value(names) };
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_dataclass_frozen(value: *const MgValue) -> u8 {
-    if value.is_null() {
-        return 0;
-    }
-    // SAFETY: handle validity is owned by the Go side contract.
-    match unsafe { &(*value).object } {
-        MontyObject::Dataclass { frozen, .. } => u8::from(*frozen),
-        _ => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_len(value: *const MgValue) -> usize {
-    if value.is_null() {
-        return 0;
-    }
-    // SAFETY: handle validity is owned by the Go side contract.
-    match unsafe { &(*value).object } {
-        MontyObject::List(values)
-        | MontyObject::Tuple(values)
-        | MontyObject::Set(values)
-        | MontyObject::FrozenSet(values)
-        | MontyObject::NamedTuple { values, .. } => values.len(),
-        MontyObject::Dict(values) => values.len(),
-        MontyObject::Dataclass { attrs, .. } => attrs.len(),
-        _ => 0,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_items_raw(
-    value: *const MgValue,
-    out: *mut MgRawValue,
-    len: usize,
-) -> i32 {
-    guard(ptr::null_mut(), || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        match unsafe { &(*value).object } {
-            MontyObject::List(values)
-            | MontyObject::Tuple(values)
-            | MontyObject::Set(values)
-            | MontyObject::FrozenSet(values)
-            | MontyObject::NamedTuple { values, .. } => {
-                write_raw_values(out, len, values, "sequence item")
-            }
-            _ => Err(ffi_error("TypeError", "value is not a sequence")),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_value_pairs_raw(
-    value: *const MgValue,
-    out: *mut MgRawPair,
-    len: usize,
-) -> i32 {
-    guard(ptr::null_mut(), || {
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "value handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        match unsafe { &(*value).object } {
-            MontyObject::Dict(values) => write_dict_pairs_raw(out, len, values, "dict pair"),
-            MontyObject::Dataclass { attrs, .. } => {
-                write_dict_pairs_raw(out, len, attrs, "dataclass pair")
-            }
-            _ => Err(ffi_error("TypeError", "value is not a dict")),
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_free(progress: *mut MgProgress) {
-    if !progress.is_null() {
-        // SAFETY: progress handles are allocated with Box::into_raw in this crate.
-        unsafe { drop(Box::from_raw(progress)) };
-    }
-}
-
-unsafe fn write_function_snapshot<T: ResourceTracker>(
-    out: *mut MgProgressSnapshot,
-    call: &FunctionCall<T>,
-) -> Result<(), MgError> {
-    // SAFETY: caller provides a non-null output pointer.
-    unsafe {
-        write_string(ptr::addr_of_mut!((*out).name), &call.function_name)?;
-        write_raw_value(
-            ptr::addr_of_mut!((*out).args),
-            MontyObject::List(call.args.clone()),
-        )?;
-        write_raw_value(
-            ptr::addr_of_mut!((*out).kwargs),
-            MontyObject::Dict(call.kwargs.clone().into()),
-        )?;
-        (*out).call_id = call.call_id;
-        (*out).method_call = u8::from(call.method_call);
-    }
-    Ok(())
-}
-
-unsafe fn write_os_snapshot<T: ResourceTracker>(
-    out: *mut MgProgressSnapshot,
-    call: &OsCall<T>,
-) -> Result<(), MgError> {
-    // SAFETY: caller provides a non-null output pointer.
-    unsafe {
-        write_string(ptr::addr_of_mut!((*out).name), &call.function.to_string())?;
-        write_raw_value(
-            ptr::addr_of_mut!((*out).args),
-            MontyObject::List(call.args.clone()),
-        )?;
-        write_raw_value(
-            ptr::addr_of_mut!((*out).kwargs),
-            MontyObject::Dict(call.kwargs.clone().into()),
-        )?;
-        (*out).call_id = call.call_id;
-    }
-    Ok(())
-}
-
-unsafe fn write_name_lookup_snapshot<T: ResourceTracker>(
-    out: *mut MgProgressSnapshot,
-    lookup: &NameLookup<T>,
-) -> Result<(), MgError> {
-    // SAFETY: caller provides a non-null output pointer.
-    unsafe { write_string(ptr::addr_of_mut!((*out).name), &lookup.name) }
-}
-
-unsafe fn init_progress_snapshot(out: *mut MgProgressSnapshot, progress: &MgProgress) {
-    let empty = MgBytes {
-        ptr: ptr::null_mut(),
-        len: 0,
-    };
-    // SAFETY: caller provides a non-null output pointer.
-    unsafe {
-        *out = MgProgressSnapshot {
-            kind: progress_kind(progress),
-            name: empty,
-            args: raw_value(KIND_INVALID),
-            kwargs: raw_value(KIND_INVALID),
-            value: raw_value(KIND_INVALID),
-            call_id: 0,
-            method_call: 0,
-            _pad: [0; 3],
-            error: ptr::null_mut(),
-        };
-    }
-}
-
-unsafe fn write_progress_snapshot_ref(
-    out: *mut MgProgressSnapshot,
-    progress: &MgProgress,
-) -> Result<(), MgError> {
-    // SAFETY: out is supplied by the caller and must point to writable snapshot storage.
-    unsafe { init_progress_snapshot(out, progress) };
-    match progress {
-        MgProgress::NoLimit(RunProgress::Complete(value))
-        | MgProgress::Limited(RunProgress::Complete(value)) => {
-            // SAFETY: init_progress_snapshot initialized out.value, and out is writable.
-            unsafe { write_raw_value(ptr::addr_of_mut!((*out).value), value.clone()) }
-        }
-        MgProgress::NoLimit(RunProgress::FunctionCall(call)) => {
-            // SAFETY: out points to writable snapshot storage for this call.
-            unsafe { write_function_snapshot(out, call) }
-        }
-        MgProgress::Limited(RunProgress::FunctionCall(call)) => {
-            // SAFETY: out points to writable snapshot storage for this call.
-            unsafe { write_function_snapshot(out, call) }
-        }
-        MgProgress::NoLimit(RunProgress::OsCall(call)) => {
-            // SAFETY: out points to writable snapshot storage for this call.
-            unsafe { write_os_snapshot(out, call) }
-        }
-        MgProgress::Limited(RunProgress::OsCall(call)) => {
-            // SAFETY: out points to writable snapshot storage for this call.
-            unsafe { write_os_snapshot(out, call) }
-        }
-        MgProgress::NoLimit(RunProgress::NameLookup(lookup)) => {
-            // SAFETY: out points to writable snapshot storage for this call.
-            unsafe { write_name_lookup_snapshot(out, lookup) }
-        }
-        MgProgress::Limited(RunProgress::NameLookup(lookup)) => {
-            // SAFETY: out points to writable snapshot storage for this call.
-            unsafe { write_name_lookup_snapshot(out, lookup) }
-        }
-        MgProgress::NoLimit(RunProgress::ResolveFutures(_))
-        | MgProgress::Limited(RunProgress::ResolveFutures(_)) => Ok(()),
-    }
-}
-
-unsafe fn write_progress_snapshot_output(
-    out: *mut MgProgressSnapshotOutput,
-    progress: MgProgress,
-    stdout: String,
-) -> Result<(), MgError> {
-    if out.is_null() {
-        return Err(ffi_error(
-            "TypeError",
-            "progress snapshot output pointer is null",
-        ));
-    }
-    // SAFETY: out is checked for null above.
-    unsafe {
-        write_owned_string(ptr::addr_of_mut!((*out).print), stdout)?;
-        write_progress_snapshot_ref(ptr::addr_of_mut!((*out).snapshot), &progress)?;
-        (*out).progress = if progress_kind(&progress) == PROGRESS_COMPLETE {
-            ptr::null_mut()
-        } else {
-            Box::into_raw(Box::new(progress))
-        };
-    }
-    Ok(())
-}
-
-fn progress_snapshot_output_error(out: *mut MgProgressSnapshotOutput) -> *mut *mut MgError {
-    if out.is_null() {
-        return ptr::null_mut();
-    }
-    // SAFETY: out is non-null and points to a caller-provided output struct.
-    unsafe { ptr::addr_of_mut!((*out).error) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_snapshot(
-    progress: *const MgProgress,
-    out: *mut MgProgressSnapshot,
-) -> i32 {
-    let out_error = if out.is_null() {
-        ptr::null_mut()
-    } else {
-        // SAFETY: out is non-null and points to a caller-provided output struct.
-        unsafe { ptr::addr_of_mut!((*out).error) }
-    };
-    guard(out_error, || {
-        if progress.is_null() {
-            return Err(ffi_error("TypeError", "progress handle is null"));
-        }
-        if out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress snapshot output pointer is null",
-            ));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        unsafe { write_progress_snapshot_ref(out, &*progress) }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_pending_len(progress: *const MgProgress) -> usize {
-    with_resolve_futures(progress, <[u32]>::len).unwrap_or(0)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_pending_id(progress: *const MgProgress, index: usize) -> u32 {
-    with_resolve_futures(progress, |ids| ids.get(index).copied())
-        .flatten()
-        .unwrap_or(0)
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_pending(
-    progress: *mut MgProgress,
-    out: *mut MgProgressOutput,
-) -> i32 {
-    guard(progress_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        let (next, stdout) = resume_pending(progress)?;
-        write_progress_output(out, next, stdout)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_return_raw(
-    progress: *mut MgProgress,
-    value: *mut MgRawValue,
-    out: *mut MgProgressOutput,
-) -> i32 {
-    guard(progress_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "raw value pointer is null"));
-        }
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        // SAFETY: value is checked for null above and only read during this call.
-        let value = read_raw_value(unsafe { &mut *value })?;
-        let (next, stdout) = resume_progress(progress, ExtFunctionResult::Return(value))?;
-        write_progress_output(out, next, stdout)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_return_raw_snapshot(
-    progress: *mut MgProgress,
-    value: *mut MgRawValue,
-    out: *mut MgProgressSnapshotOutput,
-) -> i32 {
-    guard(progress_snapshot_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "raw value pointer is null"));
-        }
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        // SAFETY: value is checked for null above and only read during this call.
-        let value = read_raw_value(unsafe { &mut *value })?;
-        let (next, stdout) = resume_progress(progress, ExtFunctionResult::Return(value))?;
-        // SAFETY: out is checked for null above.
-        unsafe { write_progress_snapshot_output(out, next, stdout) }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_exception(
-    progress: *mut MgProgress,
-    exc_type_ptr: *const u8,
-    exc_type_len: usize,
-    message_ptr: *const u8,
-    message_len: usize,
-    out: *mut MgProgressOutput,
-) -> i32 {
-    guard(progress_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        let exception = exception_from_raw(
-            MgStr {
-                ptr: exc_type_ptr,
-                len: exc_type_len,
-            },
-            MgStr {
-                ptr: message_ptr,
-                len: message_len,
-            },
-        )?;
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        let (next, stdout) = resume_progress(progress, ExtFunctionResult::Error(exception))?;
-        write_progress_output(out, next, stdout)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_name_value_raw(
-    progress: *mut MgProgress,
-    value: *mut MgRawValue,
-    out: *mut MgProgressOutput,
-) -> i32 {
-    guard(progress_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "raw value pointer is null"));
-        }
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        // SAFETY: value is checked for null above and only read during this call.
-        let value = read_raw_value(unsafe { &mut *value })?;
-        let (next, stdout) = resume_name(progress, NameLookupResult::Value(value))?;
-        write_progress_output(out, next, stdout)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_name_value_raw_snapshot(
-    progress: *mut MgProgress,
-    value: *mut MgRawValue,
-    out: *mut MgProgressSnapshotOutput,
-) -> i32 {
-    guard(progress_snapshot_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        if value.is_null() {
-            return Err(ffi_error("TypeError", "raw value pointer is null"));
-        }
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        // SAFETY: value is checked for null above and only read during this call.
-        let value = read_raw_value(unsafe { &mut *value })?;
-        let (next, stdout) = resume_name(progress, NameLookupResult::Value(value))?;
-        // SAFETY: out is checked for null above.
-        unsafe { write_progress_snapshot_output(out, next, stdout) }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_name_undefined(
-    progress: *mut MgProgress,
-    out: *mut MgProgressOutput,
-) -> i32 {
-    guard(progress_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        let (next, stdout) = resume_name(progress, NameLookupResult::Undefined)?;
-        write_progress_output(out, next, stdout)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_name_undefined_snapshot(
-    progress: *mut MgProgress,
-    out: *mut MgProgressSnapshotOutput,
-) -> i32 {
-    guard(progress_snapshot_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        let (next, stdout) = resume_name(progress, NameLookupResult::Undefined)?;
-        // SAFETY: out is checked for null above.
-        unsafe { write_progress_snapshot_output(out, next, stdout) }
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_resume_futures(
-    progress: *mut MgProgress,
-    results: *mut MgFutureResult,
-    results_len: usize,
-    out: *mut MgProgressOutput,
-) -> i32 {
-    guard(progress_output_error(out), || {
-        if progress.is_null() || out.is_null() {
-            return Err(ffi_error(
-                "TypeError",
-                "progress handle or output pointer is null",
-            ));
-        }
-        // SAFETY: progress is consumed exactly once by this call.
-        let progress = unsafe { *Box::from_raw(progress) };
-        let results = read_future_results(results, results_len)?;
-        let (next, stdout) = resume_futures(progress, results)?;
-        write_progress_output(out, next, stdout)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_dump(
-    progress: *const MgProgress,
-    out: *mut MgBytes,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if progress.is_null() {
-            return Err(ffi_error("TypeError", "progress handle is null"));
-        }
-        // SAFETY: handle validity is owned by the Go side contract.
-        let bytes = postcard::to_allocvec(unsafe { &*progress })
-            .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        write_owned_bytes(out, bytes)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mg_progress_load(
-    ptr: *const u8,
-    len: usize,
-    out_progress: *mut *mut MgProgress,
-    out_error: *mut *mut MgError,
-) -> i32 {
-    guard(out_error, || {
-        if out_progress.is_null() {
-            return Err(ffi_error("TypeError", "progress output pointer is null"));
-        }
-        let bytes = as_bytes(ptr, len)?;
-        let progress: MgProgress = postcard::from_bytes(bytes)
-            .map_err(|err| ffi_error("SerializationError", err.to_string()))?;
-        // SAFETY: out_progress is checked for null above.
-        unsafe { *out_progress = Box::into_raw(Box::new(progress)) };
-        Ok(())
-    })
 }

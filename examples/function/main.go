@@ -1,50 +1,70 @@
+// Function: host functions with generated type stubs, including concurrent
+// asyncio.gather dispatch onto goroutines.
 package main
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/joeychilson/monty"
 )
 
 type TempArgs struct {
-	Lat float64 `monty:"lat"`
-	Lng float64 `monty:"lng"`
+	Lat float64
+	Lon float64
 }
 
 type Forecast struct {
-	City string  `monty:"city"`
-	High float64 `monty:"high"`
-	Low  float64 `monty:"low"`
+	City string
+	High float64
+	Low  float64
 }
 
 func main() {
-	getTemp := monty.NewFunction("get_temperature", func(_ context.Context, _ TempArgs) (Forecast, error) {
-		return Forecast{City: "San Francisco", High: 24.5, Low: 18.0}, nil
-	}, monty.WithDoc("Get the weather forecast for a coordinate."))
-
-	fmt.Println(getTemp.PythonStub())
-
-	code := `
-forecast = get_temperature(lat=lat, lng=lng)
-f"{forecast['city']}: high {forecast['high']}C, low {forecast['low']}C"
-`
-	program, err := monty.Compile(code,
-		monty.WithInputs("lat", "lng"),
-		monty.WithFunction(getTemp),
-	)
-	if err != nil {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
-	defer program.Close()
+}
 
-	result, err := monty.RunAs[string](context.Background(), program, monty.Inputs{
-		"lat": monty.Float(37.7749),
-		"lng": monty.Float(-122.4194),
-	})
+func run() error {
+	getForecast := monty.MustFunction("get_forecast",
+		func(_ context.Context, _ TempArgs) (Forecast, error) {
+			time.Sleep(50 * time.Millisecond) // pretend to call a weather API
+			return Forecast{City: "San Francisco", High: 24.5, Low: 18.0}, nil
+		},
+		monty.WithAsync(),
+		monty.WithDoc("Get the weather forecast for a coordinate."),
+	)
+	fmt.Println("generated stub:")
+	fmt.Println(getForecast.PythonStub())
+	fmt.Println()
+
+	code := `
+import asyncio
+
+async def main():
+    west, east = await asyncio.gather(
+        get_forecast(lat=37.77, lon=-122.41),
+        get_forecast(lat=40.71, lon=-74.00),
+    )
+    return [west["high"], east["high"]]
+
+await main()
+`
+	prog, err := monty.Compile(code, monty.WithFunctions(getForecast), monty.WithTypeCheck())
 	if err != nil {
-		panic(err)
+		return err
 	}
-	fmt.Println("Python output:", result)
+	defer prog.Close()
+
+	started := time.Now()
+	highs, err := monty.RunAs[[]float64](context.Background(), prog, nil)
+	if err != nil {
+		return err
+	}
+	// Both forecasts ran concurrently in goroutines: ~50ms, not ~100ms.
+	fmt.Printf("highs=%v in %v\n", highs, time.Since(started).Round(time.Millisecond))
+	return nil
 }

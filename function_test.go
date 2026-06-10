@@ -7,247 +7,185 @@ import (
 	"testing"
 )
 
-type tempArgs struct {
-	Lat float64 `monty:"lat"`
-	Lng float64 `monty:"lng"`
-}
+func TestFunctionSignatures(t *testing.T) {
+	ctx := context.Background()
 
-type forecast struct {
-	City string  `monty:"city"`
-	High float64 `monty:"high"`
-	Low  float64 `monty:"low"`
-}
-
-func TestFunctionDispatch(t *testing.T) {
-	getTemp := NewFunction("get_temperature", func(_ context.Context, _ tempArgs) (forecast, error) {
-		return forecast{City: "San Francisco", High: 24.5, Low: 18.0}, nil
-	}, WithDoc("Get the weather forecast for a coordinate."))
-
-	if stub := getTemp.PythonStub(); !strings.Contains(stub, "def get_temperature") {
-		t.Fatalf("stub missing function: %s", stub)
-	}
-
-	code := `
-forecast = get_temperature(lat=lat, lng=lng)
-f"{forecast['city']}: high {forecast['high']}C, low {forecast['low']}C"
-`
-	program, err := Compile(code, WithInputs("lat", "lng"), WithFunction(getTemp))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer program.Close()
-
-	result, err := RunAs[string](context.Background(), program, Inputs{
-		"lat": Float(37.7749),
-		"lng": Float(-122.4194),
+	t.Run("struct kwargs", func(t *testing.T) {
+		type args struct {
+			Width  int
+			Height int
+		}
+		area := MustFunction("area", func(a args) int { return a.Width * a.Height })
+		got, err := EvalAs[int](ctx, "area(3, height=4)", nil, WithFunctions(area))
+		if err != nil || got != 12 {
+			t.Fatalf("got %d, %v", got, err)
+		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "San Francisco: high 24.5C, low 18.0C"
-	if result != want {
-		t.Fatalf("result = %q, want %q", result, want)
-	}
-}
 
-func TestNewFunctionValidatesHandler(t *testing.T) {
-	cases := []struct {
-		name      string
-		handler   any
-		wantPanic bool
-	}{
-		// Invalid signatures must be rejected at registration, not at call time.
-		{"non-func handler", "not a function", true},
-		{"nil handler", nil, true},
-		{"non-error second return", func() (int, string) { return 0, "" }, true},
-		{"three returns", func() (int, int, error) { return 0, 0, nil }, true},
-		{"three returns no error", func() (int, int, int) { return 0, 0, 0 }, true},
+	t.Run("positional multi-param", func(t *testing.T) {
+		join := MustFunction("join2", func(a, b string) string { return a + "|" + b })
+		got, err := EvalAs[string](ctx, `join2("x", "y")`, nil, WithFunctions(join))
+		if err != nil || got != "x|y" {
+			t.Fatalf("got %q, %v", got, err)
+		}
+	})
 
-		// Valid signatures must be accepted.
-		{"no returns", func(int) {}, false},
-		{"single value return", func(int) int { return 0 }, false},
-		{"single error return", func(int) error { return nil }, false},
-		{"value and error", func(int) (int, error) { return 0, nil }, false},
-		{"context value and error", func(context.Context, int) (int, error) { return 0, nil }, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			defer func() {
-				r := recover()
-				if tc.wantPanic && r == nil {
-					t.Fatalf("NewFunction(%s) did not panic", tc.name)
-				}
-				if !tc.wantPanic && r != nil {
-					t.Fatalf("NewFunction(%s) panicked unexpectedly: %v", tc.name, r)
-				}
-				if r != nil {
-					if msg, ok := r.(string); !ok || !strings.Contains(msg, "monty: NewFunction") {
-						t.Fatalf("panic message = %v, want one mentioning monty: NewFunction", r)
-					}
-				}
-			}()
-			_ = NewFunction("f", tc.handler)
+	t.Run("with params kwargs", func(t *testing.T) {
+		pad := MustFunction("pad", func(text string, width int) string {
+			for len(text) < width {
+				text += "."
+			}
+			return text
+		}, WithParams("text", "width"))
+		got, err := EvalAs[string](ctx, `pad("ab", width=4)`, nil, WithFunctions(pad))
+		if err != nil || got != "ab.." {
+			t.Fatalf("got %q, %v", got, err)
+		}
+	})
+
+	t.Run("context and error", func(t *testing.T) {
+		fail := MustFunction("fail", func(_ context.Context, n int) (int, error) {
+			return 0, Errorf("KeyError", "no %d", n)
 		})
-	}
-}
-
-// TestFunctionNonErrorSecondReturnNoIsNilPanic is the direct regression for the
-// reported bug: a handler with a non-error second return used to reach
-// callResults[1].IsNil() and panic with "reflect: call of reflect.Value.IsNil
-// on string Value" on the first Python call. Registration-time validation now
-// prevents the *Function from ever being constructed.
-func TestFunctionNonErrorSecondReturnNoIsNilPanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected NewFunction to panic for func() (int, string)")
+		_, err := Eval(ctx, "fail(5)", nil, WithFunctions(fail))
+		var execErr *ExecError
+		if !errors.As(err, &execErr) || execErr.Type != "KeyError" {
+			t.Fatalf("err = %v", err)
 		}
-	}()
-	NewFunction("f", func() (int, string) { return 0, "" })
-}
-
-// TestFunctionValueAndErrorDispatch confirms a validated (value, error) handler
-// still dispatches correctly through the slow call path: a nil error returns
-// the value, a non-nil error is raised. A bool input field keeps it off the
-// signed-int fast path, exercising call's callResults[1] handling directly.
-func TestFunctionValueAndErrorDispatch(t *testing.T) {
-	fn := NewFunction("maybe_fail", func(in struct {
-		Fail bool `monty:"fail"`
-	},
-	) (string, error) {
-		if in.Fail {
-			return "", errors.New("requested failure")
-		}
-		return "ok", nil
 	})
 
-	program, err := Compile("maybe_fail(fail=fail)", WithInputs("fail"), WithFunction(fn))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer program.Close()
-
-	got, err := RunAs[string](context.Background(), program, Inputs{"fail": Bool(false)})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got != "ok" {
-		t.Fatalf("got %q, want %q", got, "ok")
-	}
-
-	if _, err := RunAs[string](context.Background(), program, Inputs{"fail": Bool(true)}); err == nil {
-		t.Fatal("expected error from handler to surface, got nil")
-	} else if !strings.Contains(err.Error(), "requested failure") {
-		t.Fatalf("error = %v, want it to mention requested failure", err)
-	}
-}
-
-// TestPythonStubDefinesReferencedStructs guards §3.10: every named struct the
-// stub references — input field types and structs nested in the output — must
-// have a TypedDict definition, so WithTypeCheck+WithAutoStubs accepts the
-// registration instead of failing on an undefined class.
-func TestPythonStubDefinesReferencedStructs(t *testing.T) {
-	type Coords struct {
-		Lat float64 `monty:"lat"`
-		Lng float64 `monty:"lng"`
-	}
-	type Place struct {
-		Name string `monty:"name"`
-		At   Coords `monty:"at"`
-	}
-	type locateInput struct {
-		Where Coords `monty:"where"`
-	}
-	fn := NewFunction("locate", func(_ context.Context, _ locateInput) Place {
-		return Place{}
+	t.Run("error only return", func(t *testing.T) {
+		check := MustFunction("check", func(flag bool) error {
+			if !flag {
+				return Errorf("ValueError", "flag required")
+			}
+			return nil
+		})
+		value, err := Eval(ctx, "check(True)", nil, WithFunctions(check))
+		if err != nil || value.Kind() != NoneKind {
+			t.Fatalf("value %v err %v", value, err)
+		}
 	})
 
-	stub := fn.PythonStub()
-	for _, want := range []string{"class Coords(TypedDict):", "class Place(TypedDict):", "where: Coords", "-> Place"} {
-		if !strings.Contains(stub, want) {
-			t.Fatalf("stub missing %q:\n%s", want, stub)
+	t.Run("no params", func(t *testing.T) {
+		fortytwo := MustFunction("fortytwo", func() int { return 42 })
+		got, err := EvalAs[int](ctx, "fortytwo()", nil, WithFunctions(fortytwo))
+		if err != nil || got != 42 {
+			t.Fatalf("got %d, %v", got, err)
 		}
-	}
-	// Coords is referenced by both an input field and a Place field; it must be
-	// defined exactly once.
-	if n := strings.Count(stub, "class Coords(TypedDict):"); n != 1 {
-		t.Fatalf("Coords defined %d times, want 1:\n%s", n, stub)
-	}
+	})
 
-	// The strong check: type checking the stub must succeed.
-	program, err := Compile("locate(where={'lat': 1.0, 'lng': 2.0})", WithFunction(fn), WithTypeCheck())
-	if err != nil {
-		t.Fatalf("type check failed (stub names an undefined class?): %v\nstub:\n%s", err, stub)
-	}
-	program.Close()
-}
-
-// TestFunctionNonStructInputRejectsExtraArgs guards §3.9: a handler with a
-// non-struct input binds exactly one positional argument and no keywords;
-// extra positional args or any kwarg must error rather than be silently
-// dropped (which used to bind defaults and hide caller bugs).
-func TestFunctionNonStructInputRejectsExtraArgs(t *testing.T) {
-	fn := NewFunction("double", func(_ context.Context, n int) int { return n * 2 })
-
-	good, err := Compile("double(21)", WithFunction(fn))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer good.Close()
-	if got, err := RunAs[int](context.Background(), good, nil); err != nil || got != 42 {
-		t.Fatalf("double(21) = %d, err %v; want 42", got, err)
-	}
-
-	for _, call := range []string{"double(1, 2, 3)", "double(n=1)"} {
-		program, err := Compile(call, WithFunction(fn))
+	t.Run("raw function", func(t *testing.T) {
+		echo := NewRawFunction("echo", func(_ context.Context, args []Value, kwargs map[string]Value) (Value, error) {
+			items := append([]Value{}, args...)
+			for _, key := range []string{"extra"} {
+				if v, ok := kwargs[key]; ok {
+					items = append(items, v)
+				}
+			}
+			return List(items...), nil
+		})
+		value, err := Eval(ctx, `echo(1, "a", extra=True)`, nil, WithFunctions(echo))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := RunAs[int](context.Background(), program, nil); err == nil {
-			t.Fatalf("%s = nil error, want rejection of extra args/kwargs", call)
+		if value.Len() != 3 || !value.Index(2).Bool() {
+			t.Fatalf("value = %s", value)
 		}
-		program.Close()
+	})
+}
+
+func TestNewFunctionValidation(t *testing.T) {
+	if _, err := NewFunction("bad", 42); err == nil {
+		t.Fatal("non-func handler should error")
+	}
+	if _, err := NewFunction("bad", func() (int, int) { return 0, 0 }); err == nil {
+		t.Fatal("second non-error return should error")
+	}
+	if _, err := NewFunction("bad", func(_ ...int) int { return 0 }); err == nil {
+		t.Fatal("variadic handler should error")
+	}
+	if _, err := NewFunction("bad", func(_, _ int) int { return 0 }, WithParams("only")); err == nil {
+		t.Fatal("WithParams count mismatch should error")
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("MustFunction should panic on invalid handlers")
+		}
+	}()
+	MustFunction("bad", "not a function")
+}
+
+func TestFunctionArgumentErrors(t *testing.T) {
+	ctx := context.Background()
+	add := MustFunction("add", func(a, b int) int { return a + b }, WithParams("a", "b"))
+
+	cases := []string{
+		"add(1)",         // missing argument
+		"add(1, 2, 3)",   // too many
+		"add(1, c=2)",    // unknown kwarg
+		"add(1, 2, a=3)", // duplicate
+		`add("x", 2)`,    // wrong type
+	}
+	for _, code := range cases {
+		_, err := Eval(ctx, code, nil, WithFunctions(add))
+		var execErr *ExecError
+		if !errors.As(err, &execErr) {
+			t.Errorf("%s: err = %v, want ExecError", code, err)
+		}
 	}
 }
 
-// TestFunctionErrorOnlyReturn covers a handler whose sole return value is an
-// error: a non-nil error must raise a Python exception and a nil error must
-// surface as None, rather than marshaling the *errors.errorString as an empty
-// dict value (the previous behavior, where save(...) == {} regardless of
-// success or failure).
-func TestFunctionErrorOnlyReturn(t *testing.T) {
-	fn := NewFunction("save", func(in struct {
-		Fail bool `monty:"fail"`
-	},
-	) error {
-		if in.Fail {
-			return errors.New("disk full")
+func TestPythonStub(t *testing.T) {
+	type Forecast struct {
+		City string
+		High float64
+	}
+	forecast := MustFunction("get_forecast", func(_ context.Context, _, _ float64) (Forecast, error) {
+		return Forecast{}, nil
+	}, WithParams("lat", "lon"), WithDoc("Get the forecast."))
+
+	stub := forecast.PythonStub()
+	for _, want := range []string{
+		"class Forecast(TypedDict):",
+		"city: str",
+		"high: float",
+		"# Get the forecast.",
+		"def get_forecast(lat: float, lon: float) -> Forecast: ...",
+	} {
+		if !strings.Contains(stub, want) {
+			t.Errorf("stub missing %q:\n%s", want, stub)
 		}
-		return nil
+	}
+
+	asyncFn := MustFunction("fetch", func(_ string) string { return "" }, WithAsync())
+	if !strings.Contains(asyncFn.PythonStub(), "async def fetch(") {
+		t.Errorf("async stub:\n%s", asyncFn.PythonStub())
+	}
+
+	custom := MustFunction("x", func() {}, WithStub("def x() -> None: ..."))
+	if custom.PythonStub() != "def x() -> None: ..." {
+		t.Errorf("WithStub override ignored: %q", custom.PythonStub())
+	}
+
+	raw := NewRawFunction("anything", func(context.Context, []Value, map[string]Value) (Value, error) {
+		return None(), nil
 	})
-
-	if stub := fn.PythonStub(); !strings.Contains(stub, "-> None") {
-		t.Fatalf("stub = %q, want it to return None", stub)
+	if !strings.Contains(raw.PythonStub(), "*args: Any, **kwargs: Any") {
+		t.Errorf("raw stub:\n%s", raw.PythonStub())
 	}
+}
 
-	program, err := Compile("result = save(fail=fail)\nresult is None", WithInputs("fail"), WithFunction(fn))
-	if err != nil {
-		t.Fatal(err)
+func TestTypeCheckWithFunctionStubs(t *testing.T) {
+	double := MustFunction("double", func(n int) int { return 2 * n }, WithParams("n"))
+	// Passing a str where the stub declares int must fail the type check.
+	_, err := Compile(`double("nope")`, WithFunctions(double), WithTypeCheck())
+	var typeErr *TypeCheckError
+	if !errors.As(err, &typeErr) {
+		t.Fatalf("err = %v, want TypeCheckError", err)
 	}
-	defer program.Close()
-
-	// nil error: Python receives None (so `result is None` is True).
-	got, err := RunAs[bool](context.Background(), program, Inputs{"fail": Bool(false)})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !got {
-		t.Fatal("save() returned a non-None value for a nil error")
-	}
-
-	// non-nil error: raised as a Python exception.
-	if _, err := RunAs[bool](context.Background(), program, Inputs{"fail": Bool(true)}); err == nil {
-		t.Fatal("expected error from handler to surface, got nil")
-	} else if !strings.Contains(err.Error(), "disk full") {
-		t.Fatalf("error = %v, want it to mention disk full", err)
+	// And a valid call passes.
+	if _, err := Compile(`double(2)`, WithFunctions(double), WithTypeCheck()); err != nil {
+		t.Fatalf("valid call failed type check: %v", err)
 	}
 }
