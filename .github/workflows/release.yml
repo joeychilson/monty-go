@@ -10,90 +10,26 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.asset }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            goos: linux
-            goarch: amd64
-            asset: monty-go-linux-amd64
-            library: libmonty_ffi.so
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            goos: linux
-            goarch: arm64
-            asset: monty-go-linux-arm64
-            library: libmonty_ffi.so
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            goos: darwin
-            goarch: amd64
-            asset: monty-go-darwin-amd64
-            library: libmonty_ffi.dylib
-          - os: macos-15
-            target: aarch64-apple-darwin
-            goos: darwin
-            goarch: arm64
-            asset: monty-go-darwin-arm64
-            library: libmonty_ffi.dylib
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Build dylib
-        run: cargo build --release -p monty-ffi --target ${{ matrix.target }}
-
-      - name: Install embedded asset
-        run: scripts/install-ffi-library.sh "target/${{ matrix.target }}/release/${{ matrix.library }}" "${{ matrix.goos }}" "${{ matrix.goarch }}"
-
-      - name: Package artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "dist/${{ matrix.asset }}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" "dist/${{ matrix.asset }}/"
-          cp README.md LICENSE "dist/${{ matrix.asset }}/"
-          tar -czf "dist/${{ matrix.asset }}.tar.gz" -C dist "${{ matrix.asset }}"
-          shasum -a 256 "dist/${{ matrix.asset }}.tar.gz" > "dist/${{ matrix.asset }}.tar.gz.sha256"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: |
-            dist/${{ matrix.asset }}.tar.gz
-            dist/${{ matrix.asset }}.tar.gz.sha256
-          if-no-files-found: error
-
-      - name: Upload embedded asset
-        uses: actions/upload-artifact@v4
-        with:
-          name: embedded-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: internal/ffi/lib/${{ matrix.goos }}_${{ matrix.goarch }}/${{ matrix.library }}.gz
-          if-no-files-found: error
-
+  # The committed embedded libraries are what `go get` consumers run. Fail the
+  # release if any commit has touched the Rust source since the assets were
+  # last refreshed — the real staleness signal, not just file presence.
   verify-embedded-assets:
-    name: Verify embedded assets are present
+    name: Verify embedded assets are current
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      - name: Verify committed embedded assets
+      - name: Check assets exist and postdate the Rust source
         shell: bash
         run: |
           set -euo pipefail
+          sources=(crates Cargo.toml Cargo.lock rust-toolchain.toml scripts/install-ffi-library.sh)
+          failed=0
+          # Each platform's asset is checked individually: a commit that
+          # changes the Rust source and refreshes only one platform must not
+          # mask the others.
           for asset in \
             internal/ffi/lib/darwin_amd64/libmonty_ffi.dylib.gz \
             internal/ffi/lib/darwin_arm64/libmonty_ffi.dylib.gz \
@@ -102,28 +38,77 @@ jobs:
           do
             if [[ ! -s "${asset}" ]]; then
               echo "Missing embedded FFI asset: ${asset}" >&2
-              echo "Run the Refresh Embedded FFI Libraries workflow before tagging a release." >&2
-              exit 1
+              failed=1
+              continue
+            fi
+            asset_commit="$(git rev-list -1 HEAD -- "${asset}")"
+            if [[ -n "$(git rev-list "${asset_commit}..HEAD" -- "${sources[@]}")" ]]; then
+              echo "Stale embedded FFI asset: ${asset} (Rust source changed after its last refresh):" >&2
+              git log --oneline "${asset_commit}..HEAD" -- "${sources[@]}" >&2
+              failed=1
             fi
           done
+          if [[ "${failed}" -ne 0 ]]; then
+            echo "Wait for (or dispatch) the Refresh Embedded FFI Libraries workflow, then re-tag." >&2
+            exit 1
+          fi
+
+  build:
+    uses: ./.github/workflows/build-ffi.yml
+
+  package:
+    name: Package release artifacts
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: generated
+          pattern: embedded-*
+
+      - name: Package per-platform tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for artifact_dir in generated/embedded-*; do
+            name="$(basename "${artifact_dir}")"
+            platform="${name#embedded-}"
+            goos="${platform%-*}"
+            goarch="${platform##*-}"
+            asset="monty-go-${goos}-${goarch}"
+            src="$(find "${artifact_dir}" -type f -name 'libmonty_ffi.*.gz' -print -quit)"
+            mkdir -p "dist/${asset}"
+            gunzip -c "${src}" > "dist/${asset}/$(basename "${src}" .gz)"
+            cp README.md LICENSE "dist/${asset}/"
+            tar -czf "dist/${asset}.tar.gz" -C dist "${asset}"
+            shasum -a 256 "dist/${asset}.tar.gz" > "dist/${asset}.tar.gz.sha256"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-tarballs
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
 
   release:
     name: Publish GitHub release
     needs:
-      - build
+      - package
       - verify-embedded-assets
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: monty-go-*
-          merge-multiple: true
+          name: release-tarballs
 
       - name: Publish assets
         env:

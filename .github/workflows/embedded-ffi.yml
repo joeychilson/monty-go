@@ -1,61 +1,32 @@
+# Keeps the committed embedded FFI libraries in sync with the Rust source:
+# runs automatically when anything that affects the built library lands on
+# main, and commits the refreshed assets back. The commit only touches
+# internal/ffi/lib/**, which is outside this workflow's path filter, so it
+# cannot retrigger itself. Manual dispatch remains available as an escape
+# hatch.
 name: Refresh Embedded FFI Libraries
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/install-ffi-library.sh"
 
 permissions:
   contents: write
 
+# Serialize refreshes so two pushes cannot race each other's commit.
+concurrency:
+  group: embedded-ffi-${{ github.ref }}
+
 jobs:
   build:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            goos: linux
-            goarch: amd64
-            library: libmonty_ffi.so
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            goos: linux
-            goarch: arm64
-            library: libmonty_ffi.so
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            goos: darwin
-            goarch: amd64
-            library: libmonty_ffi.dylib
-          - os: macos-15
-            target: aarch64-apple-darwin
-            goos: darwin
-            goarch: arm64
-            library: libmonty_ffi.dylib
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Build dylib
-        run: cargo build --release -p monty-ffi --target ${{ matrix.target }}
-
-      - name: Install embedded asset
-        run: scripts/install-ffi-library.sh "target/${{ matrix.target }}/release/${{ matrix.library }}" "${{ matrix.goos }}" "${{ matrix.goarch }}"
-
-      - name: Upload embedded asset
-        uses: actions/upload-artifact@v4
-        with:
-          name: embedded-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: internal/ffi/lib/${{ matrix.goos }}_${{ matrix.goarch }}/${{ matrix.library }}.gz
-          if-no-files-found: error
+    uses: ./.github/workflows/build-ffi.yml
 
   commit:
     name: Commit refreshed assets
@@ -63,13 +34,11 @@ jobs:
     if: github.ref_type == 'branch'
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.ref_name }}
 
-      - name: Download embedded assets
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: generated
           pattern: embedded-*
@@ -100,4 +69,6 @@ jobs:
             exit 0
           fi
           git commit -m "Update embedded FFI libraries"
+          # Tolerate commits that landed on main while this job ran.
+          git pull --rebase origin "${GITHUB_REF_NAME}"
           git push

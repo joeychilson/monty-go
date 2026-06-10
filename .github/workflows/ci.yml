@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Supersede in-flight runs for the same ref on new pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   test:
     strategy:
@@ -20,9 +25,8 @@ jobs:
           go-version: "1.26.x"
           cache: true
 
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: rustfmt, clippy
+      # The Rust toolchain version comes from rust-toolchain.toml.
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: |
@@ -32,6 +36,9 @@ jobs:
       - name: Clippy
         run: cargo clippy -p monty-ffi --all-targets --all-features -- -D warnings
 
+      - name: Test Rust FFI
+        run: cargo test --release -p monty-ffi
+
       - name: Build Rust FFI
         run: cargo build --release -p monty-ffi
 
@@ -40,14 +47,13 @@ jobs:
 
       - name: Test Go
         env:
+          # Require the embedded asset to exist and load with the current ABI,
+          # so a stale committed library fails here instead of at a consumer.
           MONTY_GO_TEST_REQUIRE_EMBEDDED: "1"
-        run: go test ./...
+        run: go test -race ./...
 
       - name: Vet Go
         run: go vet ./...
-
-      - name: Vet benchmarks compile
-        run: go test -run '^$' -bench BenchmarkRunArithmetic -benchmem ./...
 
   lint:
     runs-on: ubuntu-latest

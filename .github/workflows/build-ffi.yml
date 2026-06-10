@@ -1,0 +1,55 @@
+# Reusable builder for the Rust FFI library. Owns the platform matrix; the
+# CI, refresh, and release workflows all call this instead of duplicating it.
+# Each platform uploads one `embedded-<goos>-<goarch>` artifact containing the
+# gzipped library exactly as it is committed under internal/ffi/lib/.
+name: Build FFI Libraries
+
+on:
+  workflow_call:
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            library: libmonty_ffi.so
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            library: libmonty_ffi.so
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            library: libmonty_ffi.dylib
+          - os: macos-15
+            goos: darwin
+            goarch: arm64
+            library: libmonty_ffi.dylib
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # rustup resolves the toolchain from rust-toolchain.toml; every runner
+      # builds natively for its own platform, so no cross targets are needed.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test Rust FFI
+        run: cargo test --release -p monty-ffi
+
+      - name: Build library
+        run: cargo build --release -p monty-ffi
+
+      - name: Package embedded asset
+        run: scripts/install-ffi-library.sh "target/release/${{ matrix.library }}" "${{ matrix.goos }}" "${{ matrix.goarch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: embedded-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: internal/ffi/lib/${{ matrix.goos }}_${{ matrix.goarch }}/${{ matrix.library }}.gz
+          if-no-files-found: error

@@ -1,0 +1,6 @@
+# Single source of truth for the Rust toolchain, honored by rustup locally
+# and on CI runners alike — no per-workflow version pins.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
